@@ -89,6 +89,8 @@ async function main(): Promise<void> {
         logger.error({ err, swap_id: swapId }, 'Failed to schedule timeout');
       });
     },
+    sphere,
+    depositConfirmationTimeoutMs: config.depositConfirmationTimeoutMs,
   });
 
   // 7. Create swap manager

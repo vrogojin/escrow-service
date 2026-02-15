@@ -375,6 +375,7 @@ export function createTestConfig(overrides: Partial<Config> = {}): Config {
     paymentRetryDelayMs: 1, // fast retries in tests
     rateLimitManifestPerMinute: 100,
     maxPendingSwaps: 10000,
+    depositConfirmationTimeoutMs: 100,
     ...overrides,
   };
 }
@@ -406,7 +407,10 @@ export interface TestContext {
   waitForTimeouts: () => Promise<void>;
 }
 
-export function createIntegrationContext(configOverrides: Partial<Config> = {}): TestContext {
+export function createIntegrationContext(
+  configOverrides: Partial<Config> = {},
+  deps?: { sphere?: unknown },
+): TestContext {
   const swapRepo = new InMemorySwapRepo();
   const depositRepo = new InMemoryDepositRepo();
   const txRepo = new InMemoryTxRepo();
@@ -472,6 +476,8 @@ export function createIntegrationContext(configOverrides: Partial<Config> = {}):
     onFirstDeposit: (swapId: string, timeoutSeconds: number) => {
       timeoutManager.scheduleTimeout(swapId, timeoutSeconds);
     },
+    sphere: deps?.sphere as any,
+    depositConfirmationTimeoutMs: config.depositConfirmationTimeoutMs,
   });
 
   const swapManager = new SwapManager({

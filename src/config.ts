@@ -19,6 +19,8 @@ export interface Config {
 
   rateLimitManifestPerMinute: number;
   maxPendingSwaps: number;
+
+  depositConfirmationTimeoutMs: number;
 }
 
 export function loadConfig(): Config {
@@ -43,5 +45,7 @@ export function loadConfig(): Config {
 
     rateLimitManifestPerMinute: parseInt(process.env.RATE_LIMIT_MANIFEST_PER_MINUTE ?? '10', 10),
     maxPendingSwaps: parseInt(process.env.MAX_PENDING_SWAPS ?? '10000', 10),
+
+    depositConfirmationTimeoutMs: parseInt(process.env.DEPOSIT_CONFIRMATION_TIMEOUT_MS ?? '60000', 10),
   };
 }

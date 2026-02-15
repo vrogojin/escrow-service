@@ -86,6 +86,65 @@ export function createMockTransfer(overrides: Partial<IncomingTransfer> & {
 }
 
 /**
+ * Creates a mock Sphere with a working event emitter for testing confirmation wait.
+ */
+export function createMockSphereWithEvents() {
+  const handlers = new Map<string, Set<Function>>();
+
+  return {
+    on(event: string, handler: Function) {
+      if (!handlers.has(event)) handlers.set(event, new Set());
+      handlers.get(event)!.add(handler);
+      return () => {
+        handlers.get(event)?.delete(handler);
+      };
+    },
+    off(event: string, handler: Function) {
+      handlers.get(event)?.delete(handler);
+    },
+    /** Emit an event (test-only helper, not part of real Sphere API). */
+    emit(event: string, data: unknown) {
+      handlers.get(event)?.forEach((h) => h(data));
+    },
+    /** Returns the number of listeners for a given event (test-only helper). */
+    listenerCount(event: string): number {
+      return handlers.get(event)?.size ?? 0;
+    },
+  };
+}
+
+/**
+ * Creates a mock IncomingTransfer with submitted (unconfirmed) tokens.
+ */
+export function createSubmittedTransfer(overrides: Partial<IncomingTransfer> & {
+  tokenOverrides?: Partial<Token>[];
+} = {}): IncomingTransfer {
+  const { tokenOverrides, ...rest } = overrides;
+  const tokens: Token[] = tokenOverrides
+    ? tokenOverrides.map((t, i) => ({
+        id: `token_${i}`,
+        coinId: 'USD',
+        amount: '1000',
+        status: 'submitted' as const,
+        ...t,
+      } as Token))
+    : [{
+        id: 'token_0',
+        coinId: 'USD',
+        amount: '1000',
+        status: 'submitted' as const,
+      } as Token];
+
+  return {
+    id: `transfer_${Date.now()}`,
+    senderPubkey: 'aabb'.repeat(16) + 'ab',
+    tokens,
+    receivedAt: Date.now(),
+    ...rest,
+  } as IncomingTransfer;
+}
+
+/**
  * Creates a valid swap manifest for testing.
  */
 export function createTestManifest(overrides: Record<string, unknown> = {}): {

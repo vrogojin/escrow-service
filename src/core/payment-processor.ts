@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg';
 import type { Redis } from 'ioredis';
-import type { IncomingTransfer, Token } from '@unicitylabs/sphere-sdk';
+import type { Sphere, IncomingTransfer, Token } from '@unicitylabs/sphere-sdk';
 import { SwapState, canAcceptDeposit, assertTransition } from './state-machine.js';
 import { isValidSwapId } from '../utils/hash.js';
 import { addressesMatch } from '../utils/address.js';
@@ -21,6 +21,8 @@ export interface PaymentProcessorDeps {
   escrowAddress: string;
   onReadyToConclude: (swapId: string) => void;
   onFirstDeposit: (swapId: string, timeoutSeconds: number) => void;
+  sphere?: Sphere;
+  depositConfirmationTimeoutMs?: number;
 }
 
 type BounceReason =
@@ -30,9 +32,12 @@ type BounceReason =
   | 'UNKNOWN_SENDER'
   | 'WRONG_CURRENCY'
   | 'ALREADY_COVERED'
-  | 'DUPLICATE_TRANSACTION';
+  | 'DUPLICATE_TRANSACTION'
+  | 'UNCONFIRMED';
 
 export class PaymentProcessor {
+  private static readonly DEFAULT_CONFIRMATION_TIMEOUT_MS = 60000;
+
   private pool: Pool;
   private redis: Redis;
   private swapRepo: SwapRepository;
@@ -42,6 +47,8 @@ export class PaymentProcessor {
   private escrowAddress: string;
   private onReadyToConclude: (swapId: string) => void;
   private onFirstDeposit: (swapId: string, timeoutSeconds: number) => void;
+  private sphere?: Sphere;
+  private depositConfirmationTimeoutMs: number;
 
   constructor(deps: PaymentProcessorDeps) {
     this.pool = deps.pool;
@@ -53,6 +60,9 @@ export class PaymentProcessor {
     this.escrowAddress = deps.escrowAddress;
     this.onReadyToConclude = deps.onReadyToConclude;
     this.onFirstDeposit = deps.onFirstDeposit;
+    this.sphere = deps.sphere;
+    this.depositConfirmationTimeoutMs =
+      deps.depositConfirmationTimeoutMs ?? PaymentProcessor.DEFAULT_CONFIRMATION_TIMEOUT_MS;
   }
 
   /**
@@ -63,6 +73,23 @@ export class PaymentProcessor {
     const senderAddress = transfer.senderNametag
       ? `@${transfer.senderNametag}`
       : `DIRECT://${transfer.senderPubkey}`;
+
+    // Wait for unicity proof before accepting deposit
+    const allConfirmed = transfer.tokens.every((t) => t.status === 'confirmed');
+
+    if (!allConfirmed && this.sphere) {
+      try {
+        await this.waitForTransferConfirmation(transfer);
+      } catch {
+        // Timeout — bounce all coins back as unconfirmed
+        const tokensByCoin = this.aggregateTokens(transfer.tokens);
+        for (const [coinId, amount] of tokensByCoin) {
+          const transactionId = `${transfer.id}_${coinId}`;
+          await this.bounceback(senderAddress, amount, coinId, 'UNCONFIRMED', transactionId);
+        }
+        return;
+      }
+    }
 
     // Aggregate token amounts by coinId
     const tokensByCoin = this.aggregateTokens(transfer.tokens);
@@ -333,6 +360,39 @@ export class PaymentProcessor {
       result.set(token.coinId, (current + BigInt(token.amount)).toString());
     }
     return result;
+  }
+
+  /**
+   * Wait for all tokens in a transfer to be confirmed (have unicity proof).
+   * Subscribes to the SDK's `transfer:confirmed` event and resolves when
+   * all pending token IDs have been confirmed. Rejects on timeout.
+   */
+  private waitForTransferConfirmation(transfer: IncomingTransfer): Promise<void> {
+    const pendingTokenIds = new Set(
+      transfer.tokens.filter((t) => t.status !== 'confirmed').map((t) => t.id),
+    );
+
+    if (pendingTokenIds.size === 0) return Promise.resolve();
+
+    const timeoutMs = this.depositConfirmationTimeoutMs;
+
+    return new Promise<void>((resolve, reject) => {
+      const unsubscribe = this.sphere!.on('transfer:confirmed', (result) => {
+        for (const token of result.tokens) {
+          pendingTokenIds.delete(token.id);
+        }
+        if (pendingTokenIds.size === 0) {
+          clearTimeout(timer);
+          unsubscribe();
+          resolve();
+        }
+      });
+
+      const timer = setTimeout(() => {
+        unsubscribe();
+        reject(new Error(`Deposit confirmation timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
   }
 
   private async bounceback(
