@@ -1,5 +1,4 @@
 export interface Config {
-  port: number;
   nodeEnv: string;
   logLevel: string;
 
@@ -17,7 +16,6 @@ export interface Config {
   paymentRetryMaxAttempts: number;
   paymentRetryDelayMs: number;
 
-  rateLimitManifestPerMinute: number;
   maxPendingSwaps: number;
 
   depositConfirmationTimeoutMs: number;
@@ -25,7 +23,6 @@ export interface Config {
 
 export function loadConfig(): Config {
   return {
-    port: parseInt(process.env.PORT ?? '3000', 10),
     nodeEnv: process.env.NODE_ENV ?? 'development',
     logLevel: process.env.LOG_LEVEL ?? 'info',
 
@@ -43,7 +40,6 @@ export function loadConfig(): Config {
     paymentRetryMaxAttempts: parseInt(process.env.PAYMENT_RETRY_MAX_ATTEMPTS ?? '3', 10),
     paymentRetryDelayMs: parseInt(process.env.PAYMENT_RETRY_DELAY_MS ?? '5000', 10),
 
-    rateLimitManifestPerMinute: parseInt(process.env.RATE_LIMIT_MANIFEST_PER_MINUTE ?? '10', 10),
     maxPendingSwaps: parseInt(process.env.MAX_PENDING_SWAPS ?? '10000', 10),
 
     depositConfirmationTimeoutMs: parseInt(process.env.DEPOSIT_CONFIRMATION_TIMEOUT_MS ?? '60000', 10),

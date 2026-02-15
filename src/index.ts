@@ -4,6 +4,7 @@ import { connectRedis, closeRedis } from './storage/redis.js';
 import { initializeWallet } from './sphere/wallet-manager.js';
 import { createPaymentSender } from './sphere/payment-sender.js';
 import { createPaymentListener } from './sphere/payment-listener.js';
+import { createMessageHandler } from './sphere/message-handler.js';
 import { SwapRepository } from './storage/repositories/swap.repository.js';
 import { DepositRepository } from './storage/repositories/deposit.repository.js';
 import { TransactionRepository } from './storage/repositories/transaction.repository.js';
@@ -12,14 +13,12 @@ import { PaymentProcessor } from './core/payment-processor.js';
 import { ConclusionProcessor } from './core/conclusion-processor.js';
 import { RefundProcessor } from './core/refund-processor.js';
 import { TimeoutManager } from './core/timeout-manager.js';
-import { createApp, startServer } from './api/server.js';
 import { SwapState } from './core/state-machine.js';
 import { logger } from './utils/logger.js';
-import type { Server } from 'http';
 
 async function main(): Promise<void> {
   const config = loadConfig();
-  logger.info({ nodeEnv: config.nodeEnv, port: config.port }, 'Starting escrow service');
+  logger.info({ nodeEnv: config.nodeEnv }, 'Starting escrow service');
 
   // 1. Initialize PostgreSQL pool + run migration
   const pool = getPool(config.databaseUrl);
@@ -111,20 +110,18 @@ async function main(): Promise<void> {
   // 10. Startup recovery: retry stuck swaps
   await recoverStuckSwaps(swapRepo, conclusionProcessor, refundProcessor);
 
-  // 11. Start HTTP server
-  const app = createApp({
-    config,
+  // 11. Start DM message handler
+  const messageHandler = createMessageHandler({
+    sphere,
     swapManager,
     depositRepo,
     txRepo,
-    pool,
-    redis,
     walletManager,
   });
-  const server = startServer(app, config.port);
+  messageHandler.start();
 
   // 12. Graceful shutdown
-  setupGracefulShutdown(server, paymentListener, timeoutManager, walletManager);
+  setupGracefulShutdown(messageHandler, paymentListener, timeoutManager, walletManager);
 
   logger.info('Escrow service started successfully');
 }
@@ -160,7 +157,7 @@ async function recoverStuckSwaps(
 }
 
 function setupGracefulShutdown(
-  server: Server,
+  messageHandler: { stop(): void },
   paymentListener: { stop(): void },
   timeoutManager: TimeoutManager,
   walletManager: { destroy(): Promise<void> },
@@ -172,8 +169,8 @@ function setupGracefulShutdown(
     shuttingDown = true;
     logger.info({ signal }, 'Graceful shutdown initiated');
 
-    // Stop accepting new HTTP connections
-    server.close();
+    // Stop accepting new DMs
+    messageHandler.stop();
 
     // Stop payment listener and timeout manager
     paymentListener.stop();

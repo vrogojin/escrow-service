@@ -19,7 +19,6 @@
   "dependencies": {
     "@unicitylabs/sphere-sdk": "file:../sphere-sdk",
     "canonicalize": "^2.0.0",
-    "express": "^4.21.0",
     "ioredis": "^5.4.1",
     "pg": "^8.13.0",
     "pino": "^9.5.0",
@@ -27,7 +26,6 @@
     "uuid": "^10.0.0"
   },
   "devDependencies": {
-    "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
     "@types/uuid": "^10.0.0",

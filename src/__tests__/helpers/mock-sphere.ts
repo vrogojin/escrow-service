@@ -2,7 +2,7 @@ import { vi } from 'vitest';
 import type { WalletManager } from '../../sphere/wallet-manager.js';
 import type { PaymentSender, SendPaymentRequest } from '../../sphere/payment-sender.js';
 import type { PaymentListener, IncomingTransferHandler } from '../../sphere/payment-listener.js';
-import type { IncomingTransfer, Token, TransferResult } from '@unicitylabs/sphere-sdk';
+import type { IncomingTransfer, Token, TransferResult, DirectMessage } from '@unicitylabs/sphere-sdk';
 
 /**
  * Creates a mock WalletManager for testing.
@@ -110,6 +110,64 @@ export function createMockSphereWithEvents() {
     listenerCount(event: string): number {
       return handlers.get(event)?.size ?? 0;
     },
+  };
+}
+
+/**
+ * Creates a mock Sphere with a working communications module for DM testing.
+ */
+export function createMockSphereWithCommunications() {
+  const dmHandlers = new Set<(message: DirectMessage) => void>();
+  const sentDMs: Array<{ recipient: string; content: string }> = [];
+
+  const sendDM = vi.fn(async (recipient: string, content: string) => {
+    sentDMs.push({ recipient, content });
+    return {} as DirectMessage;
+  });
+
+  const onDirectMessage = vi.fn((handler: (message: DirectMessage) => void) => {
+    dmHandlers.add(handler);
+    return () => {
+      dmHandlers.delete(handler);
+    };
+  });
+
+  const communications = { sendDM, onDirectMessage };
+
+  const sphere = {
+    communications,
+    on: vi.fn(),
+    off: vi.fn(),
+  };
+
+  function createDM(senderPubkey: string, content: string): DirectMessage {
+    return {
+      id: `dm_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+      senderPubkey,
+      recipientPubkey: 'escrow_pubkey',
+      content,
+      timestamp: Date.now(),
+      isRead: false,
+    };
+  }
+
+  async function simulateDM(dm: DirectMessage): Promise<void> {
+    const handlers = Array.from(dmHandlers);
+    for (const handler of handlers) {
+      handler(dm);
+    }
+    // Allow async handlers to settle
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  return {
+    sphere,
+    communications,
+    sendDM,
+    onDirectMessage,
+    sentDMs,
+    createDM,
+    simulateDM,
   };
 }
 

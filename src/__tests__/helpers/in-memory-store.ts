@@ -360,7 +360,6 @@ export function createMockPool() {
 // ---------------------------------------------------------------------------
 export function createTestConfig(overrides: Partial<Config> = {}): Config {
   return {
-    port: 3000,
     nodeEnv: 'test',
     logLevel: 'silent',
     databaseUrl: '',
@@ -373,7 +372,6 @@ export function createTestConfig(overrides: Partial<Config> = {}): Config {
     swapTimeoutDefault: 3600,
     paymentRetryMaxAttempts: 3,
     paymentRetryDelayMs: 1, // fast retries in tests
-    rateLimitManifestPerMinute: 100,
     maxPendingSwaps: 10000,
     depositConfirmationTimeoutMs: 100,
     ...overrides,

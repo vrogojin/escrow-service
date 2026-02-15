@@ -13,7 +13,6 @@ import type { SwapManifest } from '../manifest-validator.js';
  */
 function makeConfig(overrides?: Partial<Config>): Config {
   return {
-    port: 3000,
     nodeEnv: 'test',
     logLevel: 'silent',
     databaseUrl: 'postgresql://localhost:5432/test',
@@ -26,8 +25,8 @@ function makeConfig(overrides?: Partial<Config>): Config {
     swapTimeoutDefault: 3600,
     paymentRetryMaxAttempts: 3,
     paymentRetryDelayMs: 100,
-    rateLimitManifestPerMinute: 10,
     maxPendingSwaps: 10000,
+    depositConfirmationTimeoutMs: 100,
     ...overrides,
   };
 }
