@@ -13,7 +13,9 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "typecheck": "tsc --noEmit",
-    "db:migrate": "tsx src/storage/migrate.ts"
+    "db:migrate": "tsx src/storage/migrate.ts",
+    "setup": "bash scripts/setup.sh",
+    "init-wallet": "tsx src/scripts/init-wallet.ts"
   },
   "dependencies": {
     "@unicitylabs/sphere-sdk": "file:../sphere-sdk",
