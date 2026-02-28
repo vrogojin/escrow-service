@@ -46,14 +46,45 @@ export async function initializeWallet(config: Config): Promise<WalletManager> {
     tokensDir: `${config.sphereWalletPath}/tokens`,
   });
 
-  const { sphere } = await Sphere.init({
+  const { sphere, created } = await Sphere.init({
     ...providers,
     autoGenerate: true,
   });
 
-  const identity = sphere.identity!;
+  // Production startup should never silently create a new wallet — that means
+  // the existing wallet was lost and all in-flight swaps are unrecoverable.
+  if (created) {
+    await sphere.destroy();
+    throw new Error(
+      'Wallet was unexpectedly created at runtime. This indicates the wallet ' +
+      'directory was deleted or corrupted. Run "npm run init-wallet" to set up ' +
+      'a new wallet, then recover funds from the old wallet manually.',
+    );
+  }
+
+  const identity = sphere.identity;
+  if (!identity) {
+    await sphere.destroy();
+    throw new Error('Sphere initialized but identity is null — wallet may be corrupt');
+  }
   const escrowAddress = identity.directAddress ?? `DIRECT://${identity.chainPubkey}`;
 
-  logger.info({ escrowAddress }, 'Escrow wallet initialized');
+  // Verify nametag is recovered from transport (SDK calls recoverNametagFromTransport
+  // during init). Warn if it doesn't match config so the operator can investigate.
+  if (config.sphereNametag) {
+    if (!sphere.hasNametag()) {
+      logger.warn(
+        { expected: config.sphereNametag },
+        'SPHERE_NAMETAG is configured but wallet has no registered nametag. Run "npm run init-wallet" to register.',
+      );
+    } else if (sphere.getNametag() !== config.sphereNametag.replace(/^@/, '').toLowerCase()) {
+      logger.warn(
+        { expected: config.sphereNametag, actual: sphere.getNametag() },
+        'SPHERE_NAMETAG does not match registered nametag',
+      );
+    }
+  }
+
+  logger.info({ escrowAddress, nametag: sphere.getNametag() ?? null }, 'Escrow wallet initialized');
   return createWalletManager(sphere, escrowAddress);
 }
