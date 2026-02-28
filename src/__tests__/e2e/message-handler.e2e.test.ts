@@ -106,11 +106,14 @@ describe('Message Handler E2E', () => {
       expect(reply.type).toBe('announce_result');
       expect(reply.swap_id).toBe(manifest.swap_id);
 
-      // Verify stripped fields did NOT reach swapManager
-      const calledWith = spy.mock.calls[0][0];
-      expect(calledWith).not.toHaveProperty('extra_field');
-      expect(calledWith).not.toHaveProperty('__proto_pollute');
-      spy.mockRestore();
+      try {
+        // Verify stripped fields did NOT reach swapManager
+        const calledWith = spy.mock.calls[0][0];
+        expect(calledWith).not.toHaveProperty('extra_field');
+        expect(calledWith).not.toHaveProperty('__proto_pollute');
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it('should reject manifest that is an array', async () => {
@@ -213,9 +216,14 @@ describe('Message Handler E2E', () => {
       expect((reply.deposits as any[]).length).toBe(1);
       expect((reply.deposits as any[])[0].transaction_id).toBe('tx_123');
       expect((reply.transactions as any[]).length).toBe(1);
-      expect((reply.transactions as any[])[0].type).toBe('CROSS_PAYMENT');
-      expect((reply.transactions as any[])[0].recipient).toBe(manifest.party_b_address);
-      expect((reply.transactions as any[])[0].amount).toBe('1000');
+      const tx = (reply.transactions as any[])[0];
+      expect(tx.type).toBe('CROSS_PAYMENT');
+      expect(tx.direction).toBe('OUTGOING');
+      expect(tx.recipient).toBe(manifest.party_b_address);
+      expect(tx.amount).toBe('1000');
+      expect(tx.coin_id).toBe('USD');
+      expect(tx.status).toBe('SENT');
+      expect(tx.created_at).toBeDefined();
     });
 
     it('should normalize uppercase swap_id to lowercase for lookup', async () => {
@@ -357,6 +365,27 @@ describe('Message Handler E2E', () => {
       expect(reply.error).toBe('Unknown message type: foo_bar');
     });
 
+    it('should sanitize control characters and truncate long msg.type in error', async () => {
+      const longType = 'a'.repeat(100);
+      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: longType }));
+      await mockSphere.simulateDM(dm);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('error');
+      // Truncated to 64 chars
+      expect(reply.error).toBe(`Unknown message type: ${'a'.repeat(64)}`);
+
+      mockSphere.sentDMs.length = 0;
+      const typeWithControl = 'bad\x00type\x01here';
+      const dm2 = mockSphere.createDM(senderPubkey, JSON.stringify({ type: typeWithControl }));
+      await mockSphere.simulateDM(dm2);
+
+      const reply2 = parseSentReply();
+      expect(reply2.type).toBe('error');
+      // Control chars stripped
+      expect(reply2.error).toBe('Unknown message type: badtypehere');
+    });
+
     it('should reply with error for non-object message (array)', async () => {
       const dm = mockSphere.createDM(senderPubkey, JSON.stringify([1, 2, 3]));
       await mockSphere.simulateDM(dm);
@@ -385,9 +414,12 @@ describe('Message Handler E2E', () => {
       await mockSphere.simulateDM(dm);
 
       const reply = parseSentReply();
-      expect(reply.type).toBe('error');
-      expect(reply.error).toBe('Maximum pending swaps limit reached (10000)');
-      spy.mockRestore();
+      try {
+        expect(reply.type).toBe('error');
+        expect(reply.error).toBe('Maximum pending swaps limit reached (10000)');
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it('should return PG 23505 duplicate error as "Swap already exists"', async () => {
@@ -400,9 +432,12 @@ describe('Message Handler E2E', () => {
       await mockSphere.simulateDM(dm);
 
       const reply = parseSentReply();
-      expect(reply.type).toBe('error');
-      expect(reply.error).toBe('Swap already exists');
-      spy.mockRestore();
+      try {
+        expect(reply.type).toBe('error');
+        expect(reply.error).toBe('Swap already exists');
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it('should return "Internal server error" for unknown exceptions', async () => {
@@ -415,9 +450,12 @@ describe('Message Handler E2E', () => {
       await mockSphere.simulateDM(dm);
 
       const reply = parseSentReply();
-      expect(reply.type).toBe('error');
-      expect(reply.error).toBe('Internal server error');
-      spy.mockRestore();
+      try {
+        expect(reply.type).toBe('error');
+        expect(reply.error).toBe('Internal server error');
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it('should survive sendDM failure and continue processing', async () => {
@@ -481,6 +519,43 @@ describe('Message Handler E2E', () => {
 
       const reply = parseSentReply();
       expect(reply.type).toBe('announce_result');
+    });
+
+    it('should reply with error when concurrency limit is reached', async () => {
+      // Create a handler with a mock swapManager that blocks to fill in-flight slots
+      let resolveBlock!: () => void;
+      const blockPromise = new Promise<void>((resolve) => { resolveBlock = resolve; });
+      const spy = vi.spyOn(ctx.swapManager, 'announceSwap').mockImplementation(async () => {
+        await blockPromise;
+        return { swapCase: { swap_id: 'a'.repeat(64), state: 'ANNOUNCED', created_at: new Date() }, isNew: true } as any;
+      });
+
+      try {
+        // Fire 50 DMs to fill the concurrency limit (they will block)
+        const manifest = createTestManifest();
+        for (let i = 0; i < 50; i++) {
+          const dm = mockSphere.createDM(`sender_${i}`, JSON.stringify({ type: 'announce', manifest }));
+          mockSphere.simulateDM(dm); // fire-and-forget
+        }
+        // Allow microtasks to settle so all 50 are in-flight
+        await new Promise((r) => setTimeout(r, 10));
+
+        // The 51st DM should get a "Service busy" reply
+        mockSphere.sentDMs.length = 0;
+        const dm51 = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+        mockSphere.simulateDM(dm51);
+        await new Promise((r) => setTimeout(r, 10));
+
+        expect(mockSphere.sentDMs.length).toBeGreaterThanOrEqual(1);
+        const busyReply = JSON.parse(mockSphere.sentDMs[0].content);
+        expect(busyReply.type).toBe('error');
+        expect(busyReply.error).toBe('Service busy, try again later');
+
+        // Unblock all in-flight handlers so stop() can drain
+        resolveBlock();
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it('should drain in-flight handlers on stop()', async () => {

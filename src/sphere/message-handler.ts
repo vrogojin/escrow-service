@@ -42,8 +42,8 @@ function stripManifest(raw: Record<string, unknown>): Record<string, unknown> {
   return stripped;
 }
 
-// Maximum DM content size (bytes) accepted before parsing.
-const MAX_DM_SIZE = 65_536;
+// Maximum DM content length (UTF-16 code units) accepted before parsing.
+const MAX_DM_LENGTH = 65_536;
 
 // Maximum concurrent in-flight DM handlers.
 const MAX_CONCURRENT = 50;
@@ -201,7 +201,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   async function onMessage(dm: DirectMessage): Promise<void> {
     if (!active) return;
 
-    if (dm.content.length > MAX_DM_SIZE) {
+    if (dm.content.length > MAX_DM_LENGTH) {
       await reply(dm.senderPubkey, { type: 'error', error: 'Message too large' });
       return;
     }
@@ -251,6 +251,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       unsubscribe = sphere.communications.onDirectMessage((dm) => {
         if (inFlight.size >= MAX_CONCURRENT) {
           logger.warn({ sender: dm.senderPubkey }, 'DM dropped: concurrency limit reached');
+          reply(dm.senderPubkey, { type: 'error', error: 'Service busy, try again later' }).catch(() => {});
           return;
         }
         const p = onMessage(dm).catch((err) => {
