@@ -96,17 +96,17 @@ describe('Message Handler E2E', () => {
     });
 
     it('should strip unknown fields from manifest', async () => {
-      const manifest = createTestManifest();
-      const manifestWithExtra = { ...manifest, __proto_pollute: true, extra_field: 'evil' };
       const spy = vi.spyOn(ctx.swapManager, 'announceSwap');
-      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest: manifestWithExtra }));
-      await mockSphere.simulateDM(dm);
-
-      const reply = parseSentReply();
-      expect(reply.type).toBe('announce_result');
-      expect(reply.swap_id).toBe(manifest.swap_id);
-
       try {
+        const manifest = createTestManifest();
+        const manifestWithExtra = { ...manifest, __proto_pollute: true, extra_field: 'evil' };
+        const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest: manifestWithExtra }));
+        await mockSphere.simulateDM(dm);
+
+        const reply = parseSentReply();
+        expect(reply.type).toBe('announce_result');
+        expect(reply.swap_id).toBe(manifest.swap_id);
+
         // Verify stripped fields did NOT reach swapManager
         const calledWith = spy.mock.calls[0][0];
         expect(calledWith).not.toHaveProperty('extra_field');
@@ -408,13 +408,12 @@ describe('Message Handler E2E', () => {
       const spy = vi.spyOn(ctx.swapManager, 'announceSwap').mockRejectedValue(
         new SwapLimitError('Maximum pending swaps limit reached (10000)'),
       );
-
-      const manifest = createTestManifest();
-      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
-      await mockSphere.simulateDM(dm);
-
-      const reply = parseSentReply();
       try {
+        const manifest = createTestManifest();
+        const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+        await mockSphere.simulateDM(dm);
+
+        const reply = parseSentReply();
         expect(reply.type).toBe('error');
         expect(reply.error).toBe('Maximum pending swaps limit reached (10000)');
       } finally {
@@ -426,13 +425,12 @@ describe('Message Handler E2E', () => {
       const spy = vi.spyOn(ctx.swapManager, 'announceSwap').mockRejectedValue(
         Object.assign(new Error('duplicate key'), { code: '23505' }),
       );
-
-      const manifest = createTestManifest();
-      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
-      await mockSphere.simulateDM(dm);
-
-      const reply = parseSentReply();
       try {
+        const manifest = createTestManifest();
+        const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+        await mockSphere.simulateDM(dm);
+
+        const reply = parseSentReply();
         expect(reply.type).toBe('error');
         expect(reply.error).toBe('Swap already exists');
       } finally {
@@ -444,13 +442,12 @@ describe('Message Handler E2E', () => {
       const spy = vi.spyOn(ctx.swapManager, 'announceSwap').mockRejectedValue(
         new TypeError('something unexpected'),
       );
-
-      const manifest = createTestManifest();
-      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
-      await mockSphere.simulateDM(dm);
-
-      const reply = parseSentReply();
       try {
+        const manifest = createTestManifest();
+        const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+        await mockSphere.simulateDM(dm);
+
+        const reply = parseSentReply();
         expect(reply.type).toBe('error');
         expect(reply.error).toBe('Internal server error');
       } finally {
@@ -521,8 +518,7 @@ describe('Message Handler E2E', () => {
       expect(reply.type).toBe('announce_result');
     });
 
-    it('should reply with error when concurrency limit is reached', async () => {
-      // Create a handler with a mock swapManager that blocks to fill in-flight slots
+    it('should silently drop DMs when concurrency limit is reached', async () => {
       let resolveBlock!: () => void;
       const blockPromise = new Promise<void>((resolve) => { resolveBlock = resolve; });
       const spy = vi.spyOn(ctx.swapManager, 'announceSwap').mockImplementation(async () => {
@@ -531,28 +527,30 @@ describe('Message Handler E2E', () => {
       });
 
       try {
-        // Fire 50 DMs to fill the concurrency limit (they will block)
+        // Fire 50 DMs to fill the concurrency limit (they will block).
+        // simulateDM calls the handler synchronously, which synchronously adds
+        // the returned promise to inFlight before yielding at `await blockPromise`,
+        // so all 50 are guaranteed to be in-flight after the loop.
         const manifest = createTestManifest();
         for (let i = 0; i < 50; i++) {
           const dm = mockSphere.createDM(`sender_${i}`, JSON.stringify({ type: 'announce', manifest }));
-          mockSphere.simulateDM(dm); // fire-and-forget
+          mockSphere.simulateDM(dm);
         }
-        // Allow microtasks to settle so all 50 are in-flight
-        await new Promise((r) => setTimeout(r, 10));
+        expect(spy.mock.calls.length).toBe(50);
 
-        // The 51st DM should get a "Service busy" reply
+        // The 51st DM should be silently dropped (no reply, no processing)
         mockSphere.sentDMs.length = 0;
         const dm51 = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
         mockSphere.simulateDM(dm51);
         await new Promise((r) => setTimeout(r, 10));
 
-        expect(mockSphere.sentDMs.length).toBeGreaterThanOrEqual(1);
-        const busyReply = JSON.parse(mockSphere.sentDMs[0].content);
-        expect(busyReply.type).toBe('error');
-        expect(busyReply.error).toBe('Service busy, try again later');
+        // No reply sent, no additional announceSwap call
+        expect(mockSphere.sentDMs.length).toBe(0);
+        expect(spy.mock.calls.length).toBe(50);
 
         // Unblock all in-flight handlers so stop() can drain
         resolveBlock();
+        await handler.stop();
       } finally {
         spy.mockRestore();
       }

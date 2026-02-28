@@ -251,7 +251,6 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       unsubscribe = sphere.communications.onDirectMessage((dm) => {
         if (inFlight.size >= MAX_CONCURRENT) {
           logger.warn({ sender: dm.senderPubkey }, 'DM dropped: concurrency limit reached');
-          reply(dm.senderPubkey, { type: 'error', error: 'Service busy, try again later' }).catch(() => {});
           return;
         }
         const p = onMessage(dm).catch((err) => {

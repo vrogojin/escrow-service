@@ -12,7 +12,6 @@
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
-    "lint": "eslint src/ --ext .ts",
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx src/storage/migrate.ts"
   },
