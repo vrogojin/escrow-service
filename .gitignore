@@ -3,3 +3,6 @@ dist/
 .env
 *.log
 .claude
+.sphere-escrow/
+**/mnemonic.backup
+docker-compose.override.yml
