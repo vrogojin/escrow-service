@@ -98,12 +98,19 @@ describe('Message Handler E2E', () => {
     it('should strip unknown fields from manifest', async () => {
       const manifest = createTestManifest();
       const manifestWithExtra = { ...manifest, __proto_pollute: true, extra_field: 'evil' };
+      const spy = vi.spyOn(ctx.swapManager, 'announceSwap');
       const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest: manifestWithExtra }));
       await mockSphere.simulateDM(dm);
 
       const reply = parseSentReply();
       expect(reply.type).toBe('announce_result');
       expect(reply.swap_id).toBe(manifest.swap_id);
+
+      // Verify stripped fields did NOT reach swapManager
+      const calledWith = spy.mock.calls[0][0];
+      expect(calledWith).not.toHaveProperty('extra_field');
+      expect(calledWith).not.toHaveProperty('__proto_pollute');
+      spy.mockRestore();
     });
 
     it('should reject manifest that is an array', async () => {
@@ -182,6 +189,18 @@ describe('Message Handler E2E', () => {
         matched_party: 'A',
       });
 
+      // Add a transaction directly to the repo
+      await ctx.txRepo.create({
+        swap_id: manifest.swap_id,
+        type: 'CROSS_PAYMENT',
+        direction: 'OUTGOING',
+        sender: 'DIRECT://escrow_pubkey_hex',
+        recipient: manifest.party_b_address,
+        amount: '1000',
+        coin_id: 'USD',
+        status: 'SENT',
+      });
+
       mockSphere.sentDMs.length = 0;
       const dm2 = mockSphere.createDM(
         senderPubkey,
@@ -193,6 +212,27 @@ describe('Message Handler E2E', () => {
       expect(reply.type).toBe('status_result');
       expect((reply.deposits as any[]).length).toBe(1);
       expect((reply.deposits as any[])[0].transaction_id).toBe('tx_123');
+      expect((reply.transactions as any[]).length).toBe(1);
+      expect((reply.transactions as any[])[0].type).toBe('CROSS_PAYMENT');
+      expect((reply.transactions as any[])[0].recipient).toBe(manifest.party_b_address);
+      expect((reply.transactions as any[])[0].amount).toBe('1000');
+    });
+
+    it('should normalize uppercase swap_id to lowercase for lookup', async () => {
+      const manifest = createTestManifest();
+      const dm1 = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+      await mockSphere.simulateDM(dm1);
+
+      mockSphere.sentDMs.length = 0;
+      const dm2 = mockSphere.createDM(
+        senderPubkey,
+        JSON.stringify({ type: 'status', swap_id: manifest.swap_id.toUpperCase() }),
+      );
+      await mockSphere.simulateDM(dm2);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('status_result');
+      expect(reply.swap_id).toBe(manifest.swap_id);
     });
   });
 
@@ -248,6 +288,23 @@ describe('Message Handler E2E', () => {
       expect(reply.type).toBe('error');
       expect(reply.error).toBe('Invalid swap_id: must be exactly 64 lowercase hex characters');
     });
+
+    it('should normalize uppercase swap_id to lowercase for lookup', async () => {
+      const manifest = createTestManifest();
+      const dm1 = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+      await mockSphere.simulateDM(dm1);
+
+      mockSphere.sentDMs.length = 0;
+      const dm2 = mockSphere.createDM(
+        senderPubkey,
+        JSON.stringify({ type: 'deposit_instructions', swap_id: manifest.swap_id.toUpperCase() }),
+      );
+      await mockSphere.simulateDM(dm2);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('deposit_instructions_result');
+      expect(reply.swap_id).toBe(manifest.swap_id);
+    });
   });
 
   // =========================================================================
@@ -270,6 +327,25 @@ describe('Message Handler E2E', () => {
       const reply = parseSentReply();
       expect(reply.type).toBe('error');
       expect(reply.error).toBe('Missing or invalid "type" field');
+    });
+
+    it('should reply with error for non-string type field', async () => {
+      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 123 }));
+      await mockSphere.simulateDM(dm);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('error');
+      expect(reply.error).toBe('Missing or invalid "type" field');
+    });
+
+    it('should reply with error for message exceeding size limit', async () => {
+      const largeContent = JSON.stringify({ type: 'announce', manifest: { padding: 'x'.repeat(70000) } });
+      const dm = mockSphere.createDM(senderPubkey, largeContent);
+      await mockSphere.simulateDM(dm);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('error');
+      expect(reply.error).toBe('Message too large');
     });
 
     it('should reply with error for unknown message type', async () => {
@@ -300,8 +376,7 @@ describe('Message Handler E2E', () => {
     });
 
     it('should return SwapLimitError as error reply', async () => {
-      const origAnnounce = ctx.swapManager.announceSwap.bind(ctx.swapManager);
-      ctx.swapManager.announceSwap = vi.fn().mockRejectedValue(
+      const spy = vi.spyOn(ctx.swapManager, 'announceSwap').mockRejectedValue(
         new SwapLimitError('Maximum pending swaps limit reached (10000)'),
       );
 
@@ -312,10 +387,11 @@ describe('Message Handler E2E', () => {
       const reply = parseSentReply();
       expect(reply.type).toBe('error');
       expect(reply.error).toBe('Maximum pending swaps limit reached (10000)');
+      spy.mockRestore();
     });
 
     it('should return PG 23505 duplicate error as "Swap already exists"', async () => {
-      ctx.swapManager.announceSwap = vi.fn().mockRejectedValue(
+      const spy = vi.spyOn(ctx.swapManager, 'announceSwap').mockRejectedValue(
         Object.assign(new Error('duplicate key'), { code: '23505' }),
       );
 
@@ -326,10 +402,11 @@ describe('Message Handler E2E', () => {
       const reply = parseSentReply();
       expect(reply.type).toBe('error');
       expect(reply.error).toBe('Swap already exists');
+      spy.mockRestore();
     });
 
     it('should return "Internal server error" for unknown exceptions', async () => {
-      ctx.swapManager.announceSwap = vi.fn().mockRejectedValue(
+      const spy = vi.spyOn(ctx.swapManager, 'announceSwap').mockRejectedValue(
         new TypeError('something unexpected'),
       );
 
@@ -340,6 +417,7 @@ describe('Message Handler E2E', () => {
       const reply = parseSentReply();
       expect(reply.type).toBe('error');
       expect(reply.error).toBe('Internal server error');
+      spy.mockRestore();
     });
 
     it('should survive sendDM failure and continue processing', async () => {

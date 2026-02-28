@@ -42,6 +42,12 @@ function stripManifest(raw: Record<string, unknown>): Record<string, unknown> {
   return stripped;
 }
 
+// Maximum DM content size (bytes) accepted before parsing.
+const MAX_DM_SIZE = 65_536;
+
+// Maximum concurrent in-flight DM handlers.
+const MAX_CONCURRENT = 50;
+
 export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   const { sphere, swapManager, depositRepo, txRepo, walletManager } = deps;
 
@@ -195,6 +201,11 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   async function onMessage(dm: DirectMessage): Promise<void> {
     if (!active) return;
 
+    if (dm.content.length > MAX_DM_SIZE) {
+      await reply(dm.senderPubkey, { type: 'error', error: 'Message too large' });
+      return;
+    }
+
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(dm.content);
@@ -213,9 +224,10 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       return;
     }
 
-    logger.info({ sender: dm.senderPubkey, type: msg.type }, 'DM request received');
+    const msgType = msg.type;
+    logger.info({ sender: dm.senderPubkey, type: msgType }, 'DM request received');
 
-    switch (msg.type) {
+    switch (msgType) {
       case 'announce':
         await handleAnnounce(dm.senderPubkey, msg);
         break;
@@ -225,8 +237,10 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       case 'deposit_instructions':
         await handleDepositInstructions(dm.senderPubkey, msg);
         break;
-      default:
-        await reply(dm.senderPubkey, { type: 'error', error: `Unknown message type: ${msg.type}` });
+      default: {
+        const safeType = msgType.slice(0, 64).replace(/[^\x20-\x7E]/g, '');
+        await reply(dm.senderPubkey, { type: 'error', error: `Unknown message type: ${safeType}` });
+      }
     }
   }
 
@@ -235,6 +249,10 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       if (active) return;
       active = true;
       unsubscribe = sphere.communications.onDirectMessage((dm) => {
+        if (inFlight.size >= MAX_CONCURRENT) {
+          logger.warn({ sender: dm.senderPubkey }, 'DM dropped: concurrency limit reached');
+          return;
+        }
         const p = onMessage(dm).catch((err) => {
           logger.error({ err, dmId: dm.id }, 'Unhandled error processing DM');
         });
@@ -250,8 +268,8 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
         unsubscribe();
         unsubscribe = null;
       }
-      // Drain in-flight handlers before returning
-      if (inFlight.size > 0) {
+      // Drain in-flight handlers before returning (loop handles late additions)
+      while (inFlight.size > 0) {
         logger.info({ count: inFlight.size }, 'Draining in-flight DM handlers');
         await Promise.all(inFlight);
       }
