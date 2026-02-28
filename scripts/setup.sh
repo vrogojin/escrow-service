@@ -16,13 +16,16 @@ info "Checking prerequisites..."
 
 command -v node >/dev/null 2>&1 || fail "node is not installed (>= 18 required)"
 NODE_VERSION=$(node -v | sed 's/^v//' | cut -d. -f1)
+if ! [[ "$NODE_VERSION" =~ ^[0-9]+$ ]]; then
+  fail "Could not parse Node.js version from: $(node -v)"
+fi
 if [ "$NODE_VERSION" -lt 18 ]; then
   fail "Node.js >= 18 required (found v$(node -v | sed 's/^v//'))"
 fi
 ok "Node.js v$(node -v | sed 's/^v//')"
 
 command -v docker >/dev/null 2>&1 || fail "docker is not installed"
-ok "Docker $(docker --version | grep -oP '\d+\.\d+\.\d+')"
+ok "Docker $(docker --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 
 docker compose version >/dev/null 2>&1 || fail "'docker compose' plugin is not available"
 ok "Docker Compose $(docker compose version --short)"
@@ -33,32 +36,59 @@ if [ ! -f .env ]; then
 
   # Determine network
   if [ -z "${SPHERE_NETWORK:-}" ]; then
+    if [ ! -t 0 ]; then
+      fail "SPHERE_NETWORK is not set and stdin is not a terminal. Set SPHERE_NETWORK=testnet|mainnet|dev"
+    fi
     echo ""
     echo "Select Unicity network:"
-    echo "  1) mainnet  (production)"
-    echo "  2) testnet  (testing)"
+    echo "  1) testnet  (testing — recommended for initial setup)"
+    echo "  2) mainnet  (production)"
     echo "  3) dev      (local development)"
     echo ""
     read -rp "Choice [1/2/3]: " NETWORK_CHOICE
     case "$NETWORK_CHOICE" in
-      1) SPHERE_NETWORK="mainnet" ;;
-      2) SPHERE_NETWORK="testnet" ;;
+      1) SPHERE_NETWORK="testnet" ;;
+      2) SPHERE_NETWORK="mainnet" ;;
       3) SPHERE_NETWORK="dev" ;;
       *) fail "Invalid choice: $NETWORK_CHOICE" ;;
     esac
   fi
 
-  sed "s/^SPHERE_NETWORK=.*/SPHERE_NETWORK=${SPHERE_NETWORK}/" .env.example > .env
+  # Validate network regardless of source (env var or interactive)
+  case "$SPHERE_NETWORK" in
+    mainnet|testnet|dev) ;;
+    *) fail "Invalid SPHERE_NETWORK: must be mainnet, testnet, or dev" ;;
+  esac
+
+  # Generate a random postgres password for this instance
+  POSTGRES_PASSWORD=$(openssl rand -base64 24)
+
+  # Build .env from template with safe substitutions (no sed injection)
+  while IFS= read -r line; do
+    case "$line" in
+      "SPHERE_NETWORK="*)     echo "SPHERE_NETWORK=${SPHERE_NETWORK}" ;;
+      "POSTGRES_PASSWORD="*)  echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" ;;
+      "DATABASE_URL="*)       echo "DATABASE_URL=postgresql://escrow:${POSTGRES_PASSWORD}@localhost:5432/escrow_db" ;;
+      "REDIS_URL="*)          echo "REDIS_URL=redis://:${REDIS_PASSWORD:-redis_dev}@localhost:6379" ;;
+      *)                      echo "$line" ;;
+    esac
+  done < .env.example > .env
+
   ok "Created .env (network: ${SPHERE_NETWORK})"
 else
   ok ".env already exists, skipping"
 fi
 
-# Source .env so subsequent steps can use the values
-set -a
-# shellcheck disable=SC1091
-source .env
-set +a
+# Load .env values safely (KEY=VALUE parsing only, no command execution)
+while IFS='=' read -r key value; do
+  # Skip comments and blank lines
+  [[ "$key" =~ ^[[:space:]]*# ]] && continue
+  [[ -z "$key" ]] && continue
+  key="${key#"${key%%[![:space:]]*}"}"
+  key="${key%"${key##*[![:space:]]}"}"
+  [ -z "$key" ] && continue
+  export "$key"="$value"
+done < .env
 
 # ── 3. Docker Compose ───────────────────────────────────────
 info "Starting PostgreSQL and Redis..."
@@ -66,29 +96,28 @@ docker compose up -d
 
 info "Waiting for containers to be healthy..."
 RETRIES=30
-until [ "$(docker compose ps --format json | grep -c '"healthy"')" -ge 2 ] || [ "$RETRIES" -le 0 ]; do
+HEALTHY=0
+while [ "$RETRIES" -gt 0 ]; do
+  HEALTHY=$(docker compose ps --format json 2>/dev/null | grep -cE '"healthy"' || true)
+  [ "$HEALTHY" -ge 2 ] && break
   sleep 1
   RETRIES=$((RETRIES - 1))
 done
 
-if [ "$RETRIES" -le 0 ]; then
-  warn "Timed out waiting for containers — check 'docker compose ps'"
-else
-  ok "PostgreSQL and Redis are healthy"
+if [ "$HEALTHY" -lt 2 ]; then
+  fail "Containers did not become healthy within 30s — check 'docker compose ps'"
 fi
+ok "PostgreSQL and Redis are healthy"
 
 # ── 4. Node dependencies ────────────────────────────────────
-if [ ! -d node_modules ]; then
-  info "Installing npm dependencies..."
-  npm install
-  ok "Dependencies installed"
-else
-  ok "node_modules/ exists, skipping npm install"
-fi
+info "Installing npm dependencies..."
+npm install
+ok "Dependencies installed"
 
 # ── 5. Build ─────────────────────────────────────────────────
 info "Building TypeScript..."
 npm run build
+[ -f dist/scripts/init-wallet.js ] || fail "Build did not produce dist/scripts/init-wallet.js"
 ok "Build complete"
 
 # ── 6. Database migration ───────────────────────────────────
@@ -112,5 +141,7 @@ echo "    npm run start    (production, from dist/)"
 echo ""
 echo "  Stop infrastructure:"
 echo "    docker compose down"
+echo ""
+echo "  WARNING: 'docker compose down -v' destroys all data."
 echo ""
 echo "========================================"
