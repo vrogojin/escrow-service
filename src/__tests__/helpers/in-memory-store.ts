@@ -367,6 +367,7 @@ export function createTestConfig(overrides: Partial<Config> = {}): Config {
     sphereWalletPath: '',
     sphereAddressIndex: 0,
     sphereNetwork: 'testnet',
+    sphereNametag: '',
     swapTimeoutMin: 60,
     swapTimeoutMax: 86400,
     swapTimeoutDefault: 3600,

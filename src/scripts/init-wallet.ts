@@ -18,6 +18,7 @@ async function main(): Promise<void> {
   const { sphere, created, generatedMnemonic } = await Sphere.init({
     ...providers,
     autoGenerate: true,
+    ...(config.sphereNametag ? { nametag: config.sphereNametag } : {}),
   });
 
   const identity = sphere.identity;
@@ -60,9 +61,14 @@ async function main(): Promise<void> {
     console.log('\n========================================');
     console.log('  NEW ESCROW WALLET CREATED');
     console.log('========================================\n');
-    console.log(`  Address : ${escrowAddress}`);
-    console.log(`  Network : ${config.sphereNetwork}`);
-    console.log(`  Wallet  : ${walletPath}\n`);
+    console.log(`  Address  : ${escrowAddress}`);
+    if (sphere.hasNametag()) {
+      console.log(`  Nametag  : @${sphere.getNametag()}`);
+      const proxyAddr = sphere.getProxyAddress();
+      if (proxyAddr) console.log(`  Proxy    : ${proxyAddr}`);
+    }
+    console.log(`  Network  : ${config.sphereNetwork}`);
+    console.log(`  Wallet   : ${walletPath}\n`);
     console.log(`  Mnemonic backup saved to: ${backupPath}`);
     console.log('  Permissions: 0600 (owner-only read/write)\n');
 
@@ -77,9 +83,21 @@ async function main(): Promise<void> {
 
     console.log('========================================\n');
   } else {
+    // Register nametag on existing wallet if configured and not yet registered
+    if (config.sphereNametag && !sphere.hasNametag()) {
+      console.log(`Registering nametag @${config.sphereNametag}...`);
+      await sphere.registerNametag(config.sphereNametag);
+      console.log(`Nametag @${config.sphereNametag} registered successfully`);
+    }
+
     console.log(`Wallet already exists at ${walletPath}`);
-    console.log(`  Address : ${escrowAddress}`);
-    console.log(`  Network : ${config.sphereNetwork}`);
+    console.log(`  Address  : ${escrowAddress}`);
+    if (sphere.hasNametag()) {
+      console.log(`  Nametag  : @${sphere.getNametag()}`);
+      const proxyAddr = sphere.getProxyAddress();
+      if (proxyAddr) console.log(`  Proxy    : ${proxyAddr}`);
+    }
+    console.log(`  Network  : ${config.sphereNetwork}`);
   }
 
   try {
