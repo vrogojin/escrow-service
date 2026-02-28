@@ -157,7 +157,7 @@ async function recoverStuckSwaps(
 }
 
 function setupGracefulShutdown(
-  messageHandler: { stop(): void },
+  messageHandler: { stop(): Promise<void> },
   paymentListener: { stop(): void },
   timeoutManager: TimeoutManager,
   walletManager: { destroy(): Promise<void> },
@@ -169,15 +169,19 @@ function setupGracefulShutdown(
     shuttingDown = true;
     logger.info({ signal }, 'Graceful shutdown initiated');
 
-    // Stop accepting new DMs
-    messageHandler.stop();
+    // Hard-kill fallback if graceful shutdown hangs
+    const hardKill = setTimeout(() => {
+      logger.error('Graceful shutdown timed out, forcing exit');
+      process.exit(1);
+    }, 30_000);
+    hardKill.unref();
+
+    // Stop accepting new messages and drain in-flight handlers
+    await messageHandler.stop();
 
     // Stop payment listener and timeout manager
     paymentListener.stop();
     timeoutManager.stop();
-
-    // Wait for in-flight operations
-    await new Promise((resolve) => setTimeout(resolve, 5000));
 
     // Close connections
     await walletManager.destroy().catch((err) => {

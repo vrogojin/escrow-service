@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createMessageHandler, type MessageHandler } from '../../sphere/message-handler.js';
 import {
   createMockSphereWithCommunications,
@@ -6,6 +6,7 @@ import {
   createTestManifest,
 } from '../helpers/mock-sphere.js';
 import { createIntegrationContext, type TestContext } from '../helpers/in-memory-store.js';
+import { ManifestValidationError, SwapLimitError } from '../../core/swap-manager.js';
 import type { Sphere } from '@unicitylabs/sphere-sdk';
 
 describe('Message Handler E2E', () => {
@@ -29,8 +30,8 @@ describe('Message Handler E2E', () => {
     handler.start();
   });
 
-  afterEach(() => {
-    handler.stop();
+  afterEach(async () => {
+    await handler.stop();
   });
 
   function parseSentReply(index = 0): Record<string, unknown> {
@@ -92,6 +93,26 @@ describe('Message Handler E2E', () => {
       expect(reply.error).toBe('Manifest validation failed');
       expect(reply.details).toBeDefined();
       expect(Array.isArray(reply.details)).toBe(true);
+    });
+
+    it('should strip unknown fields from manifest', async () => {
+      const manifest = createTestManifest();
+      const manifestWithExtra = { ...manifest, __proto_pollute: true, extra_field: 'evil' };
+      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest: manifestWithExtra }));
+      await mockSphere.simulateDM(dm);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('announce_result');
+      expect(reply.swap_id).toBe(manifest.swap_id);
+    });
+
+    it('should reject manifest that is an array', async () => {
+      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest: [1, 2, 3] }));
+      await mockSphere.simulateDM(dm);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('error');
+      expect(reply.error).toBe('Request body must contain a "manifest" object');
     });
   });
 
@@ -277,6 +298,74 @@ describe('Message Handler E2E', () => {
       expect(reply.type).toBe('error');
       expect(reply.error).toBe('Message must be a JSON object');
     });
+
+    it('should return SwapLimitError as error reply', async () => {
+      const origAnnounce = ctx.swapManager.announceSwap.bind(ctx.swapManager);
+      ctx.swapManager.announceSwap = vi.fn().mockRejectedValue(
+        new SwapLimitError('Maximum pending swaps limit reached (10000)'),
+      );
+
+      const manifest = createTestManifest();
+      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+      await mockSphere.simulateDM(dm);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('error');
+      expect(reply.error).toBe('Maximum pending swaps limit reached (10000)');
+    });
+
+    it('should return PG 23505 duplicate error as "Swap already exists"', async () => {
+      ctx.swapManager.announceSwap = vi.fn().mockRejectedValue(
+        Object.assign(new Error('duplicate key'), { code: '23505' }),
+      );
+
+      const manifest = createTestManifest();
+      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+      await mockSphere.simulateDM(dm);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('error');
+      expect(reply.error).toBe('Swap already exists');
+    });
+
+    it('should return "Internal server error" for unknown exceptions', async () => {
+      ctx.swapManager.announceSwap = vi.fn().mockRejectedValue(
+        new TypeError('something unexpected'),
+      );
+
+      const manifest = createTestManifest();
+      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+      await mockSphere.simulateDM(dm);
+
+      const reply = parseSentReply();
+      expect(reply.type).toBe('error');
+      expect(reply.error).toBe('Internal server error');
+    });
+
+    it('should survive sendDM failure and continue processing', async () => {
+      // Make sendDM fail once
+      mockSphere.sendDM.mockRejectedValueOnce(new Error('Nostr relay down'));
+
+      const manifest = createTestManifest();
+      const dm1 = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+      await mockSphere.simulateDM(dm1);
+
+      // sendDM was called but failed — no crash
+      expect(mockSphere.sendDM).toHaveBeenCalledTimes(1);
+
+      // Handler still works for subsequent messages
+      mockSphere.sentDMs.length = 0;
+      const dm2 = mockSphere.createDM(
+        senderPubkey,
+        JSON.stringify({ type: 'status', swap_id: manifest.swap_id }),
+      );
+      await mockSphere.simulateDM(dm2);
+
+      // The swap was created despite the reply failure, so status should find it
+      const reply = parseSentReply();
+      expect(reply.type).toBe('status_result');
+      expect(reply.swap_id).toBe(manifest.swap_id);
+    });
   });
 
   // =========================================================================
@@ -284,7 +373,7 @@ describe('Message Handler E2E', () => {
   // =========================================================================
   describe('lifecycle', () => {
     it('should not process messages after stop()', async () => {
-      handler.stop();
+      await handler.stop();
 
       const manifest = createTestManifest();
       const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
@@ -299,19 +388,34 @@ describe('Message Handler E2E', () => {
       expect(mockSphere.onDirectMessage).toHaveBeenCalledTimes(1);
     });
 
-    it('should handle idempotent stop()', () => {
-      handler.stop();
-      handler.stop(); // should not throw
+    it('should handle idempotent stop()', async () => {
+      await handler.stop();
+      await handler.stop(); // should not throw
     });
 
     it('should be restartable after stop()', async () => {
-      handler.stop();
+      await handler.stop();
       handler.start();
 
       const manifest = createTestManifest();
       const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
       await mockSphere.simulateDM(dm);
 
+      const reply = parseSentReply();
+      expect(reply.type).toBe('announce_result');
+    });
+
+    it('should drain in-flight handlers on stop()', async () => {
+      const manifest = createTestManifest();
+      const dm = mockSphere.createDM(senderPubkey, JSON.stringify({ type: 'announce', manifest }));
+      // Simulate DM without awaiting — handler is in-flight
+      mockSphere.simulateDM(dm);
+
+      // stop() should wait for in-flight to complete
+      await handler.stop();
+
+      // By the time stop() resolves, the reply should have been sent
+      expect(mockSphere.sentDMs.length).toBeGreaterThan(0);
       const reply = parseSentReply();
       expect(reply.type).toBe('announce_result');
     });

@@ -17,13 +17,41 @@ export interface MessageHandlerDeps {
 
 export interface MessageHandler {
   start(): void;
-  stop(): void;
+  stop(): Promise<void>;
+}
+
+// Known manifest fields — strip everything else from untrusted input.
+const MANIFEST_KEYS = [
+  'swap_id',
+  'party_a_address',
+  'party_b_address',
+  'party_a_currency_to_change',
+  'party_a_value_to_change',
+  'party_b_currency_to_change',
+  'party_b_value_to_change',
+  'timeout',
+] as const;
+
+function stripManifest(raw: Record<string, unknown>): Record<string, unknown> {
+  const stripped: Record<string, unknown> = {};
+  for (const key of MANIFEST_KEYS) {
+    if (key in raw) {
+      stripped[key] = raw[key];
+    }
+  }
+  return stripped;
 }
 
 export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   const { sphere, swapManager, depositRepo, txRepo, walletManager } = deps;
+
+  // Lifecycle state.
+  // `active` is set synchronously before any await, so the flag-check at
+  // handler entry is race-free in single-threaded JS.  In-flight promises
+  // are tracked so stop() can drain them.
   let active = false;
   let unsubscribe: (() => void) | null = null;
+  const inFlight = new Set<Promise<void>>();
 
   async function reply(senderPubkey: string, payload: Record<string, unknown>): Promise<void> {
     try {
@@ -48,13 +76,14 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   }
 
   async function handleAnnounce(senderPubkey: string, msg: Record<string, unknown>): Promise<void> {
-    if (!msg.manifest || typeof msg.manifest !== 'object') {
+    if (!msg.manifest || typeof msg.manifest !== 'object' || Array.isArray(msg.manifest)) {
       await reply(senderPubkey, { type: 'error', error: 'Request body must contain a "manifest" object' });
       return;
     }
 
     try {
-      const result = await swapManager.announceSwap(msg.manifest as any);
+      const manifest = stripManifest(msg.manifest as Record<string, unknown>);
+      const result = await swapManager.announceSwap(manifest as any);
       await reply(senderPubkey, {
         type: 'announce_result',
         swap_id: result.swapCase.swap_id,
@@ -206,18 +235,25 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       if (active) return;
       active = true;
       unsubscribe = sphere.communications.onDirectMessage((dm) => {
-        onMessage(dm).catch((err) => {
+        const p = onMessage(dm).catch((err) => {
           logger.error({ err, dmId: dm.id }, 'Unhandled error processing DM');
         });
+        inFlight.add(p);
+        p.finally(() => inFlight.delete(p));
       });
       logger.info('Message handler started');
     },
-    stop() {
+    async stop() {
       if (!active) return;
       active = false;
       if (unsubscribe) {
         unsubscribe();
         unsubscribe = null;
+      }
+      // Drain in-flight handlers before returning
+      if (inFlight.size > 0) {
+        logger.info({ count: inFlight.size }, 'Draining in-flight DM handlers');
+        await Promise.all(inFlight);
       }
       logger.info('Message handler stopped');
     },
