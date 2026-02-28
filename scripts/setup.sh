@@ -60,8 +60,9 @@ if [ ! -f .env ]; then
     *) fail "Invalid SPHERE_NETWORK: must be mainnet, testnet, or dev" ;;
   esac
 
-  # Generate a random postgres password for this instance
-  POSTGRES_PASSWORD=$(openssl rand -base64 24)
+  # Generate random URL-safe passwords for this instance
+  POSTGRES_PASSWORD=$(openssl rand -hex 24)
+  REDIS_PASSWORD=$(openssl rand -hex 24)
 
   # Build .env from template with safe substitutions (no sed injection)
   while IFS= read -r line; do
@@ -69,7 +70,8 @@ if [ ! -f .env ]; then
       "SPHERE_NETWORK="*)     echo "SPHERE_NETWORK=${SPHERE_NETWORK}" ;;
       "POSTGRES_PASSWORD="*)  echo "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" ;;
       "DATABASE_URL="*)       echo "DATABASE_URL=postgresql://escrow:${POSTGRES_PASSWORD}@localhost:5432/escrow_db" ;;
-      "REDIS_URL="*)          echo "REDIS_URL=redis://:${REDIS_PASSWORD:-redis_dev}@localhost:6379" ;;
+      "REDIS_PASSWORD="*)     echo "REDIS_PASSWORD=${REDIS_PASSWORD}" ;;
+      "REDIS_URL="*)          echo "REDIS_URL=redis://:${REDIS_PASSWORD}@localhost:6379" ;;
       *)                      echo "$line" ;;
     esac
   done < .env.example > .env
@@ -80,10 +82,13 @@ else
 fi
 
 # Load .env values safely (KEY=VALUE parsing only, no command execution)
-while IFS='=' read -r key value; do
+while IFS= read -r line; do
   # Skip comments and blank lines
-  [[ "$key" =~ ^[[:space:]]*# ]] && continue
-  [[ -z "$key" ]] && continue
+  [[ "$line" =~ ^[[:space:]]*# ]] && continue
+  [[ -z "$line" ]] && continue
+  # Split on first '=' only to preserve values containing '='
+  key="${line%%=*}"
+  value="${line#*=}"
   key="${key#"${key%%[![:space:]]*}"}"
   key="${key%"${key##*[![:space:]]}"}"
   [ -z "$key" ] && continue
