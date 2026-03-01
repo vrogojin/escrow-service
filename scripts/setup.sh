@@ -72,6 +72,7 @@ if [ ! -f .env ]; then
       "DATABASE_URL="*)       echo "DATABASE_URL=postgresql://escrow:${POSTGRES_PASSWORD}@localhost:5432/escrow_db" ;;
       "REDIS_PASSWORD="*)     echo "REDIS_PASSWORD=${REDIS_PASSWORD}" ;;
       "REDIS_URL="*)          echo "REDIS_URL=redis://:${REDIS_PASSWORD}@localhost:6379" ;;
+      "SPHERE_NAMETAG="*)     echo "SPHERE_NAMETAG=${SPHERE_NAMETAG:-}" ;;
       *)                      echo "$line" ;;
     esac
   done < .env.example > .env
