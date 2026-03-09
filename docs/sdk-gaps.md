@@ -28,7 +28,7 @@ The deposit invoice has the escrow's address as the target with two coin assets.
 
 - **Any address** can pay either asset, not just the designated parties
 - The escrow must perform **application-level sender validation** on every `invoice:payment` event:
-  1. Call `getInvoiceStatus()` and iterate `coinAssets[i].transfers` to identify the sender via each transfer's `InvoiceTransferRef.senderAddress` (the cryptographically-authenticated on-chain address — **not** `senderBalances`, whose keys are spoofable `effectiveSender` values)
+  1. Call `getInvoiceStatus()` and iterate `coinAssets[i].transfers` to identify the sender via each transfer's `InvoiceTransferRef.senderAddress` (the cryptographically-authenticated on-chain address — **not** `senderBalances`, whose keys are self-asserted `effectiveSender` values that include the unverified `refundAddress` when `isRefundAddress` is `true`). **Naming collision warning:** `InvoiceSenderBalance` also has a field called `senderAddress`, but in that context it holds the `effectiveSender` value (not the cryptographic address). Always use `InvoiceTransferRef.senderAddress` for identity verification. Note: `senderAddress` is `string | null` — it is `null` for masked-predicate senders, requiring the escrow to mandate unmasked predicates as a precondition.
   2. Check sender against resolved party addresses
   3. Call `returnInvoicePayment()` to bounce unauthorized payments
 - This adds latency between payment receipt and validation response
@@ -49,7 +49,7 @@ export interface InvoiceRequestedAsset {
 ```
 
 Behavior when set:
-- When processing an inbound transfer event, check if the sender's **on-chain address** (`senderAddress` from the transfer, NOT `effectiveSender` which includes the spoofable `refundAddress`) is in `allowedSenders`
+- When processing an inbound transfer event, check if the sender's **on-chain address** (`senderAddress` from the transfer, NOT `effectiveSender` which includes the self-asserted `refundAddress`) is in `allowedSenders`. **Design note:** This check uses `senderAddress` (cryptographically authenticated) rather than `effectiveSender`, which is consistent with the security goal of verifiable identity. However, `senderAddress` is `null` for masked-predicate senders — such senders would always fail the `allowedSenders` check. This means `allowedSenders` implicitly requires all authorized senders to use unmasked predicates (DIRECT:// addresses derived from their public keys).
 - If not, treat as an irrelevant transfer with reason `'sender_unauthorized'`
 - Fire `invoice:sender_unauthorized` event (see gap #5)
 - Auto-return the payment if auto-return is enabled, or leave it for the target to return manually
@@ -100,7 +100,7 @@ The `InvoiceTerms` type has a `deliveryMethods` field (commented as "PLACEHOLDER
 // types.ts
 export interface InvoiceTerms {
   // ...
-  readonly deliveryMethods?: string[];  // e.g. ["https://pay.example.com/inv/abc"]
+  readonly deliveryMethods?: string[];
   // ...
 }
 ```
@@ -173,7 +173,7 @@ The escrow must define its own serialization format for DM-based invoice deliver
 
 ```typescript
 // AccountingModule
-exportInvoice(invoiceId: string): InvoicePackage;
+async exportInvoice(invoiceId: string): Promise<InvoicePackage>;
 
 interface InvoicePackage {
   /** Format version for forward compatibility */
@@ -208,13 +208,13 @@ The escrow serializes the TxfToken as JSON in DM payloads. Recipients parse the 
 
 The `dueDate` field in `InvoiceTerms` is **informational only**. When an invoice has a `dueDate` that has passed:
 
-- `computeInvoiceStatus()` in balance-computer.ts sets `state = 'EXPIRED'` (line 545–546):
+- `computeInvoiceStatus()` in balance-computer.ts sets `state = 'EXPIRED'` (lines 545–547):
   ```typescript
   } else if (terms.dueDate !== undefined && terms.dueDate < Date.now()) {
     state = 'EXPIRED';
   }
   ```
-- However, payments are **still accepted and indexed**. The `EXPIRED` state does not prevent the `invoice:payment` event from firing or the balance from updating.
+- However, payments are **still accepted and indexed**. The `EXPIRED` state does not prevent the `invoice:payment` event from firing or the balance from updating. Note: if an invoice past its `dueDate` receives enough payments to become fully covered, the state will be `COVERED` (not `EXPIRED`), because the `COVERED` check has higher priority than the `EXPIRED` check in the state computation chain (`CLOSED > CANCELLED > COVERED > EXPIRED > PARTIAL > OPEN`).
 - There is no option to hard-reject payments after the due date.
 - `createInvoice()` validates that `dueDate > Date.now()` at creation time (line 790–792) but does not enforce it after creation.
 
@@ -301,7 +301,7 @@ If gap #1 (`allowedSenders`) is implemented, add a new event:
 // SphereEventMap additions
 'invoice:sender_unauthorized': {
   invoiceId: string;
-  senderAddress: string;
+  senderAddress: string | null;
   coinId: string;
   amount: string;
   transferId: string;
@@ -385,11 +385,11 @@ For operational queries (e.g., "show all swaps where address X has deposited"), 
 Add an optional `senderAddress` filter to `getInvoices()`:
 
 ```typescript
-getInvoices(filter?: {
+async getInvoices(filter?: {
   // ... existing filters ...
   /** Only return invoices that have received payments from this address */
   senderAddress?: string;
-}): InvoiceRef[];
+}): Promise<InvoiceRef[]>;
 ```
 
 Note: The AccountingModule does **not** currently maintain a sender-to-invoice index. Per-sender balance computation happens dynamically inside `computeInvoiceStatus()` (balance-computer.ts), which iterates all entries per invoice and builds per-sender accumulators on the fly. Implementing this filter would require building a new secondary index (`senderAddress → Set<invoiceId>`), which adds maintenance overhead but would be a significant query-time improvement.
@@ -412,6 +412,6 @@ The escrow uses application-level filtering. For the current escrow use case (mo
 | 6 | Distributed locking / multi-instance support | **Medium** | No | Single-instance deployment with active-passive failover |
 | 7 | `getInvoices()` per-sender filtering | Low | No | Application-level filtering after retrieval |
 
-**None of these gaps are blocking.** The escrow service can be fully implemented using the current AccountingModule API. The gaps represent opportunities for the SDK to reduce boilerplate and push common patterns into the framework.
+**None of these gaps are blocking.** The escrow service can be fully implemented using the current AccountingModule API. The gaps represent opportunities for the SDK to reduce boilerplate and push common patterns into the framework. However, gap #1's workaround exposes a DOS surface (unauthorized payment flooding forces an event → validate → return loop per payment) that should be mitigated with application-level rate-limiting until `allowedSenders` is available.
 
 The highest-impact gap is **`allowedSenders`** (#1), which would eliminate the most complex application-level workaround (the payment → validate → bounce loop) and close the DOS vector from unauthorized payment flooding. Gap #6 (distributed locking) is **Medium** because it imposes a hard single-instance architectural constraint on all AccountingModule consumers. The remaining gaps are convenience improvements that reduce code duplication across invoice-issuing applications.
