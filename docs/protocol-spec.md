@@ -424,7 +424,7 @@ await accounting.payInvoice(payoutBInvoiceId, {
 });
 ```
 
-**Crash recovery warning:** When retrying `payInvoice()` during crash recovery, **omit the `amount` parameter**. The SDK will compute `remaining = requestedAmount - netCoveredAmount` and send only the uncovered remainder. If the payout was already completed before the crash, `remaining` will be `0` and the SDK throws `INVOICE_INVALID_AMOUNT` (safe to catch as success). Passing an explicit `amount` during retry bypasses this guard and causes a **double-payment**. See architecture.md §Crash Recovery for the full error code handling.
+**Crash recovery warning:** When retrying `payInvoice()` during crash recovery, **omit the `amount` parameter**. The SDK will compute `remaining = requestedAmount - netCoveredAmount` and send only the uncovered remainder. If the payout was already completed before the crash, `remaining` will be `0` and the SDK throws `INVOICE_INVALID_AMOUNT` (safe to catch as success). The SDK may also throw `INVOICE_TERMINATED` (invoice already closed/cancelled — treat as success) or `INVOICE_NOT_FOUND` (invoice token not loaded after restart — re-import via `importInvoice()`, then retry). Passing an explicit `amount` during retry bypasses the zero-remaining guard and causes a **double-payment**.
 
 ### Step 9: Payout Delivery and Confirmation
 
