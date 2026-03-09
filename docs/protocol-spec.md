@@ -70,7 +70,7 @@ Request re-delivery of an invoice token. Used when a party lost their deposit or
 }
 ```
 
-The escrow responds with an `invoice_delivery` message containing the requested token. The requesting party must be one of the swap's designated parties. **Note on authorization:** The DM sender is identified by their Nostr npub key, which exists in a different key space from the DIRECT:// chain addresses in the manifest. The escrow must maintain a mapping between Nostr npubs and chain addresses. This mapping is established during the `announce` phase: the DM sender's npub is recorded when they submit the manifest and is associated with the party role they claim. **Note:** The `invoice:payment` event reveals the payer's on-chain `senderAddress`, NOT their Nostr npub — on-chain payments do not disclose the DM identity. Parties who did not announce via DM cannot use `request_invoice` — they must first establish their Nostr identity by sending an `announce` message.
+The escrow responds with an `invoice_delivery` message containing the requested token. The requesting party must be one of the swap's designated parties. **Note on authorization:** The DM sender is identified by their Nostr npub key, which exists in a different key space from the DIRECT:// chain addresses in the manifest. The escrow must maintain a mapping between Nostr npubs and chain addresses. This mapping is established during the `announce` phase: the DM sender's npub is recorded when they submit the manifest and is associated with the party role they claim. **Trust assumption:** There is no cryptographic proof linking a Nostr npub to a DIRECT:// chain address — the mapping is trust-based. The announcer claims a party role but the escrow cannot verify this claim at announcement time. Role misidentification only affects DM-level authorization (status queries, invoice re-delivery); it does not affect on-chain payment validation, which uses cryptographic `senderAddress`. A stronger protocol could require a signed proof linking the npub to the chain address, but this is not implemented in the current design. **Note:** The `invoice:payment` event reveals the payer's on-chain `senderAddress`, NOT their Nostr npub — on-chain payments do not disclose the DM identity. Parties who did not announce via DM cannot use `request_invoice` — they must first establish their Nostr identity by sending an `announce` message.
 
 ### 1.2 Escrow → Party Messages
 
@@ -369,13 +369,19 @@ On each `invoice:payment` event, the escrow:
 5. If wrong sender or wrong currency → calls `returnInvoicePayment()`:
 
 ```typescript
+// recipient must be effectiveSender (refundAddress ?? senderAddress),
+// NOT raw senderAddress — the SDK validates balance cap against
+// senderBalances keyed by effectiveSender.
+const recipient = transfer.refundAddress ?? transfer.senderAddress;
 await accounting.returnInvoicePayment(depositInvoiceId, {
-  recipient: wrongSenderAddress,  // DIRECT:// address to return to
+  recipient,                      // DIRECT:// address to return to
   amount: paymentAmount,          // amount to return (smallest units)
   coinId: wrongCoinId,
   freeText: 'Bounce: UNKNOWN_SENDER',  // optional annotation
 });
 ```
+
+**Note on identity vs routing:** The escrow uses `senderAddress` (cryptographic) for identity verification (determining which party sent the payment), but uses `effectiveSender` (`refundAddress ?? senderAddress`) for return routing. This asymmetry is intentional: `senderAddress` cannot be forged but `refundAddress` is the sender's declared return path. Auto-return also sends to `effectiveSender`, not raw `senderAddress`.
 
 6. **Already-covered check:** Before processing, verify the swap is not already in `DEPOSIT_COVERED` or later. If a party retries a payment with a new `transferId` after the invoice is already covered, bounce with reason `ALREADY_COVERED`.
 
@@ -392,12 +398,11 @@ When both parties have fully paid, the AccountingModule fires `invoice:covered`.
 1. **State guard:** only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT`
 2. **Re-validate per-party coverage:** call `getInvoiceStatus()` and iterate `coinAssets[i].transfers` to verify that party A's `senderAddress` (the on-chain address, **not** `effectiveSender` from `senderBalances`) contributed to asset 0 and party B's to asset 1. The `invoice:covered` event only means aggregate amounts are met — an unauthorized sender could have contributed before being bounced. If validation fails, return the unauthorized payment and wait.
 3. **Check for swapped-currency deposits:** Verify that each party paid their **own** required currency. Party A must contribute to asset 0 (`party_a_currency`) and party B to asset 1 (`party_b_currency`). If party A paid `party_b_currency` (or vice versa), bounce the payment with reason `WRONG_CURRENCY` even though the aggregate amounts may show coverage.
-4. Transitions: `PARTIAL_DEPOSIT → DEPOSIT_COVERED` (or `DEPOSIT_INVOICE_CREATED → DEPOSIT_COVERED`). Note: `DEPOSIT_COVERED` is a transient state — the escrow immediately proceeds to closing and payout creation within the same handler. It is persisted only as a recovery checkpoint (as `CONCLUDING`) before payout.
-5. Cancels the timeout timer
-6. Closes the deposit invoice: `closeInvoice(depositInvoiceId)`
+4. Transitions: `PARTIAL_DEPOSIT → DEPOSIT_COVERED` (or `DEPOSIT_INVOICE_CREATED → DEPOSIT_COVERED`). Note: `DEPOSIT_COVERED` is a transient state — the escrow immediately proceeds to closing and payout creation within the same handler.
+5. Cancels the timeout timer (if running)
+6. Closes the deposit invoice: `closeInvoice(depositInvoiceId)` — do **not** pass `{autoReturn: true}` (see architecture.md §Event-Driven Flow)
 7. Creates two payout invoices (see §2.2)
-8. Persists state as `CONCLUDING` with payout invoice IDs to SwapStateStore
-9. Transitions: `DEPOSIT_COVERED → CONCLUDING`
+8. **Persists state as `CONCLUDING`** with both payout invoice IDs to SwapStateStore **before** paying — this is the persist-before-act checkpoint for crash recovery (see architecture.md §Crash Recovery)
 
 ### Step 8: Escrow Pays Payout Invoices
 
@@ -418,6 +423,8 @@ await accounting.payInvoice(payoutBInvoiceId, {
   amount: manifest.party_a_value_to_change,
 });
 ```
+
+**Crash recovery warning:** When retrying `payInvoice()` during crash recovery, **omit the `amount` parameter**. The SDK will compute `remaining = requestedAmount - netCoveredAmount` and send only the uncovered remainder. If the payout was already completed before the crash, `remaining` will be `0` and the SDK throws `INVOICE_INVALID_AMOUNT` (safe to catch as success). Passing an explicit `amount` during retry bypasses this guard and causes a **double-payment**. See architecture.md §Crash Recovery for the full error code handling.
 
 ### Step 9: Payout Delivery and Confirmation
 
@@ -467,14 +474,17 @@ Escrow checks swap state
     │   │
     │   ▼ Swap transitions: PARTIAL_DEPOSIT → TIMED_OUT → CANCELLING
     │   │
-    │   ▼ AccountingModule auto-return:
+    │   ▼ AccountingModule cancelInvoice():
     │     - Freezes balances (CANCELLED state)
+    │     - Fires invoice:cancelled event
+    │     - Then begins auto-return (asynchronous, after event)
     │     - For each sender balance: records intent → sends return → marks completed
     │     - Dedup ledger prevents double-returns on crash recovery
     │   │
-    │   ▼ invoice:cancelled event
+    │   ▼ invoice:cancelled event handler
     │   │
     │   ▼ Swap transitions: CANCELLING → CANCELLED
+    │     (auto-return continues independently — failures don't affect swap state)
     │
     ├── State is DEPOSIT_COVERED or later:
     │   ▼ (no-op — coverage won the race)
@@ -576,7 +586,7 @@ Where:
   - `B` (back) — return/bounce of a payment
   - `RC` (return_closed) — return from a closed invoice
   - `RX` (return_cancelled) — return from a cancelled invoice
-- `[free_text]` — optional annotation (max 256 chars outbound, 1024 inbound)
+- `[free_text]` — optional annotation (max 256 Unicode code points outbound, 1024 Unicode code points inbound)
 
 ### On-Chain Message Format
 
@@ -679,7 +689,7 @@ After receiving payout notification, each party independently verifies:
    - `terms.targets[0].address` === my DIRECT address
    - `terms.targets[0].assets[0].coin[0]` === expected currency
    - `terms.targets[0].assets[0].coin[1]` === expected amount
-   - `terms.creator` === escrow's known chain pubkey
+   - `terms.creator` === escrow's known chain pubkey (reject if `terms.creator` is `undefined` — the SDK type is `creator?: string`, but escrow invoices are always non-anonymous)
 
 3. **Check invoice status:**
    ```typescript

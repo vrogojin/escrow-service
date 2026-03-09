@@ -37,7 +37,7 @@ The deposit invoice has the escrow's address as the target with two coin assets.
 
 ### Proposed API Change
 
-Add an optional `allowedSenders` field to `InvoiceRequestedAsset`:
+Add an optional `allowedSenders` field to `InvoiceRequestedAsset`. **Privacy tradeoff:** Since `InvoiceRequestedAsset` is embedded in `InvoiceTerms` (which is serialized into the on-chain invoice token), the `allowedSenders` list would be visible to anyone who obtains the token. For the escrow use case, party addresses are already known to both parties (they're in the manifest), so on-chain visibility is acceptable. Applications requiring private sender restrictions should use the application-level workaround instead, or the SDK could support a separate local-only config (not embedded in InvoiceTerms):
 
 ```typescript
 export interface InvoiceRequestedAsset {
