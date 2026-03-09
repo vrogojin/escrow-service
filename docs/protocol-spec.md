@@ -4,6 +4,8 @@
 
 All communication between parties and the escrow service uses NIP-17 encrypted direct messages (DMs) over Nostr relays. Messages are JSON objects with a `type` field discriminator.
 
+**Message versioning:** All messages include an optional `v` field (integer, defaults to `1` if absent). The escrow and parties should ignore unknown fields for forward compatibility. Breaking changes to existing message types require incrementing `v` and supporting both old and new formats during a transition period.
+
 ### 1.1 Party → Escrow Messages
 
 #### `announce`
@@ -28,7 +30,7 @@ Submit a swap manifest to the escrow service.
 
 **Validation rules:**
 - `swap_id` must be exactly 64 lowercase hex characters
-- `swap_id` must equal `SHA-256(canonical(party_a_address, party_b_address, party_a_currency_to_change, party_a_value_to_change, party_b_currency_to_change, party_b_value_to_change, timeout))`
+- `swap_id` must equal `SHA-256(JCS(manifest_fields))` where JCS is RFC 8785 (JSON Canonicalization Scheme). The `manifest_fields` object contains exactly these keys: `party_a_address`, `party_b_address`, `party_a_currency_to_change`, `party_a_value_to_change`, `party_b_currency_to_change`, `party_b_value_to_change`, `timeout`. The hash input is the JCS-serialized UTF-8 byte string of this object.
 - Party addresses must differ
 - Currencies must differ
 - Values must be positive integer strings (no decimals, no leading zeros except "0")
@@ -55,6 +57,20 @@ Request deposit payment information (legacy — replaced by `invoice_delivery` i
   "swap_id": "<64 hex chars>"
 }
 ```
+
+#### `request_invoice`
+
+Request re-delivery of an invoice token. Used when a party lost their deposit or payout invoice token (e.g., DM delivery failed, client crash before import).
+
+```json
+{
+  "type": "request_invoice",
+  "swap_id": "<64 hex chars>",
+  "invoice_type": "deposit" | "payout"
+}
+```
+
+The escrow responds with an `invoice_delivery` message containing the requested token. The requesting party must be one of the swap's designated parties. **Note on authorization:** The DM sender is identified by their Nostr npub key, which exists in a different key space from the DIRECT:// chain addresses in the manifest. The escrow must maintain a mapping between Nostr npubs and chain addresses. This mapping is established via: (a) the `announce` phase (the DM sender's npub is recorded when they submit the manifest), and (b) the first valid `invoice:payment` event (the escrow can associate the payer's `senderAddress` with the DM npub that announced for that party). Parties who neither announced nor deposited cannot use `request_invoice` — they must first establish their identity through one of these channels.
 
 ### 1.2 Escrow → Party Messages
 
@@ -124,6 +140,23 @@ Response to a `status` query.
 }
 ```
 
+**Derivation of `deposit_status` per-party fields:**
+
+The escrow derives per-party coverage from `getInvoiceStatus(depositInvoiceId)`:
+
+1. Get `status.targets[0].coinAssets` — the array of per-coin balance summaries
+2. Asset at index 0 corresponds to `party_a_currency_to_change`, index 1 to `party_b_currency_to_change`
+3. For each asset, iterate `coinAssets[i].transfers` (the raw `InvoiceTransferRef[]` array) to find the party's contribution:
+   - Use each transfer's `senderAddress` field (the cryptographically-authenticated on-chain sender) — **not** `effectiveSender` from `senderBalances`, which is `refundAddress ?? senderAddress` and can be spoofed
+   - Sum `amount` from transfers whose `senderAddress` matches the party's resolved DIRECT address
+   - Set `party_X_covered = true` if the summed amount >= the requested amount
+   - **Important:** Do not use `senderBalances` for identity verification — its keys are `effectiveSender` values, which include the spoofable `refundAddress` field
+4. If a party has no matching transfers, `party_X_amount = "0"` and `party_X_covered = false`
+
+**Authorization:** Status queries are only served if the requesting party's Nostr DM pubkey is associated with one of the swap's parties. Since Nostr npub keys and DIRECT:// chain addresses are in different key spaces, the escrow must establish this association during the announce phase (the DM sender who submits the manifest is recorded as one of the swap's parties). Queries from unrecognized npubs receive an `error` response with `"Unauthorized"`.
+
+**Note:** The `deposit_status.state` field may show `EXPIRED` even while the escrow's application-level timeout has not yet fired. This happens because `dueDate` is set from invoice creation time, while the escrow timeout starts from the first deposit (see §4). The `state` field in the outer response (the swap state) is the authoritative indicator of escrow lifecycle status.
+
 #### `payment_confirmation`
 
 Sent after the escrow pays into a payout invoice.
@@ -136,6 +169,33 @@ Sent after the escrow pays into a payout invoice.
   "currency": "<coinId received>",
   "amount": "<amount string>",
   "status": "paid"
+}
+```
+
+#### `swap_cancelled`
+
+Sent to both parties when a swap is cancelled (timeout or manual cancellation).
+
+```json
+{
+  "type": "swap_cancelled",
+  "swap_id": "<64 hex chars>",
+  "reason": "timeout",
+  "deposits_returned": true
+}
+```
+
+#### `bounce_notification`
+
+Sent to a party when their payment is bounced back by the escrow.
+
+```json
+{
+  "type": "bounce_notification",
+  "swap_id": "<64 hex chars>",
+  "reason": "UNKNOWN_SENDER" | "WRONG_CURRENCY" | "SWAP_NOT_FOUND" | "SWAP_CLOSED" | "ALREADY_COVERED",
+  "returned_amount": "<amount string>",
+  "returned_currency": "<coinId>"
 }
 ```
 
@@ -238,9 +298,12 @@ Party A ──[announce {manifest}]──▶ Escrow
 
 The escrow validates the manifest. If valid:
 - Creates a swap case in state `ANNOUNCED`
+- Records the announcing party's Nostr npub as associated with a swap party (for later authorization of status queries and invoice re-delivery)
 - Proceeds to Step 3 immediately
 
-If the second party also sends `announce` with the same manifest, the escrow returns the existing swap case (`is_new: false`).
+If the second party also sends `announce` with the same manifest, the escrow returns the existing swap case (`is_new: false`) and records their npub association.
+
+**Griefing note:** The `announce` message does not cryptographically prove that the DM sender is one of the parties listed in the manifest. A third party who obtains the manifest (e.g., from an untrusted channel) could submit it to the escrow, causing an invoice to be created. This is mitigated by the content-addressed `swap_id` — the announcement is only harmful if the attacker has the exact manifest. If this is a concern, the protocol could require that both parties announce independently before the deposit invoice is created (changing `ANNOUNCED` to a two-phase state). For the current trust model (parties share the manifest only with each other), single-party announcement is sufficient.
 
 ### Step 3: Deposit Invoice Creation
 
@@ -297,7 +360,7 @@ The on-chain transfer message encodes the invoice reference:
 On each `invoice:payment` event, the escrow:
 
 1. Calls `getInvoiceStatus(depositInvoiceId)` to get the current balance
-2. Inspects `targets[0].coinAssets[i].senderBalances` to identify the payer
+2. Inspects the payment event's transfer data or iterates `targets[0].coinAssets[i].transfers` (raw `InvoiceTransferRef[]`) to identify the payer by their `senderAddress` field (cryptographically-authenticated on-chain address)
 3. Resolves the sender's DIRECT address to determine which party they are:
    - Match against party A's resolved DIRECT address
    - Match against party B's resolved DIRECT address
@@ -313,6 +376,8 @@ await accounting.returnInvoicePayment(depositInvoiceId, {
 });
 ```
 
+6. **Already-covered check:** Before processing, verify the swap is not already in `DEPOSIT_COVERED` or later. If a party retries a payment with a new `transferId` after the invoice is already covered, bounce with reason `ALREADY_COVERED`.
+
 On first valid deposit:
 - Swap transitions: `DEPOSIT_INVOICE_CREATED → PARTIAL_DEPOSIT`
 - Timeout timer starts: `setTimeout(handleTimeout, manifest.timeout * 1000)`
@@ -321,11 +386,15 @@ On first valid deposit:
 
 When both parties have fully paid, the AccountingModule fires `invoice:covered`. The escrow:
 
-1. Transitions: `PARTIAL_DEPOSIT → DEPOSIT_COVERED`
-2. Cancels the timeout timer
-3. Closes the deposit invoice: `closeInvoice(depositInvoiceId)`
-4. Creates two payout invoices (see §2.2)
-5. Transitions: `DEPOSIT_COVERED → CONCLUDING`
+1. **State guard:** only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT`
+2. **Re-validate per-party coverage:** call `getInvoiceStatus()` and iterate `coinAssets[i].transfers` to verify that party A's `senderAddress` (the on-chain address, **not** `effectiveSender` from `senderBalances`) contributed to asset 0 and party B's to asset 1. The `invoice:covered` event only means aggregate amounts are met — an unauthorized sender could have contributed before being bounced. If validation fails, return the unauthorized payment and wait.
+3. **Check for swapped-currency deposits:** Verify that each party paid their **own** required currency. Party A must contribute to asset 0 (`party_a_currency`) and party B to asset 1 (`party_b_currency`). If party A paid `party_b_currency` (or vice versa), bounce the payment with reason `WRONG_CURRENCY` even though the aggregate amounts may show coverage.
+4. Transitions: `PARTIAL_DEPOSIT → DEPOSIT_COVERED` (or `DEPOSIT_INVOICE_CREATED → DEPOSIT_COVERED`). Note: `DEPOSIT_COVERED` is a transient state — the escrow immediately proceeds to closing and payout creation within the same handler. It is persisted only as a recovery checkpoint (as `CONCLUDING`) before payout.
+5. Cancels the timeout timer
+6. Closes the deposit invoice: `closeInvoice(depositInvoiceId)`
+7. Creates two payout invoices (see §2.2)
+8. Persists state as `CONCLUDING` with payout invoice IDs to SwapStateStore
+9. Transitions: `DEPOSIT_COVERED → CONCLUDING`
 
 ### Step 8: Escrow Pays Payout Invoices
 
@@ -389,6 +458,18 @@ TimeoutManager fires
     ▼
 Escrow checks swap state
     │
+    ├── State is DEPOSIT_INVOICE_CREATED (manual cancellation only):
+    │   ▼
+    │   cancelInvoice(depositInvoiceId, { autoReturn: true })
+    │   │
+    │   ▼ Swap transitions: DEPOSIT_INVOICE_CREATED → TIMED_OUT → CANCELLING
+    │   │
+    │   ▼ No deposits to return (autoReturn is a no-op)
+    │   │
+    │   ▼ invoice:cancelled event
+    │   │
+    │   ▼ Swap transitions: CANCELLING → CANCELLED
+    │
     ├── State is PARTIAL_DEPOSIT:
     │   ▼
     │   cancelInvoice(depositInvoiceId, { autoReturn: true })
@@ -428,14 +509,15 @@ After cancellation, the escrow notifies both parties:
 
 ### Bounce-Back Reasons
 
-When the escrow returns a payment via `returnInvoicePayment()`, it includes a reason in the DM notification:
+When the escrow returns a payment via `returnInvoicePayment()`, it includes a reason in the DM notification (via `bounce_notification` message). Reason codes are aligned with the existing escrow codebase:
 
 | Reason | Description |
 |---|---|
 | `UNKNOWN_SENDER` | Sender does not match party A or party B |
 | `WRONG_CURRENCY` | Sender paid the wrong currency for their role |
 | `SWAP_NOT_FOUND` | No swap case matches the invoice |
-| `ALREADY_CANCELLED` | Invoice was already cancelled (timeout expired) |
+| `SWAP_CLOSED` | Swap is in a terminal state (COMPLETED, CANCELLED, FAILED) |
+| `ALREADY_COVERED` | The party's required asset is already fully covered |
 
 The bounce-back uses the `:B` (back) direction code in the invoice memo:
 
@@ -448,6 +530,15 @@ INV:<invoice_id>:B Bounce: UNKNOWN_SENDER
 - Parties may retry failed payments. The AccountingModule deduplicates by `transferId::coinId`.
 - The escrow does not explicitly retry — it relies on AccountingModule's idempotent operations.
 - Auto-return retries up to 5 times (via `AutoReturnManager.MAX_RETRY_COUNT`). After exhaustion, entries are marked `failed` and can be reset by calling `setAutoReturn()` again.
+
+### Post-Cancellation Payments
+
+Payments may arrive after the deposit invoice has been cancelled (e.g., network latency, Nostr relay delay). The AccountingModule handles this automatically:
+
+- If `autoReturn` was enabled on `cancelInvoice()`, post-cancellation payments are auto-returned via the dedup ledger
+- The `invoice:payment` event still fires for post-cancellation payments, but `getInvoiceStatus()` will show `state: 'CANCELLED'`
+- The escrow's `invoice:payment` handler should check the swap state — if `TIMED_OUT`, `CANCELLING`, or `CANCELLED`, ignore the event (auto-return handles it)
+- Auto-returned payments use the `:RX` (return_cancelled) direction code in the memo
 
 ### Failure States
 
@@ -547,17 +638,19 @@ Resolved addresses are cached in the swap case to avoid re-resolution. This prev
 
 ### Sender Matching
 
-When validating deposit senders, the escrow compares the transfer's sender DIRECT address against both parties' cached resolved DIRECT addresses:
+When validating deposit senders, the escrow compares the transfer's **on-chain sender address** (`InvoiceTransferRef.senderAddress`) against both parties' cached resolved DIRECT addresses:
 
 ```typescript
-function identifyParty(senderDirectAddress: string, swap: SwapCase): 'A' | 'B' | null {
-  if (senderDirectAddress === swap.resolved_party_a_address) return 'A';
-  if (senderDirectAddress === swap.resolved_party_b_address) return 'B';
+function identifyParty(senderAddress: string, swap: SwapCase): 'A' | 'B' | null {
+  if (senderAddress === swap.resolved_party_a_address) return 'A';
+  if (senderAddress === swap.resolved_party_b_address) return 'B';
   return null;
 }
 ```
 
-Note: DIRECT address comparison is **case-sensitive exact string match** (per AccountingModule convention).
+**Security note:** The escrow must use `senderAddress` (the cryptographically-authenticated on-chain sender), **not** `effectiveSender` (which is `refundAddress ?? senderAddress`). The `refundAddress` field (`inv.ra` in the on-chain message) is set by the sender and can be spoofed — a malicious sender could set `inv.ra` to party A's address to impersonate them. The `senderAddress` is derived from the transfer's cryptographic signature and cannot be forged.
+
+DIRECT address comparison is **case-sensitive exact string match** (matching the SDK's convention — see `balance-computer.ts` line 12 and `isTarget()` which uses `Set.has()`). The escrow MUST store the exact DIRECT address format returned by the SDK's address resolution methods, without modification. If addresses are compared at the application level (e.g., `identifyParty()`), the comparison must also be case-sensitive. Normalization to lowercase should only be applied at manifest validation time for the `swap_id` hash input, not for stored or compared addresses.
 
 ## 8. Verification Protocol
 

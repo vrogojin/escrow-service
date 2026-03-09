@@ -4,7 +4,7 @@ This document identifies gaps in the sphere-sdk AccountingModule (`feat/accounti
 
 ## 1. `allowedSenders` on InvoiceRequestedAsset
 
-**Priority: Medium**
+**Priority: High**
 
 ### Current SDK Behavior
 
@@ -20,7 +20,7 @@ export interface InvoiceRequestedAsset {
 
 There is no field to restrict which addresses may pay a specific asset. The `InvoiceTarget` only specifies the destination address and the requested assets — not who is authorized to pay.
 
-When a payment arrives with an `INV:<id>:F` memo, the AccountingModule indexes it into the invoice-transfer ledger unconditionally if the destination address and coin ID match a target. All per-sender tracking happens post-facto in `computeInvoiceStatus()` (balance-computer.ts).
+When a payment arrives with an `INV:<id>:F` memo, the AccountingModule indexes the transfer into the invoice-transfer ledger unconditionally if the destination address matches a target. Classification into the correct coin asset slot (and per-sender balance aggregation) happens post-facto in `computeInvoiceStatus()` (balance-computer.ts) — the indexing itself does not check the coin ID, only the classification step does.
 
 ### Impact on Escrow
 
@@ -28,7 +28,7 @@ The deposit invoice has the escrow's address as the target with two coin assets.
 
 - **Any address** can pay either asset, not just the designated parties
 - The escrow must perform **application-level sender validation** on every `invoice:payment` event:
-  1. Call `getInvoiceStatus()` to inspect `senderBalances`
+  1. Call `getInvoiceStatus()` and iterate `coinAssets[i].transfers` to identify the sender via each transfer's `InvoiceTransferRef.senderAddress` (the cryptographically-authenticated on-chain address — **not** `senderBalances`, whose keys are spoofable `effectiveSender` values)
   2. Check sender against resolved party addresses
   3. Call `returnInvoicePayment()` to bounce unauthorized payments
 - This adds latency between payment receipt and validation response
@@ -49,7 +49,7 @@ export interface InvoiceRequestedAsset {
 ```
 
 Behavior when set:
-- During invoice-transfer indexing, check if the sender's effective address (refundAddress ?? senderAddress) is in `allowedSenders`
+- When processing an inbound transfer event, check if the sender's **on-chain address** (`senderAddress` from the transfer, NOT `effectiveSender` which includes the spoofable `refundAddress`) is in `allowedSenders`
 - If not, treat as an irrelevant transfer with reason `'sender_unauthorized'`
 - Fire `invoice:sender_unauthorized` event (see gap #5)
 - Auto-return the payment if auto-return is enabled, or leave it for the target to return manually
@@ -89,7 +89,7 @@ The escrow monitors `invoice:payment` events and calls `returnInvoicePayment()` 
 
 There is no SDK method that combines invoice token delivery with DM notification. To deliver an invoice to a recipient, the escrow must:
 
-1. Retrieve the invoice token in TxfToken format (from `getInvoice()` which returns `InvoiceRef` containing the token)
+1. Retrieve the invoice token in TxfToken format (from token storage — `getInvoice()` returns `InvoiceRef` which exposes metadata but does **not** include the raw token; see gap #3)
 2. Serialize the token for transport
 3. Compose a DM with the token and payment instructions
 4. Send via `communications.sendDM(recipientPubkey, payload)`
@@ -145,21 +145,10 @@ The escrow implements delivery as part of its `invoice_delivery` DM message type
 
 ### Current SDK Behavior
 
-Invoice tokens are stored internally as `TxfToken` objects (the Token eXchange Format). The `InvoiceRef` returned by `getInvoice()` and `getInvoices()` includes:
+Invoice tokens are stored internally as `TxfToken` objects (the Token eXchange Format). The `InvoiceRef` returned by `getInvoice()` and `getInvoices()` exposes invoice metadata but does **not** include the raw token:
 
 ```typescript
-export interface InvoiceRef {
-  readonly invoiceId: string;
-  readonly terms: InvoiceTerms;
-  readonly token: TxfToken;
-  readonly isTarget: boolean;
-  readonly role: 'creator' | 'payer' | 'target' | 'observer';
-}
-```
-
-To access the raw TxfToken for delivery, the escrow must retrieve it from token storage separately — `InvoiceRef` does not include the token:
-
-```typescript
+// types.ts — actual InvoiceRef definition
 export interface InvoiceRef {
   readonly invoiceId: string;
   readonly terms: InvoiceTerms;
@@ -168,6 +157,8 @@ export interface InvoiceRef {
   readonly closed: boolean;
 }
 ```
+
+To access the raw TxfToken for delivery, the escrow must retrieve it from token storage separately.
 
 There is no standardized "invoice package" format that bundles the token with human-readable metadata for cross-wallet delivery.
 
@@ -217,7 +208,7 @@ The escrow serializes the TxfToken as JSON in DM payloads. Recipients parse the 
 
 The `dueDate` field in `InvoiceTerms` is **informational only**. When an invoice has a `dueDate` that has passed:
 
-- `computeInvoiceStatus()` in balance-computer.ts sets `state = 'EXPIRED'` (line 545–547):
+- `computeInvoiceStatus()` in balance-computer.ts sets `state = 'EXPIRED'` (line 545–546):
   ```typescript
   } else if (terms.dueDate !== undefined && terms.dueDate < Date.now()) {
     state = 'EXPIRED';
@@ -327,16 +318,100 @@ The escrow uses `invoice:payment` + application-level validation. This is the cu
 
 ---
 
+## 6. Distributed Locking / Multi-Instance Support
+
+**Priority: Medium**
+
+### Current SDK Behavior
+
+The AccountingModule serializes concurrent operations on the same invoice using an in-process async mutex (`invoiceGates` — a `Map<string, Promise<void>>` that chains promises per invoice ID). This prevents race conditions when multiple event handlers or API calls target the same invoice concurrently within a single Node.js process.
+
+However, this mutex is **not distributed**. If two processes (or two instances of an application) operate on the same invoice simultaneously, the mutex provides no protection — both processes can proceed concurrently, potentially causing double-payments, inconsistent state, or corrupted ledger entries.
+
+### Impact on Escrow
+
+The escrow service must run as a **single instance**. This limits:
+- Horizontal scaling for high swap throughput
+- High-availability deployment (active-active is unsafe; only active-passive with failover is possible)
+- Container orchestration (Kubernetes replicas must be set to 1)
+
+For the current escrow use case (moderate swap volume), single-instance is acceptable. But it is a hard architectural constraint that must be documented and enforced.
+
+### Proposed API Change
+
+Add a `LockProvider` interface to the AccountingModule configuration:
+
+```typescript
+export interface LockProvider {
+  /** Acquire an exclusive lock for the given key. Returns an unlock function. */
+  acquire(key: string, timeoutMs?: number): Promise<() => Promise<void>>;
+}
+
+// AccountingModule configuration
+interface AccountingModuleConfig {
+  // ... existing fields ...
+  /** Optional distributed lock provider. Defaults to in-process promise chaining. */
+  lockProvider?: LockProvider;
+}
+```
+
+Applications requiring multi-instance deployment would provide a Redis-based or database-based lock provider. The default in-process implementation remains for single-instance use.
+
+### Workaround
+
+The escrow runs as a single instance. Deployments must enforce `replicas: 1` in container orchestration. If the escrow needs high availability, an active-passive failover pattern (with leader election) is used instead of active-active scaling.
+
+---
+
+## 7. `getInvoices()` Per-Sender Filtering
+
+**Priority: Low**
+
+### Current SDK Behavior
+
+The `getInvoices()` method returns all invoices (or all matching a filter like `state`, `createdByMe`, `targetingMe`, `limit`, `offset`, `sortBy`, `sortOrder`). There is no way to query invoices that have received payments from a specific sender address.
+
+To find all invoices where a given address has contributed, the escrow must:
+1. Call `getInvoices()` to retrieve all invoices
+2. For each invoice, call `getInvoiceStatus()` to inspect transfers
+3. Filter locally by iterating `coinAssets[i].transfers` and matching `senderAddress`
+
+### Impact on Escrow
+
+For operational queries (e.g., "show all swaps where address X has deposited"), the escrow must load every invoice's full status. This is O(N) in the total invoice count and becomes expensive as the escrow processes more swaps.
+
+### Proposed API Change
+
+Add an optional `senderAddress` filter to `getInvoices()`:
+
+```typescript
+getInvoices(filter?: {
+  // ... existing filters ...
+  /** Only return invoices that have received payments from this address */
+  senderAddress?: string;
+}): InvoiceRef[];
+```
+
+Note: The AccountingModule does **not** currently maintain a sender-to-invoice index. Per-sender balance computation happens dynamically inside `computeInvoiceStatus()` (balance-computer.ts), which iterates all entries per invoice and builds per-sender accumulators on the fly. Implementing this filter would require building a new secondary index (`senderAddress → Set<invoiceId>`), which adds maintenance overhead but would be a significant query-time improvement.
+
+### Workaround
+
+The escrow uses application-level filtering. For the current escrow use case (moderate swap volume, queries are infrequent), this is acceptable.
+
+---
+
 ## Summary
 
 | # | Gap | Priority | Blocking? | Workaround |
 |---|---|---|---|---|
-| 1 | `allowedSenders` on InvoiceRequestedAsset | Medium | No | Application-level validation via `getInvoiceStatus()` + `returnInvoicePayment()` |
+| 1 | `allowedSenders` on InvoiceRequestedAsset | **High** | No | Application-level validation via `getInvoiceStatus()` + `returnInvoicePayment()` |
 | 2 | `deliverInvoice()` convenience method | Low | No | Manual DM composition with serialized TxfToken |
 | 3 | Invoice export/serialization format | Low | No | Custom JSON serialization of TxfToken in DM payloads |
 | 4 | `dueDate` enforcement option | Low | No | Application-level timeout + `cancelInvoice({ autoReturn: true })` |
 | 5 | `invoice:sender_unauthorized` event | Low | No | `invoice:payment` event + manual sender check |
+| 6 | Distributed locking / multi-instance support | **Medium** | No | Single-instance deployment with active-passive failover |
+| 7 | `getInvoices()` per-sender filtering | Low | No | Application-level filtering after retrieval |
 
 **None of these gaps are blocking.** The escrow service can be fully implemented using the current AccountingModule API. The gaps represent opportunities for the SDK to reduce boilerplate and push common patterns into the framework.
 
-The highest-impact gap is **`allowedSenders`** (#1), which would eliminate the most complex application-level workaround (the payment → validate → bounce loop). The remaining gaps are convenience improvements that reduce code duplication across invoice-issuing applications.
+The highest-impact gap is **`allowedSenders`** (#1), which would eliminate the most complex application-level workaround (the payment → validate → bounce loop) and close the DOS vector from unauthorized payment flooding. Gap #6 (distributed locking) is **Medium** because it imposes a hard single-instance architectural constraint on all AccountingModule consumers. The remaining gaps are convenience improvements that reduce code duplication across invoice-issuing applications.
