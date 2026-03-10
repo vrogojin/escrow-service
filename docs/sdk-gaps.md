@@ -214,7 +214,7 @@ The `dueDate` field in `InvoiceTerms` is **informational only**. When an invoice
     state = 'EXPIRED';
   }
   ```
-- However, payments are **still accepted and indexed**. The `EXPIRED` state does not prevent the `invoice:payment` event from firing or the balance from updating. Note: if an invoice past its `dueDate` receives enough payments to become fully covered, the state will be `COVERED` (not `EXPIRED`), because the `COVERED` check has higher priority than the `EXPIRED` check in the state computation chain (`CLOSED > CANCELLED > COVERED > EXPIRED > PARTIAL > OPEN`).
+- However, payments are **still accepted and indexed**. The `EXPIRED` state does not prevent the `invoice:payment` event from firing or the balance from updating. Note: if an invoice past its `dueDate` receives enough payments to become fully covered, the state will be `COVERED` (not `EXPIRED`), because the `COVERED` check has higher priority than the `EXPIRED` check in the state computation chain (`CLOSED > CANCELLED > COVERED > EXPIRED > PARTIAL > OPEN`). Note: `CLOSED` and `CANCELLED` are determined by a separate frozen-balances code path, not the same dynamic if-else chain that computes `COVERED > EXPIRED > PARTIAL > OPEN`.
 - There is no option to hard-reject payments after the due date.
 - `createInvoice()` validates that `dueDate > Date.now()` at creation time (line 790–792) but does not enforce it after creation.
 

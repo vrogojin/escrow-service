@@ -334,6 +334,7 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 | `PARTIAL_DEPOSIT` | `CANCELLED` | Timeout fired during crash — transition to `CANCELLED` |
 | `DEPOSIT_INVOICE_CREATED` | `CANCELLED` | Manual or unexpected cancellation before any deposit — transition to `CANCELLED` |
 | `DEPOSIT_INVOICE_CREATED` | `CLOSED` | Deposit closed without the escrow tracking it — investigate and transition to `FAILED` |
+| `DEPOSIT_COVERED` | `OPEN` or `PARTIAL` or `EXPIRED` | Coverage regressed during crash window — auto-returns or late return-direction transfers reduced `netCoveredAmount` below threshold. Re-validate per-sender coverage. If valid coverage can be restored (correct parties' payments alone still meet thresholds), proceed with conclusion. If not, revert swap to `PARTIAL_DEPOSIT`, re-subscribe to events, and re-register timeout with remaining time. |
 | `DEPOSIT_COVERED` | `CANCELLED` | Deposit cancelled after coverage (e.g., admin action during crash window) — check if deposits were auto-returned (inspect auto-return dedup ledger). If all returned, transition to `CANCELLED`. If partially returned or no returns, transition to `FAILED` for manual intervention. |
 | `DEPOSIT_COVERED` | `CLOSED` | Deposit closed before payouts created — create payout invoices if missing, persist as `CONCLUDING`, then proceed with payouts |
 | `CONCLUDING` | `CLOSED` | Payouts may be partially complete — check each payout invoice individually (see below) |

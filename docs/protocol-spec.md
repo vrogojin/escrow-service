@@ -373,6 +373,12 @@ On each `invoice:payment` event, the escrow:
 // NOT raw senderAddress — the SDK validates balance cap against
 // senderBalances keyed by effectiveSender.
 const recipient = transfer.refundAddress ?? transfer.senderAddress;
+if (!recipient) {
+  // senderAddress is null (masked predicate) and no refundAddress —
+  // cannot return payment. Log for manual intervention.
+  log.warn(`Cannot return payment: no return address for transfer ${transfer.transferId}`);
+  return;
+}
 await accounting.returnInvoicePayment(depositInvoiceId, {
   recipient,                      // DIRECT:// address to return to
   amount: paymentAmount,          // amount to return (smallest units)
@@ -609,11 +615,11 @@ The authoritative invoice reference is encoded in `TransferTransactionData.messa
 
 Fields:
 - `inv.id` — invoice ID (required, normalized to lowercase)
-- `inv.dir` — direction code (required: `F`, `B`, `RC`, `RX`)
-- `inv.ra` — refund address (optional, DIRECT:// format, max 256 chars)
-- `inv.ct.a` — contact address (optional, DIRECT:// format, max 256 chars)
-- `inv.ct.u` — contact URL (optional, https:// or wss://, max 2048 chars)
-- `txt` — free text (optional, max 1024 code points)
+- `inv.dir` — direction code (optional, defaults to `F` if absent: `F`, `B`, `RC`, `RX`)
+- `inv.ra` — refund address (optional, DIRECT:// format, max 256 UTF-16 code units)
+- `inv.ct.a` — contact address (optional, DIRECT:// format, max 256 UTF-16 code units)
+- `inv.ct.u` — contact URL (optional, https:// or wss://, max 2048 UTF-16 code units)
+- `txt` — free text (optional, max 1024 Unicode code points)
 
 ### Swap ID ↔ Invoice Memo Mapping
 
