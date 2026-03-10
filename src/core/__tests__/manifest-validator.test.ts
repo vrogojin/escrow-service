@@ -724,4 +724,44 @@ describe('manifest-validator', () => {
       }));
     });
   });
+
+  describe('validateManifest - leading-zero rejection', () => {
+    it('should reject value "007" with leading zeros', () => {
+      const manifest = makeValidManifest({ party_a_value_to_change: '007' });
+      const result = validateManifest(manifest);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContainEqual(expect.objectContaining({
+        field: 'party_a_value_to_change',
+        message: expect.stringContaining('positive integer'),
+      }));
+    });
+
+    it('should reject value "0" as not a positive integer', () => {
+      const manifest = makeValidManifest({ party_b_value_to_change: '0' });
+      const result = validateManifest(manifest);
+      expect(result.valid).toBe(false);
+      expect(result.errors).toContainEqual(expect.objectContaining({
+        field: 'party_b_value_to_change',
+        message: expect.stringContaining('positive integer'),
+      }));
+    });
+
+    it('should accept value "1" as valid positive integer', () => {
+      const manifest = makeValidManifest({
+        party_a_value_to_change: '1',
+        party_b_value_to_change: '1',
+      });
+      const result = validateManifest(manifest);
+      expect(result.valid).toBe(true);
+    });
+
+    it('should accept large BigInt value without leading zeros', () => {
+      const manifest = makeValidManifest({
+        party_a_value_to_change: '1000000000000000000',
+        party_b_value_to_change: '1000000000000000000',
+      });
+      const result = validateManifest(manifest);
+      expect(result.valid).toBe(true);
+    });
+  });
 });

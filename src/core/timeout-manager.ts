@@ -1,152 +1,167 @@
-import type { Pool } from 'pg';
-import type { Redis } from 'ioredis';
-import { SwapRepository } from '../storage/repositories/swap.repository.js';
+/**
+ * TimeoutManager
+ *
+ * Simplified in-process timer manager for swap timeouts. Replaces the previous
+ * Redis + PostgreSQL-based implementation with plain Node.js setTimeout handles.
+ *
+ * The timer starts from the first deposit event, not from manifest submission.
+ * On crash recovery, remaining time is computed from the persisted timeout_at
+ * timestamp and passed to reRegister().
+ *
+ * The AccountingModule's dueDate is informational only — the escrow enforces
+ * timeouts at the application level via this class.
+ */
+
 import { logger } from '../utils/logger.js';
 
-const TIMEOUT_KEY = 'swap_timeouts';
-
 export interface TimeoutManagerDeps {
-  pool: Pool;
-  swapRepo: SwapRepository;
-  redis: Redis;
+  /** Callback invoked when a swap's timeout expires. */
   onTimeout: (swapId: string) => Promise<void>;
 }
 
+/** Internal record storing the timer handle and deadline for each swap. */
+interface TimerEntry {
+  handle: NodeJS.Timeout;
+  deadlineMs: number;
+}
+
+/**
+ * Manages application-level timeout timers for active swaps.
+ *
+ * Each swap gets at most one active timer. Timers are stored in memory —
+ * crash recovery must use reRegister() with the remaining time computed
+ * from persisted timeout_at.
+ */
 export class TimeoutManager {
-  private pool: Pool;
-  private swapRepo: SwapRepository;
-  private redis: Redis;
-  private onTimeout: (swapId: string) => Promise<void>;
-  private redisPollerHandle: ReturnType<typeof setInterval> | null = null;
-  private dbPollerHandle: ReturnType<typeof setInterval> | null = null;
-  private running = false;
+  private readonly timers = new Map<string, TimerEntry>();
+  private readonly onTimeout: (swapId: string) => Promise<void>;
 
   constructor(deps: TimeoutManagerDeps) {
-    this.pool = deps.pool;
-    this.swapRepo = deps.swapRepo;
-    this.redis = deps.redis;
     this.onTimeout = deps.onTimeout;
   }
 
   /**
-   * Schedule a timeout for a swap. Writes to both Redis (fast) and PostgreSQL (durable).
+   * Schedules a timeout for a swap.
+   *
+   * @param swapId - The swap identifier.
+   * @param timeoutMs - Milliseconds from now until timeout fires.
+   * @throws Error if a timer already exists for this swap (caller must cancel first).
    */
-  async scheduleTimeout(swapId: string, timeoutSeconds: number): Promise<void> {
-    const timeoutAt = Date.now() + timeoutSeconds * 1000;
-    await this.redis.zadd(TIMEOUT_KEY, timeoutAt, swapId);
-    logger.info({ swap_id: swapId, timeout_at: new Date(timeoutAt).toISOString() }, 'Timeout scheduled');
+  schedule(swapId: string, timeoutMs: number): void {
+    if (this.timers.has(swapId)) {
+      throw new Error(`Timer already exists for swap ${swapId}. Cancel before rescheduling.`);
+    }
+
+    const deadlineMs = Date.now() + timeoutMs;
+    this._scheduleInternal(swapId, timeoutMs, deadlineMs);
+
+    logger.info({ swap_id: swapId, timeoutMs, deadlineAt: new Date(deadlineMs).toISOString() }, 'Timeout scheduled');
   }
 
   /**
-   * Cancel a timeout (e.g., when conclusion happens before timeout).
+   * Cancels an active timeout timer.
+   *
+   * Idempotent — silently does nothing if no timer exists for the swap.
+   *
+   * @param swapId - The swap identifier.
    */
-  async cancelTimeout(swapId: string): Promise<void> {
-    await this.redis.zrem(TIMEOUT_KEY, swapId);
+  cancel(swapId: string): void {
+    const entry = this.timers.get(swapId);
+    if (!entry) {
+      return;
+    }
+    clearTimeout(entry.handle);
+    this.timers.delete(swapId);
     logger.info({ swap_id: swapId }, 'Timeout cancelled');
   }
 
   /**
-   * Start the timeout polling workers.
+   * Returns the remaining time in milliseconds for a scheduled timer.
+   *
+   * @param swapId - The swap identifier.
+   * @returns Remaining milliseconds (may be negative if overdue), or null if no timer.
    */
-  start(): void {
-    if (this.running) return;
-    this.running = true;
-
-    // Redis poller: check every 1 second for expired timeouts
-    this.redisPollerHandle = setInterval(() => this.pollRedis(), 1000);
-
-    // Database backup poller: check every 10 seconds
-    this.dbPollerHandle = setInterval(() => this.pollDatabase(), 10000);
-
-    logger.info('Timeout manager started');
+  getRemainingTime(swapId: string): number | null {
+    const entry = this.timers.get(swapId);
+    if (!entry) {
+      return null;
+    }
+    return entry.deadlineMs - Date.now();
   }
 
   /**
-   * Stop the timeout polling workers.
+   * Re-registers a timeout for crash recovery.
+   *
+   * Unlike schedule(), this method accepts the remaining time (not the full
+   * original timeout). If remainingMs <= 0, the timeout fires immediately
+   * (in the next microtask turn via setTimeout(fn, 0)).
+   *
+   * Does NOT throw if a timer already exists — it cancels the existing one first.
+   * This is intentional: during recovery, the swap may already have been
+   * re-subscribed and a timer may have been set.
+   *
+   * @param swapId - The swap identifier.
+   * @param remainingMs - Milliseconds remaining until timeout (from persisted timeout_at).
    */
-  stop(): void {
-    this.running = false;
-    if (this.redisPollerHandle) {
-      clearInterval(this.redisPollerHandle);
-      this.redisPollerHandle = null;
-    }
-    if (this.dbPollerHandle) {
-      clearInterval(this.dbPollerHandle);
-      this.dbPollerHandle = null;
-    }
-    logger.info('Timeout manager stopped');
-  }
+  reRegister(swapId: string, remainingMs: number): void {
+    // Cancel any existing timer to avoid duplicates
+    this.cancel(swapId);
 
-  /**
-   * Recover timeouts from the database on startup.
-   */
-  async recover(): Promise<void> {
-    logger.info('Recovering timeouts from database');
-    const timedOutSwaps = await this.swapRepo.findTimedOut();
+    const effectiveMs = Math.max(0, remainingMs);
+    const deadlineMs = Date.now() + effectiveMs;
+    this._scheduleInternal(swapId, effectiveMs, deadlineMs);
 
-    // Process already-expired swaps
-    for (const swap of timedOutSwaps) {
-      logger.info({ swap_id: swap.swap_id }, 'Processing expired timeout on recovery');
-      await this.onTimeout(swap.swap_id);
-    }
-
-    // Re-schedule future timeouts from DB
-    const result = await this.pool.query<{ swap_id: string; timeout_at: Date }>(
-      `SELECT swap_id, timeout_at FROM swap_cases
-       WHERE state = 'PARTIAL_DEPOSIT' AND timeout_at IS NOT NULL AND timeout_at > NOW()`,
+    logger.info(
+      { swap_id: swapId, remainingMs, effectiveMs, deadlineAt: new Date(deadlineMs).toISOString() },
+      'Timeout re-registered (crash recovery)',
     );
-
-    for (const row of result.rows) {
-      const timeoutAt = row.timeout_at.getTime();
-      await this.redis.zadd(TIMEOUT_KEY, timeoutAt, row.swap_id);
-      logger.info({ swap_id: row.swap_id, timeout_at: row.timeout_at }, 'Timeout re-scheduled from DB');
-    }
-
-    logger.info({ recovered: timedOutSwaps.length, rescheduled: result.rows.length }, 'Timeout recovery complete');
   }
 
-  private async pollRedis(): Promise<void> {
-    if (!this.running) return;
-
-    try {
-      const now = Date.now();
-      // Get all swap IDs with timeout_at <= now
-      const expired = await this.redis.zrangebyscore(TIMEOUT_KEY, 0, now);
-
-      for (const swapId of expired) {
-        // Remove from Redis first to prevent duplicate processing
-        const removed = await this.redis.zrem(TIMEOUT_KEY, swapId);
-        if (removed > 0) {
-          logger.info({ swap_id: swapId }, 'Timeout expired (Redis poller)');
-          this.onTimeout(swapId).catch((err) => {
-            logger.error({ err, swap_id: swapId }, 'Error handling timeout');
-          });
-        }
-      }
-    } catch (err) {
-      logger.error({ err }, 'Redis timeout poll error');
-    }
+  /**
+   * Returns whether a timer is currently scheduled for the given swap.
+   *
+   * @param swapId - The swap identifier.
+   */
+  hasTimer(swapId: string): boolean {
+    return this.timers.has(swapId);
   }
 
-  private async pollDatabase(): Promise<void> {
-    if (!this.running) return;
-
-    try {
-      const timedOutSwaps = await this.swapRepo.findTimedOut();
-
-      for (const swap of timedOutSwaps) {
-        // Check if it's still in Redis (already being processed)
-        const score = await this.redis.zscore(TIMEOUT_KEY, swap.swap_id);
-        if (score === null) {
-          // Not in Redis — may have been missed
-          logger.info({ swap_id: swap.swap_id }, 'Timeout caught by DB backup poller');
-          this.onTimeout(swap.swap_id).catch((err) => {
-            logger.error({ err, swap_id: swap.swap_id }, 'Error handling timeout (DB poller)');
-          });
-        }
-      }
-    } catch (err) {
-      logger.error({ err }, 'Database timeout poll error');
+  /**
+   * Cancels all active timers and clears internal state.
+   *
+   * Must be called on graceful shutdown to prevent timers from firing after
+   * the orchestrator has been torn down.
+   */
+  destroy(): void {
+    for (const [swapId, entry] of this.timers) {
+      clearTimeout(entry.handle);
+      logger.debug({ swap_id: swapId }, 'Timer cleared on destroy');
     }
+    this.timers.clear();
+    logger.info('TimeoutManager destroyed');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Internal helper that creates the setTimeout, stores the entry, and wires
+   * the fired callback to clear the timer reference (preventing memory leaks).
+   */
+  private _scheduleInternal(swapId: string, delayMs: number, deadlineMs: number): void {
+    const handle = setTimeout(() => {
+      // Clear the timer reference before firing to prevent memory leaks
+      // and allow hasTimer() to return false within the callback
+      this.timers.delete(swapId);
+
+      logger.info({ swap_id: swapId }, 'Swap timeout fired');
+
+      this.onTimeout(swapId).catch((err: unknown) => {
+        logger.error({ err, swap_id: swapId }, 'Error handling swap timeout');
+      });
+    }, delayMs);
+
+    this.timers.set(swapId, { handle, deadlineMs });
   }
 }

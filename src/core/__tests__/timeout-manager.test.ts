@@ -1,550 +1,238 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import type { Pool } from 'pg';
-import type { Redis } from 'ioredis';
-import { TimeoutManager, type TimeoutManagerDeps } from '../timeout-manager.js';
-import type { SwapRepository } from '../../storage/repositories/swap.repository.js';
-import type { SwapCaseRow } from '../../storage/repositories/swap.repository.js';
+import { TimeoutManager } from '../timeout-manager.js';
 
 describe('TimeoutManager', () => {
-  let mockRedis: Partial<Redis>;
-  let mockSwapRepo: Partial<SwapRepository>;
-  let mockPool: Partial<Pool>;
-  let mockOnTimeout: ReturnType<typeof vi.fn>;
+  let onTimeoutMock: ReturnType<typeof vi.fn>;
   let timeoutManager: TimeoutManager;
 
   beforeEach(() => {
-    vi.clearAllMocks();
-
-    mockRedis = {
-      zadd: vi.fn().mockResolvedValue(1),
-      zrem: vi.fn().mockResolvedValue(1),
-      zrangebyscore: vi.fn().mockResolvedValue([]),
-      zscore: vi.fn().mockResolvedValue(null),
-    };
-
-    mockSwapRepo = {
-      findTimedOut: vi.fn().mockResolvedValue([]),
-    };
-
-    mockPool = {
-      query: vi.fn().mockResolvedValue({ rows: [] }),
-    };
-
-    mockOnTimeout = vi.fn().mockResolvedValue(undefined);
-
-    timeoutManager = new TimeoutManager({
-      pool: mockPool as Pool,
-      swapRepo: mockSwapRepo as SwapRepository,
-      redis: mockRedis as Redis,
-      onTimeout: mockOnTimeout,
-    });
+    vi.useFakeTimers();
+    onTimeoutMock = vi.fn().mockResolvedValue(undefined);
+    timeoutManager = new TimeoutManager({ onTimeout: onTimeoutMock });
   });
 
   afterEach(() => {
-    timeoutManager.stop();
-    vi.restoreAllMocks();
+    timeoutManager.destroy();
+    vi.useRealTimers();
   });
 
-  describe('scheduleTimeout', () => {
-    it('should add swap to Redis sorted set with correct score', async () => {
+  describe('schedule()', () => {
+    it('should schedule timeout for given milliseconds', () => {
       const swapId = 'a'.repeat(64);
-      const timeoutSeconds = 300;
+      const timeoutMs = 5000;
 
-      await timeoutManager.scheduleTimeout(swapId, timeoutSeconds);
+      timeoutManager.schedule(swapId, timeoutMs);
 
-      expect(mockRedis.zadd).toHaveBeenCalledTimes(1);
-      const [key, score, id] = (mockRedis.zadd as any).mock.calls[0];
-      expect(key).toBe('swap_timeouts');
-      expect(id).toBe(swapId);
-      expect(typeof score).toBe('number');
-      expect(Math.abs(score - (Date.now() + timeoutSeconds * 1000))).toBeLessThan(100);
+      expect(timeoutManager.hasTimer(swapId)).toBe(true);
     });
 
-    it('should schedule multiple timeouts independently', async () => {
+    it('should fire callback after timeout duration elapses', async () => {
+      const swapId = 'a'.repeat(64);
+      const timeoutMs = 5000;
+
+      timeoutManager.schedule(swapId, timeoutMs);
+
+      vi.advanceTimersByTime(timeoutMs);
+      await vi.runAllTimersAsync();
+
+      expect(onTimeoutMock).toHaveBeenCalledWith(swapId);
+      expect(onTimeoutMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('should cancel scheduled timeout when cancel() is called', async () => {
+      const swapId = 'a'.repeat(64);
+      const timeoutMs = 5000;
+
+      timeoutManager.schedule(swapId, timeoutMs);
+      expect(timeoutManager.hasTimer(swapId)).toBe(true);
+
+      timeoutManager.cancel(swapId);
+      expect(timeoutManager.hasTimer(swapId)).toBe(false);
+
+      vi.advanceTimersByTime(timeoutMs);
+      await vi.runAllTimersAsync();
+
+      expect(onTimeoutMock).not.toHaveBeenCalled();
+    });
+
+    it('should be idempotent: calling cancel() on non-existent timer is a no-op', () => {
+      const swapId = 'a'.repeat(64);
+
+      expect(() => {
+        timeoutManager.cancel(swapId);
+      }).not.toThrow();
+
+      expect(timeoutManager.hasTimer(swapId)).toBe(false);
+    });
+
+    it('should not fire callback if cancelled before expiry', async () => {
+      const swapId = 'a'.repeat(64);
+      const timeoutMs = 5000;
+
+      timeoutManager.schedule(swapId, timeoutMs);
+
+      vi.advanceTimersByTime(2000);
+      timeoutManager.cancel(swapId);
+
+      vi.advanceTimersByTime(3000);
+      await vi.runAllTimersAsync();
+
+      expect(onTimeoutMock).not.toHaveBeenCalled();
+    });
+
+    it('should handle multiple concurrent timeouts for different swap IDs', async () => {
+      const swapId1 = 'a'.repeat(64);
+      const swapId2 = 'b'.repeat(64);
+      const swapId3 = 'c'.repeat(64);
+
+      timeoutManager.schedule(swapId1, 2000);
+      timeoutManager.schedule(swapId2, 4000);
+      timeoutManager.schedule(swapId3, 6000);
+
+      vi.advanceTimersByTime(2001);
+      await vi.waitFor(() => onTimeoutMock.mock.calls.length === 1);
+      expect(onTimeoutMock).toHaveBeenNthCalledWith(1, swapId1);
+
+      vi.advanceTimersByTime(2000);
+      await vi.waitFor(() => onTimeoutMock.mock.calls.length === 2);
+      expect(onTimeoutMock).toHaveBeenNthCalledWith(2, swapId2);
+
+      vi.advanceTimersByTime(2000);
+      await vi.waitFor(() => onTimeoutMock.mock.calls.length === 3);
+      expect(onTimeoutMock).toHaveBeenNthCalledWith(3, swapId3);
+    });
+  });
+
+  describe('getRemainingTime()', () => {
+    it('should report remaining time for a scheduled timeout', () => {
+      const swapId = 'a'.repeat(64);
+      const timeoutMs = 5000;
+
+      timeoutManager.schedule(swapId, timeoutMs);
+
+      const remaining1 = timeoutManager.getRemainingTime(swapId);
+      expect(remaining1).toBeDefined();
+      expect(remaining1).toBeLessThanOrEqual(timeoutMs);
+      expect(remaining1).toBeGreaterThan(0);
+
+      vi.advanceTimersByTime(2000);
+
+      const remaining2 = timeoutManager.getRemainingTime(swapId);
+      expect(remaining2).toBeDefined();
+      expect(remaining2).toBeLessThanOrEqual(3000);
+      expect(remaining2).toBeGreaterThan(0);
+    });
+
+    it('should return null from getRemainingTime for non-existent timer', () => {
+      const swapId = 'a'.repeat(64);
+
+      const remaining = timeoutManager.getRemainingTime(swapId);
+
+      expect(remaining).toBeNull();
+    });
+  });
+
+  describe('reRegister()', () => {
+    it('should re-register timeout with remaining time', async () => {
+      const swapId = 'a'.repeat(64);
+
+      timeoutManager.schedule(swapId, 10000);
+
+      vi.advanceTimersByTime(3000);
+
+      const remaining = timeoutManager.getRemainingTime(swapId)!;
+      expect(remaining).toBeGreaterThan(0);
+      expect(remaining).toBeLessThanOrEqual(7000);
+
+      timeoutManager.reRegister(swapId, remaining);
+
+      expect(timeoutManager.hasTimer(swapId)).toBe(true);
+
+      vi.advanceTimersByTime(remaining);
+      await vi.runAllTimersAsync();
+
+      expect(onTimeoutMock).toHaveBeenCalledWith(swapId);
+    });
+
+    it('should fire immediately when reRegister called with remainingMs <= 0', async () => {
+      const swapId = 'a'.repeat(64);
+
+      timeoutManager.reRegister(swapId, -1000);
+
+      vi.advanceTimersByTime(0);
+      await vi.runAllTimersAsync();
+
+      expect(onTimeoutMock).toHaveBeenCalledWith(swapId);
+    });
+
+    it('should throw if scheduling timeout for swap that already has active timer', () => {
+      const swapId = 'a'.repeat(64);
+
+      timeoutManager.schedule(swapId, 5000);
+
+      expect(() => {
+        timeoutManager.schedule(swapId, 3000);
+      }).toThrow(/Timer already exists for swap/);
+    });
+
+    it('should clear timer reference after firing (hasTimer returns false in callback)', async () => {
+      const swapId = 'a'.repeat(64);
+      let hasTimerDuringCallback: boolean | undefined;
+
+      onTimeoutMock.mockImplementation(async (id: string) => {
+        hasTimerDuringCallback = timeoutManager.hasTimer(id);
+      });
+
+      timeoutManager.schedule(swapId, 5000);
+
+      vi.advanceTimersByTime(5000);
+      await vi.runAllTimersAsync();
+
+      expect(hasTimerDuringCallback).toBe(false);
+      expect(timeoutManager.hasTimer(swapId)).toBe(false);
+    });
+
+    it('should not extend timeout window when re-registering after crash', async () => {
+      const swapId = 'a'.repeat(64);
+
+      // Initial schedule: 10s from now
+      timeoutManager.schedule(swapId, 10000);
+
+      // Simulate crash after 3s elapsed
+      vi.advanceTimersByTime(3000);
+
+      // Crash recovery: re-register with remaining time from persisted timeout_at
+      const remaining = timeoutManager.getRemainingTime(swapId)!;
+      timeoutManager.reRegister(swapId, remaining);
+
+      // Should fire after the remaining time, not after a new 10s window
+      vi.advanceTimersByTime(remaining);
+      await vi.runAllTimersAsync();
+
+      expect(onTimeoutMock).toHaveBeenCalledWith(swapId);
+    });
+  });
+
+  describe('destroy()', () => {
+    it('should destroy all timers on destroy()', async () => {
       const swapId1 = 'a'.repeat(64);
       const swapId2 = 'b'.repeat(64);
 
-      await timeoutManager.scheduleTimeout(swapId1, 300);
-      await timeoutManager.scheduleTimeout(swapId2, 600);
+      timeoutManager.schedule(swapId1, 5000);
+      timeoutManager.schedule(swapId2, 10000);
 
-      expect(mockRedis.zadd).toHaveBeenCalledTimes(2);
-    });
+      expect(timeoutManager.hasTimer(swapId1)).toBe(true);
+      expect(timeoutManager.hasTimer(swapId2)).toBe(true);
 
-    it('should handle timeouts with zero seconds', async () => {
-      const swapId = 'a'.repeat(64);
+      timeoutManager.destroy();
 
-      await timeoutManager.scheduleTimeout(swapId, 0);
+      expect(timeoutManager.hasTimer(swapId1)).toBe(false);
+      expect(timeoutManager.hasTimer(swapId2)).toBe(false);
 
-      expect(mockRedis.zadd).toHaveBeenCalledTimes(1);
-    });
-  });
+      vi.advanceTimersByTime(15000);
+      await vi.runAllTimersAsync();
 
-  describe('cancelTimeout', () => {
-    it('should remove swap from Redis by swap ID', async () => {
-      const swapId = 'a'.repeat(64);
-
-      await timeoutManager.cancelTimeout(swapId);
-
-      expect(mockRedis.zrem).toHaveBeenCalledTimes(1);
-      expect(mockRedis.zrem).toHaveBeenCalledWith('swap_timeouts', swapId);
-    });
-
-    it('should handle cancellation of non-existent timeout', async () => {
-      (mockRedis.zrem as any).mockResolvedValue(0);
-      const swapId = 'a'.repeat(64);
-
-      await timeoutManager.cancelTimeout(swapId);
-
-      expect(mockRedis.zrem).toHaveBeenCalledWith('swap_timeouts', swapId);
-    });
-
-    it('should cancel multiple timeouts independently', async () => {
-      const swapId1 = 'a'.repeat(64);
-      const swapId2 = 'b'.repeat(64);
-
-      await timeoutManager.cancelTimeout(swapId1);
-      await timeoutManager.cancelTimeout(swapId2);
-
-      expect(mockRedis.zrem).toHaveBeenCalledTimes(2);
-    });
-  });
-
-  describe('start', () => {
-    it('should set up two intervals for pollers', () => {
-      const setIntervalSpy = vi.spyOn(global, 'setInterval');
-
-      timeoutManager.start();
-
-      expect(setIntervalSpy).toHaveBeenCalledTimes(2);
-      expect(setIntervalSpy).toHaveBeenNthCalledWith(1, expect.any(Function), 1000);
-      expect(setIntervalSpy).toHaveBeenNthCalledWith(2, expect.any(Function), 10000);
-
-      setIntervalSpy.mockRestore();
-    });
-
-    it('should be idempotent when called multiple times', () => {
-      const setIntervalSpy = vi.spyOn(global, 'setInterval');
-
-      timeoutManager.start();
-      timeoutManager.start();
-      timeoutManager.start();
-
-      expect(setIntervalSpy).toHaveBeenCalledTimes(2);
-
-      setIntervalSpy.mockRestore();
-    });
-
-    it('should set running flag to true', () => {
-      timeoutManager.start();
-
-      expect((timeoutManager as any).running).toBe(true);
-    });
-  });
-
-  describe('stop', () => {
-    it('should clear both intervals', () => {
-      const clearIntervalSpy = vi.spyOn(global, 'clearInterval');
-
-      timeoutManager.start();
-      timeoutManager.stop();
-
-      expect(clearIntervalSpy).toHaveBeenCalledTimes(2);
-
-      clearIntervalSpy.mockRestore();
-    });
-
-    it('should set running flag to false', () => {
-      timeoutManager.start();
-      timeoutManager.stop();
-
-      expect((timeoutManager as any).running).toBe(false);
-    });
-
-    it('should handle being called when not started', () => {
-      const clearIntervalSpy = vi.spyOn(global, 'clearInterval');
-
-      timeoutManager.stop();
-
-      expect(clearIntervalSpy).not.toHaveBeenCalled();
-
-      clearIntervalSpy.mockRestore();
-    });
-
-    it('should be safe to call multiple times', () => {
-      const clearIntervalSpy = vi.spyOn(global, 'clearInterval');
-
-      timeoutManager.start();
-      timeoutManager.stop();
-      timeoutManager.stop();
-      timeoutManager.stop();
-
-      expect(clearIntervalSpy).toHaveBeenCalledTimes(2);
-
-      clearIntervalSpy.mockRestore();
-    });
-  });
-
-  describe('recover', () => {
-    it('should process already-expired swaps from DB', async () => {
-      const expiredSwap: SwapCaseRow = {
-        id: '1',
-        swap_id: 'a'.repeat(64),
-        manifest: {} as any,
-        state: 'PARTIAL_DEPOSIT' as any,
-        party_a_deposited: '0',
-        party_b_deposited: '0',
-        party_a_coin_id: null,
-        party_b_coin_id: null,
-        created_at: new Date(),
-        first_deposit_at: new Date(),
-        timeout_at: new Date(Date.now() - 1000),
-        completed_at: null,
-        error_message: null,
-        version: 1,
-      };
-
-      (mockSwapRepo.findTimedOut as any).mockResolvedValue([expiredSwap]);
-
-      await timeoutManager.recover();
-
-      expect(mockOnTimeout).toHaveBeenCalledWith(expiredSwap.swap_id);
-    });
-
-    it('should re-schedule future timeouts to Redis', async () => {
-      const futureTimeout = Date.now() + 60000;
-      (mockPool.query as any).mockResolvedValue({
-        rows: [
-          {
-            swap_id: 'b'.repeat(64),
-            timeout_at: new Date(futureTimeout),
-          },
-        ],
-      });
-
-      await timeoutManager.recover();
-
-      expect(mockRedis.zadd).toHaveBeenCalledWith('swap_timeouts', futureTimeout, 'b'.repeat(64));
-    });
-
-    it('should handle multiple expired and future timeouts', async () => {
-      const expiredSwap1: SwapCaseRow = {
-        id: '1',
-        swap_id: 'a'.repeat(64),
-        manifest: {} as any,
-        state: 'PARTIAL_DEPOSIT' as any,
-        party_a_deposited: '0',
-        party_b_deposited: '0',
-        party_a_coin_id: null,
-        party_b_coin_id: null,
-        created_at: new Date(),
-        first_deposit_at: new Date(),
-        timeout_at: new Date(Date.now() - 1000),
-        completed_at: null,
-        error_message: null,
-        version: 1,
-      };
-
-      const expiredSwap2: SwapCaseRow = {
-        ...expiredSwap1,
-        swap_id: 'c'.repeat(64),
-      };
-
-      (mockSwapRepo.findTimedOut as any).mockResolvedValue([expiredSwap1, expiredSwap2]);
-
-      const futureTimeout = Date.now() + 60000;
-      (mockPool.query as any).mockResolvedValue({
-        rows: [
-          {
-            swap_id: 'b'.repeat(64),
-            timeout_at: new Date(futureTimeout),
-          },
-          {
-            swap_id: 'd'.repeat(64),
-            timeout_at: new Date(futureTimeout + 30000),
-          },
-        ],
-      });
-
-      await timeoutManager.recover();
-
-      expect(mockOnTimeout).toHaveBeenCalledTimes(2);
-      expect(mockRedis.zadd).toHaveBeenCalledTimes(2);
-    });
-
-    it('should not fail if no timeouts to recover', async () => {
-      (mockSwapRepo.findTimedOut as any).mockResolvedValue([]);
-      (mockPool.query as any).mockResolvedValue({ rows: [] });
-
-      await expect(timeoutManager.recover()).resolves.not.toThrow();
-    });
-  });
-
-  describe('pollRedis', () => {
-    // Directly invoke the private pollRedis method to avoid fake timer issues
-    const invokePollRedis = () => (timeoutManager as any).pollRedis();
-
-    it('should fire onTimeout for expired entries', async () => {
-      const expiredSwapId = 'a'.repeat(64);
-
-      (mockRedis.zrangebyscore as any).mockResolvedValue([expiredSwapId]);
-      (mockRedis.zrem as any).mockResolvedValue(1);
-
-      // Must be running for pollRedis to execute
-      (timeoutManager as any).running = true;
-
-      await invokePollRedis();
-      // Wait for fire-and-forget onTimeout promise
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockOnTimeout).toHaveBeenCalledWith(expiredSwapId);
-    });
-
-    it('should remove expired entries from Redis before calling onTimeout', async () => {
-      const expiredSwapId = 'a'.repeat(64);
-
-      (mockRedis.zrangebyscore as any).mockResolvedValue([expiredSwapId]);
-      (mockRedis.zrem as any).mockResolvedValue(1);
-
-      (timeoutManager as any).running = true;
-
-      await invokePollRedis();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockRedis.zrem).toHaveBeenCalledWith('swap_timeouts', expiredSwapId);
-    });
-
-    it('should skip entries that fail to remove (already processed)', async () => {
-      const expiredSwapId = 'a'.repeat(64);
-
-      (mockRedis.zrangebyscore as any).mockResolvedValue([expiredSwapId]);
-      (mockRedis.zrem as any).mockResolvedValue(0); // Already removed
-
-      (timeoutManager as any).running = true;
-
-      await invokePollRedis();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockOnTimeout).not.toHaveBeenCalled();
-    });
-
-    it('should handle errors in Redis queries gracefully', async () => {
-      (mockRedis.zrangebyscore as any).mockRejectedValue(new Error('Redis connection failed'));
-
-      (timeoutManager as any).running = true;
-
-      // Should not throw
-      await expect(invokePollRedis()).resolves.not.toThrow();
-
-      expect(mockOnTimeout).not.toHaveBeenCalled();
-    });
-
-    it('should not run if manager is not running', async () => {
-      const expiredSwapId = 'a'.repeat(64);
-
-      (mockRedis.zrangebyscore as any).mockResolvedValue([expiredSwapId]);
-
-      (timeoutManager as any).running = false;
-
-      await invokePollRedis();
-
-      expect(mockRedis.zrangebyscore).not.toHaveBeenCalled();
-    });
-
-    it('should process multiple expired entries in a single poll', async () => {
-      const swapIds = ['a'.repeat(64), 'b'.repeat(64), 'c'.repeat(64)];
-
-      (mockRedis.zrangebyscore as any).mockResolvedValue(swapIds);
-      (mockRedis.zrem as any).mockResolvedValue(1);
-
-      (timeoutManager as any).running = true;
-
-      await invokePollRedis();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockOnTimeout).toHaveBeenCalledTimes(3);
-      swapIds.forEach((id) => {
-        expect(mockOnTimeout).toHaveBeenCalledWith(id);
-      });
-    });
-  });
-
-  describe('pollDatabase', () => {
-    // Directly invoke the private pollDatabase method
-    const invokePollDatabase = () => (timeoutManager as any).pollDatabase();
-
-    it('should find timeouts not in Redis', async () => {
-      const missedSwapId = 'a'.repeat(64);
-
-      const missedSwap: SwapCaseRow = {
-        id: '1',
-        swap_id: missedSwapId,
-        manifest: {} as any,
-        state: 'PARTIAL_DEPOSIT' as any,
-        party_a_deposited: '0',
-        party_b_deposited: '0',
-        party_a_coin_id: null,
-        party_b_coin_id: null,
-        created_at: new Date(),
-        first_deposit_at: new Date(),
-        timeout_at: new Date(Date.now() - 1000),
-        completed_at: null,
-        error_message: null,
-        version: 1,
-      };
-
-      (mockSwapRepo.findTimedOut as any).mockResolvedValue([missedSwap]);
-      (mockRedis.zscore as any).mockResolvedValue(null); // Not in Redis
-
-      (timeoutManager as any).running = true;
-
-      await invokePollDatabase();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockOnTimeout).toHaveBeenCalledWith(missedSwapId);
-    });
-
-    it('should skip timeouts still in Redis', async () => {
-      const swapId = 'a'.repeat(64);
-
-      const swap: SwapCaseRow = {
-        id: '1',
-        swap_id: swapId,
-        manifest: {} as any,
-        state: 'PARTIAL_DEPOSIT' as any,
-        party_a_deposited: '0',
-        party_b_deposited: '0',
-        party_a_coin_id: null,
-        party_b_coin_id: null,
-        created_at: new Date(),
-        first_deposit_at: new Date(),
-        timeout_at: new Date(Date.now() - 1000),
-        completed_at: null,
-        error_message: null,
-        version: 1,
-      };
-
-      (mockSwapRepo.findTimedOut as any).mockResolvedValue([swap]);
-      (mockRedis.zscore as any).mockResolvedValue(Date.now() - 1000); // Still in Redis
-
-      (timeoutManager as any).running = true;
-
-      await invokePollDatabase();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockOnTimeout).not.toHaveBeenCalled();
-    });
-
-    it('should handle errors in database queries gracefully', async () => {
-      (mockSwapRepo.findTimedOut as any).mockRejectedValue(new Error('Database error'));
-
-      (timeoutManager as any).running = true;
-
-      await expect(invokePollDatabase()).resolves.not.toThrow();
-
-      expect(mockOnTimeout).not.toHaveBeenCalled();
-    });
-
-    it('should not run if manager is not running', async () => {
-      (mockSwapRepo.findTimedOut as any).mockResolvedValue([]);
-
-      (timeoutManager as any).running = false;
-
-      await invokePollDatabase();
-
-      expect(mockSwapRepo.findTimedOut).not.toHaveBeenCalled();
-    });
-
-    it('should use setInterval for backup polling at 10 second intervals', () => {
-      const setIntervalSpy = vi.spyOn(global, 'setInterval');
-
-      timeoutManager.start();
-
-      // Second call to setInterval should be the DB poller at 10s
-      expect(setIntervalSpy).toHaveBeenNthCalledWith(2, expect.any(Function), 10000);
-
-      setIntervalSpy.mockRestore();
-    });
-  });
-
-  describe('Error handling in onTimeout', () => {
-    it('should catch and log errors from onTimeout handler in Redis poller', async () => {
-      const swapId = 'a'.repeat(64);
-
-      (mockRedis.zrangebyscore as any).mockResolvedValue([swapId]);
-      (mockRedis.zrem as any).mockResolvedValue(1);
-      (mockOnTimeout as any).mockRejectedValue(new Error('Handler failed'));
-
-      (timeoutManager as any).running = true;
-
-      // Should not throw — errors are caught by the .catch() handler
-      await (timeoutManager as any).pollRedis();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockOnTimeout).toHaveBeenCalledWith(swapId);
-    });
-
-    it('should catch and log errors from onTimeout handler in DB poller', async () => {
-      const swapId = 'a'.repeat(64);
-
-      const swap: SwapCaseRow = {
-        id: '1',
-        swap_id: swapId,
-        manifest: {} as any,
-        state: 'PARTIAL_DEPOSIT' as any,
-        party_a_deposited: '0',
-        party_b_deposited: '0',
-        party_a_coin_id: null,
-        party_b_coin_id: null,
-        created_at: new Date(),
-        first_deposit_at: new Date(),
-        timeout_at: new Date(Date.now() - 1000),
-        completed_at: null,
-        error_message: null,
-        version: 1,
-      };
-
-      (mockSwapRepo.findTimedOut as any).mockResolvedValue([swap]);
-      (mockRedis.zscore as any).mockResolvedValue(null);
-      (mockOnTimeout as any).mockRejectedValue(new Error('Handler failed'));
-
-      (timeoutManager as any).running = true;
-
-      // Should not throw
-      await (timeoutManager as any).pollDatabase();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockOnTimeout).toHaveBeenCalledWith(swapId);
-    });
-  });
-
-  describe('Integration scenarios', () => {
-    it('should schedule, then timeout on Redis poll', async () => {
-      const swapId = 'a'.repeat(64);
-
-      (mockRedis.zrangebyscore as any).mockResolvedValue([swapId]);
-      (mockRedis.zrem as any).mockResolvedValue(1);
-
-      await timeoutManager.scheduleTimeout(swapId, 300);
-
-      (timeoutManager as any).running = true;
-      await (timeoutManager as any).pollRedis();
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(mockOnTimeout).toHaveBeenCalledWith(swapId);
-    });
-
-    it('should schedule, then cancel before timeout', async () => {
-      const swapId = 'a'.repeat(64);
-
-      await timeoutManager.scheduleTimeout(swapId, 300);
-      await timeoutManager.cancelTimeout(swapId);
-
-      (mockRedis.zrangebyscore as any).mockResolvedValue([]);
-
-      (timeoutManager as any).running = true;
-      await (timeoutManager as any).pollRedis();
-
-      expect(mockOnTimeout).not.toHaveBeenCalled();
+      expect(onTimeoutMock).not.toHaveBeenCalled();
     });
   });
 });

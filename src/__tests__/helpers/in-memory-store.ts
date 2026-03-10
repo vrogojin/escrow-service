@@ -450,9 +450,6 @@ export function createIntegrationContext(
   });
 
   const timeoutManager = new TimeoutManager({
-    pool: pool as any,
-    swapRepo: swapRepo as any,
-    redis: redis as any,
     onTimeout: async (swapId: string) => {
       const p = refundProcessor.processTimeout(swapId);
       timeoutPromises.push(p);
@@ -473,7 +470,11 @@ export function createIntegrationContext(
       concludePromises.push(p);
     },
     onFirstDeposit: (swapId: string, timeoutSeconds: number) => {
-      timeoutManager.scheduleTimeout(swapId, timeoutSeconds);
+      try {
+        timeoutManager.schedule(swapId, timeoutSeconds * 1000);
+      } catch {
+        // Ignore if already scheduled
+      }
     },
     sphere: deps?.sphere as any,
     depositConfirmationTimeoutMs: config.depositConfirmationTimeoutMs,

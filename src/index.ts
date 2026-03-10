@@ -64,9 +64,6 @@ async function main(): Promise<void> {
   });
 
   const timeoutManager = new TimeoutManager({
-    pool,
-    swapRepo,
-    redis,
     onTimeout: (swapId: string) => refundProcessor.processTimeout(swapId),
   });
 
@@ -84,9 +81,11 @@ async function main(): Promise<void> {
       });
     },
     onFirstDeposit: (swapId: string, timeoutSeconds: number) => {
-      timeoutManager.scheduleTimeout(swapId, timeoutSeconds).catch((err) => {
+      try {
+        timeoutManager.schedule(swapId, timeoutSeconds * 1000);
+      } catch (err: unknown) {
         logger.error({ err, swap_id: swapId }, 'Failed to schedule timeout');
-      });
+      }
     },
     sphere,
     depositConfirmationTimeoutMs: config.depositConfirmationTimeoutMs,
@@ -103,20 +102,20 @@ async function main(): Promise<void> {
   // 8. Start payment listener
   paymentListener.start((transfer) => paymentProcessor.processIncomingTransfer(transfer));
 
-  // 9. Start timeout manager with recovery
-  await timeoutManager.recover();
-  timeoutManager.start();
+  // 9. Timeout manager is in-process; no separate start/recover needed in legacy path
 
   // 10. Startup recovery: retry stuck swaps
   await recoverStuckSwaps(swapRepo, conclusionProcessor, refundProcessor);
 
   // 11. Start DM message handler
+  // TODO: Wire up new SwapOrchestrator, InvoiceManager, and NpubRoleMap here
+  // when the invoice-based orchestration layer is fully wired into the entry point.
   const messageHandler = createMessageHandler({
     sphere,
-    swapManager,
-    depositRepo,
-    txRepo,
-    walletManager,
+    orchestrator: swapManager as any,  // temporary: swapManager used as stub until full wiring
+    stateStore: swapRepo as any,
+    invoiceManager: {} as any,
+    npubRoleMap: { register: () => {}, getRole: () => null, getSwapIds: () => [] } as any,
   });
   messageHandler.start();
 
@@ -181,7 +180,7 @@ function setupGracefulShutdown(
 
     // Stop payment listener and timeout manager
     paymentListener.stop();
-    timeoutManager.stop();
+    timeoutManager.destroy();
 
     // Close connections
     await walletManager.destroy().catch((err) => {
