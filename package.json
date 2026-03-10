@@ -11,25 +11,19 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:integration": "vitest run --config vitest.integration.config.ts",
-    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:e2e-live": "vitest run --config vitest.e2e-live.config.ts",
     "typecheck": "tsc --noEmit",
-    "db:migrate": "tsx src/storage/migrate.ts",
     "setup": "bash scripts/setup.sh",
     "init-wallet": "tsx src/scripts/init-wallet.ts"
   },
   "dependencies": {
     "@unicitylabs/sphere-sdk": "file:../sphere-sdk",
     "canonicalize": "^2.0.0",
-    "ioredis": "^5.4.1",
-    "pg": "^8.13.0",
     "pino": "^9.5.0",
-    "pino-pretty": "^11.3.0",
-    "uuid": "^10.0.0"
+    "pino-pretty": "^11.3.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/pg": "^8.11.0",
-    "@types/uuid": "^10.0.0",
     "tsx": "^4.19.0",
     "typescript": "~5.6.0",
     "vitest": "^2.0.0"
