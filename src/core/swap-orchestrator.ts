@@ -544,8 +544,8 @@ export class SwapOrchestrator {
         'invoice:covered — coverage not validated per party, waiting for correct payment',
       );
 
-      // Find and return the unauthorized payment that caused false coverage
-      // Check asset A for unauthorized payers
+      // Best-effort bounce of unauthorized payments that caused false coverage.
+      // Continue bouncing remaining transfers even if one bounce fails.
       for (const transfer of assetA.transfers) {
         if (transfer.paymentDirection !== 'forward') continue;
         if (transfer.senderAddress === null) continue;
@@ -555,10 +555,13 @@ export class SwapOrchestrator {
           swap.resolved_party_b_address,
         );
         if (party !== 'A') {
-          await this._bouncePayment(swap, invoiceId, transfer, 'UNKNOWN_SENDER');
+          try {
+            await this._bouncePayment(swap, invoiceId, transfer, 'UNKNOWN_SENDER');
+          } catch {
+            // Already logged inside _bouncePayment; continue bouncing others
+          }
         }
       }
-      // Check asset B for unauthorized payers
       for (const transfer of assetB.transfers) {
         if (transfer.paymentDirection !== 'forward') continue;
         if (transfer.senderAddress === null) continue;
@@ -568,7 +571,11 @@ export class SwapOrchestrator {
           swap.resolved_party_b_address,
         );
         if (party !== 'B') {
-          await this._bouncePayment(swap, invoiceId, transfer, 'UNKNOWN_SENDER');
+          try {
+            await this._bouncePayment(swap, invoiceId, transfer, 'UNKNOWN_SENDER');
+          } catch {
+            // Already logged inside _bouncePayment; continue bouncing others
+          }
         }
       }
       return;
@@ -602,12 +609,19 @@ export class SwapOrchestrator {
           // Already closed — proceed to payout creation
           logger.info({ swap_id: swap.swap_id }, 'Deposit invoice already closed, proceeding to payouts');
         } else if (err.code === 'INVOICE_ALREADY_CANCELLED') {
-          // Timeout won the race — abort conclusion
-          logger.warn(
+          // Timeout won the race — the invoice is cancelled and deposits are
+          // being auto-returned. We cannot proceed with conclusion. The swap is
+          // currently in DEPOSIT_COVERED (we transitioned it above). Transition
+          // to FAILED for manual reconciliation — crash recovery handles
+          // DEPOSIT_COVERED + CANCELLED via _recoverCancelledAfterCoverage.
+          logger.error(
             { swap_id: swap.swap_id },
-            'Deposit invoice was cancelled (timeout won race), aborting conclusion',
+            'Deposit invoice cancelled (timeout won race) while swap is DEPOSIT_COVERED — transitioning to FAILED',
           );
-          // Reload swap to get the latest state; it should have transitioned via timeout
+          await this._transitionToFailed(
+            coveredSwap,
+            'Deposit invoice cancelled by timeout while in DEPOSIT_COVERED; deposits auto-returned',
+          );
           return;
         } else {
           throw err;
@@ -803,7 +817,7 @@ export class SwapOrchestrator {
       return;
     }
 
-    const concluding = this.stateStore.updateState(
+    let concluding = this.stateStore.updateState(
       swap.swap_id,
       SwapState.CONCLUDING,
       {
@@ -814,8 +828,22 @@ export class SwapOrchestrator {
     );
 
     if (!concluding) {
-      logger.error({ swap_id: swap.swap_id }, 'Version mismatch persisting CONCLUDING state');
-      return;
+      // Version mismatch — another path may have already moved the swap forward.
+      // Check if we're already CONCLUDING (another handler won the race).
+      const recheck = this.stateStore.findBySwapId(swap.swap_id);
+      if (recheck?.state === SwapState.CONCLUDING) {
+        logger.info({ swap_id: swap.swap_id }, 'Another handler already transitioned to CONCLUDING');
+        concluding = recheck;
+      } else {
+        logger.error(
+          { swap_id: swap.swap_id, currentState: recheck?.state },
+          'Version mismatch persisting CONCLUDING — swap in unexpected state, orphaned payout invoices',
+        );
+        if (recheck) {
+          await this._transitionToFailed(recheck, `CONCLUDING version mismatch; payout invoices ${payoutAId}, ${payoutBId} may be orphaned`);
+        }
+        return;
+      }
     }
 
     logger.info(
@@ -915,6 +943,8 @@ export class SwapOrchestrator {
       return;
     }
 
+    // Return the payment — propagate errors so callers know the bounce failed.
+    // This is a funds-movement operation; silent failure would trap funds.
     try {
       await this.invoiceManager.returnPayment(invoiceId, {
         recipient,
@@ -922,20 +952,29 @@ export class SwapOrchestrator {
         coinId: transfer.coinId,
         freeText: `Bounce: ${reason}`,
       });
-
-      logger.info(
-        {
-          swap_id: swap.swap_id,
-          transferId: transfer.transferId,
-          recipient,
-          reason,
-          coinId: transfer.coinId,
-          amount: transfer.amount,
-        },
-        'Payment bounced',
+    } catch (err) {
+      logger.error(
+        { err, swap_id: swap.swap_id, transferId: transfer.transferId, reason },
+        'Failed to return payment (bounce) — funds may be trapped in deposit invoice',
       );
+      // Re-throw so callers can handle the failure
+      throw err;
+    }
 
-      // Notify the sender via DM if possible
+    logger.info(
+      {
+        swap_id: swap.swap_id,
+        transferId: transfer.transferId,
+        recipient,
+        reason,
+        coinId: transfer.coinId,
+        amount: transfer.amount,
+      },
+      'Payment bounced',
+    );
+
+    // Notify the sender via DM — best-effort, do not let DM failure mask a successful bounce
+    try {
       await this.messageSender.sendToAddress(recipient, {
         type: 'bounce_notification',
         swap_id: swap.swap_id,
@@ -943,10 +982,10 @@ export class SwapOrchestrator {
         returned_amount: transfer.amount,
         returned_currency: transfer.coinId,
       });
-    } catch (err) {
-      logger.error(
-        { err, swap_id: swap.swap_id, transferId: transfer.transferId },
-        'Failed to bounce payment',
+    } catch (dmErr) {
+      logger.warn(
+        { err: dmErr, swap_id: swap.swap_id, transferId: transfer.transferId },
+        'Bounce succeeded but DM notification failed',
       );
     }
   }

@@ -397,9 +397,13 @@ export class CrashRecoveryManager {
    */
   private async _recoverTimedOut(swap: SwapRecord): Promise<void> {
     if (!swap.deposit_invoice_id) {
-      logger.warn({ swap_id: swap.swap_id }, 'Recovery: TIMED_OUT but no deposit_invoice_id, transitioning to CANCELLING');
-      this.stateStore.updateState(swap.swap_id, SwapState.CANCELLING, {}, swap.version);
-      this.stateStore.updateState(swap.swap_id, SwapState.CANCELLED, {}, swap.version + 1);
+      logger.warn({ swap_id: swap.swap_id }, 'Recovery: TIMED_OUT but no deposit_invoice_id, transitioning to CANCELLED');
+      const cancelling = this.stateStore.updateState(swap.swap_id, SwapState.CANCELLING, {}, swap.version);
+      if (!cancelling) {
+        logger.warn({ swap_id: swap.swap_id }, 'Recovery: TIMED_OUT — version mismatch on CANCELLING (no invoice)');
+        return;
+      }
+      this._cancelSwap(cancelling);
       return;
     }
 
@@ -599,24 +603,20 @@ export class CrashRecoveryManager {
       }
     }
 
-    await this.orchestrator._concludeSwap(coveredSwap);
+    // Route through _resumePayouts (not _concludeSwap) to avoid explicit
+    // amounts in payInvoice — recovery must omit amount so SDK computes
+    // remaining, preventing double-payment if a prior attempt partially paid.
+    await this._resumePayouts(coveredSwap);
   }
 
   /**
    * Handles DEPOSIT_COVERED + CLOSED recovery.
    * Deposit was closed but payout invoices may not have been created yet.
+   * Always routes through _resumePayouts to use amount-omitting payInvoice.
    */
   private async _concludeFromClosed(swap: SwapRecord): Promise<void> {
-    // If we already have payout IDs, we're actually in CONCLUDING territory
-    if (swap.payout_a_invoice_id && swap.payout_b_invoice_id) {
-      logger.info({ swap_id: swap.swap_id }, 'Recovery: DEPOSIT_COVERED + CLOSED — payout IDs already exist, resuming payouts');
-      await this._resumePayouts(swap);
-      return;
-    }
-
-    // Transition to DEPOSIT_COVERED (to allow conclude to proceed)
-    logger.info({ swap_id: swap.swap_id }, 'Recovery: DEPOSIT_COVERED + CLOSED — creating payout invoices');
-    await this.orchestrator._concludeSwap(swap);
+    logger.info({ swap_id: swap.swap_id }, 'Recovery: DEPOSIT_COVERED + CLOSED — resuming payouts');
+    await this._resumePayouts(swap);
   }
 
   /**
