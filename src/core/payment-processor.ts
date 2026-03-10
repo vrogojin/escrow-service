@@ -260,8 +260,8 @@ export class PaymentProcessor {
       const stateUpdates: Record<string, unknown> = { ...updateFields };
 
       if (bothCovered) {
-        newState = SwapState.READY_TO_CONCLUDE;
-      } else if (swap.state === SwapState.ANNOUNCED) {
+        newState = SwapState.DEPOSIT_COVERED;
+      } else if (swap.state === SwapState.DEPOSIT_INVOICE_CREATED) {
         newState = SwapState.PARTIAL_DEPOSIT;
         stateUpdates.first_deposit_at = new Date();
         const timeoutAt = new Date(Date.now() + swap.manifest.timeout * 1000);
@@ -294,7 +294,7 @@ export class PaymentProcessor {
       }
 
       // Trigger follow-up actions
-      if (newState === SwapState.READY_TO_CONCLUDE) {
+      if (newState === SwapState.DEPOSIT_COVERED) {
         this.onReadyToConclude(swapId);
       } else if (newState === SwapState.PARTIAL_DEPOSIT) {
         this.onFirstDeposit(swapId, swap.manifest.timeout);

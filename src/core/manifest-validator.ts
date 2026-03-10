@@ -27,7 +27,7 @@ export interface ValidationResult {
  */
 function isValidPositiveBigint(value: string): boolean {
   if (typeof value !== 'string') return false;
-  if (!/^[0-9]+$/.test(value)) return false;
+  if (!/^[1-9][0-9]*$/.test(value)) return false;
   try {
     const n = BigInt(value);
     return n > 0n;

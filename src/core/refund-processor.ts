@@ -71,11 +71,11 @@ export class RefundProcessor {
         return;
       }
 
-      // Transition TIMED_OUT → REFUNDING
-      assertTransition(SwapState.TIMED_OUT, SwapState.REFUNDING);
+      // Transition TIMED_OUT → CANCELLING
+      assertTransition(SwapState.TIMED_OUT, SwapState.CANCELLING);
       updated = await this.swapRepo.updateState(
         swapId,
-        SwapState.REFUNDING,
+        SwapState.CANCELLING,
         updated.version,
         {},
         client,
@@ -100,12 +100,12 @@ export class RefundProcessor {
   }
 
   /**
-   * Retry refund for a swap already in REFUNDING state (e.g. on startup recovery).
+   * Retry refund for a swap already in CANCELLING state (e.g. on startup recovery).
    */
   async retryRefund(swapId: string): Promise<void> {
     const swap = await this.swapRepo.findBySwapId(swapId);
-    if (!swap || swap.state !== SwapState.REFUNDING) {
-      logger.info({ swap_id: swapId, state: swap?.state }, 'Swap not in REFUNDING state for retry');
+    if (!swap || swap.state !== SwapState.CANCELLING) {
+      logger.info({ swap_id: swapId, state: swap?.state }, 'Swap not in CANCELLING state for retry');
       return;
     }
     await this.executeRefunds(swapId, swap);
@@ -134,13 +134,13 @@ export class RefundProcessor {
           });
         }
 
-        // Transition REFUNDING → REFUNDED
+        // Transition CANCELLING → CANCELLED
         const freshSwap = await this.swapRepo.findBySwapId(swapId);
-        if (freshSwap && freshSwap.state === SwapState.REFUNDING) {
-          assertTransition(SwapState.REFUNDING, SwapState.REFUNDED);
+        if (freshSwap && freshSwap.state === SwapState.CANCELLING) {
+          assertTransition(SwapState.CANCELLING, SwapState.CANCELLED);
           await this.swapRepo.updateState(
             swapId,
-            SwapState.REFUNDED,
+            SwapState.CANCELLED,
             freshSwap.version,
             { completed_at: new Date() },
           );

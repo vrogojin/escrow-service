@@ -140,10 +140,10 @@ async function recoverStuckSwaps(
     });
   }
 
-  // Retry swaps stuck in REFUNDING
-  const refundingResult = await swapRepo.findByState(SwapState.REFUNDING);
+  // Retry swaps stuck in CANCELLING
+  const refundingResult = await swapRepo.findByState(SwapState.CANCELLING);
   for (const swap of refundingResult) {
-    logger.warn({ swap_id: swap.swap_id }, 'Retrying stuck REFUNDING swap');
+    logger.warn({ swap_id: swap.swap_id }, 'Retrying stuck CANCELLING swap');
     refundProcessor.retryRefund(swap.swap_id).catch((err) => {
       logger.error({ err, swap_id: swap.swap_id }, 'Recovery refund failed');
     });

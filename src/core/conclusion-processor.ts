@@ -50,8 +50,8 @@ export class ConclusionProcessor {
         return;
       }
 
-      if (swap.state !== SwapState.READY_TO_CONCLUDE) {
-        logger.warn({ swap_id: swapId, state: swap.state }, 'Swap not in READY_TO_CONCLUDE state');
+      if (swap.state !== SwapState.DEPOSIT_COVERED) {
+        logger.warn({ swap_id: swapId, state: swap.state }, 'Swap not in DEPOSIT_COVERED state');
         await client.query('ROLLBACK');
         return;
       }

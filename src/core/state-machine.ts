@@ -1,33 +1,39 @@
 export enum SwapState {
   ANNOUNCED = 'ANNOUNCED',
+  DEPOSIT_INVOICE_CREATED = 'DEPOSIT_INVOICE_CREATED',
   PARTIAL_DEPOSIT = 'PARTIAL_DEPOSIT',
-  READY_TO_CONCLUDE = 'READY_TO_CONCLUDE',
+  DEPOSIT_COVERED = 'DEPOSIT_COVERED',
   CONCLUDING = 'CONCLUDING',
   COMPLETED = 'COMPLETED',
   TIMED_OUT = 'TIMED_OUT',
-  REFUNDING = 'REFUNDING',
-  REFUNDED = 'REFUNDED',
+  CANCELLING = 'CANCELLING',
+  CANCELLED = 'CANCELLED',
   FAILED = 'FAILED',
 }
 
 const TERMINAL_STATES = new Set([
   SwapState.COMPLETED,
-  SwapState.REFUNDED,
+  SwapState.CANCELLED,
   SwapState.FAILED,
 ]);
 
 const VALID_TRANSITIONS: Record<string, Set<SwapState>> = {
   [SwapState.ANNOUNCED]: new Set([
-    SwapState.PARTIAL_DEPOSIT,
-    SwapState.READY_TO_CONCLUDE,
+    SwapState.DEPOSIT_INVOICE_CREATED,
     SwapState.FAILED,
   ]),
-  [SwapState.PARTIAL_DEPOSIT]: new Set([
-    SwapState.READY_TO_CONCLUDE,
+  [SwapState.DEPOSIT_INVOICE_CREATED]: new Set([
+    SwapState.PARTIAL_DEPOSIT,
+    SwapState.DEPOSIT_COVERED,
     SwapState.TIMED_OUT,
     SwapState.FAILED,
   ]),
-  [SwapState.READY_TO_CONCLUDE]: new Set([
+  [SwapState.PARTIAL_DEPOSIT]: new Set([
+    SwapState.DEPOSIT_COVERED,
+    SwapState.TIMED_OUT,
+    SwapState.FAILED,
+  ]),
+  [SwapState.DEPOSIT_COVERED]: new Set([
     SwapState.CONCLUDING,
     SwapState.FAILED,
   ]),
@@ -36,11 +42,11 @@ const VALID_TRANSITIONS: Record<string, Set<SwapState>> = {
     SwapState.FAILED,
   ]),
   [SwapState.TIMED_OUT]: new Set([
-    SwapState.REFUNDING,
+    SwapState.CANCELLING,
     SwapState.FAILED,
   ]),
-  [SwapState.REFUNDING]: new Set([
-    SwapState.REFUNDED,
+  [SwapState.CANCELLING]: new Set([
+    SwapState.CANCELLED,
     SwapState.FAILED,
   ]),
 };
@@ -56,7 +62,7 @@ export function isValidTransition(from: SwapState, to: SwapState): boolean {
 }
 
 export function canAcceptDeposit(state: SwapState): boolean {
-  return state === SwapState.ANNOUNCED || state === SwapState.PARTIAL_DEPOSIT;
+  return state === SwapState.DEPOSIT_INVOICE_CREATED || state === SwapState.PARTIAL_DEPOSIT;
 }
 
 export function assertTransition(from: SwapState, to: SwapState): void {
