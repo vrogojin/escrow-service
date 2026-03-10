@@ -125,9 +125,17 @@ export class CrashRecoveryManager {
    *
    * Invoice creation failed or the store write was lost after createInvoice.
    * Re-create the deposit invoice by calling announce again.
+   *
+   * NOTE: If the crash occurred between createInvoice and updateState, a deposit
+   * invoice may already exist in the AccountingModule but not in our swap record.
+   * The SDK does not support querying invoices by swap metadata, so we cannot
+   * detect this orphan. The orphaned invoice is harmless — no party has its ID,
+   * so nobody will pay into it. It will remain in OPEN state until it expires.
+   * A production enhancement could use a deterministic invoice ID derived from
+   * swap_id to make re-creation idempotent.
    */
   private async _recoverAnnounced(swap: SwapRecord): Promise<void> {
-    logger.info({ swap_id: swap.swap_id }, 'Recovery: ANNOUNCED — re-announcing swap');
+    logger.info({ swap_id: swap.swap_id }, 'Recovery: ANNOUNCED — re-announcing swap (may create orphaned invoice if prior createInvoice succeeded but updateState did not)');
     try {
       await this.orchestrator.announce(swap.manifest);
     } catch (err) {

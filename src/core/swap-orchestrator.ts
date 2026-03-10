@@ -366,13 +366,18 @@ export class SwapOrchestrator {
       return;
     }
 
-    // State guard: ignore if already covered or concluding
+    // State guard: ignore if already covered or concluding.
+    // Do NOT attempt to bounce — the deposit invoice is already closed (or being
+    // closed) by _onInvoiceCovered(), so returnInvoicePayment would fail.
+    // Late payments on a closed invoice are handled by the SDK's auto-return.
     if (
       swap.state === SwapState.DEPOSIT_COVERED ||
       swap.state === SwapState.CONCLUDING
     ) {
-      // Bounce with ALREADY_COVERED reason
-      await this._bouncePayment(swap, invoiceId, transfer, 'ALREADY_COVERED');
+      logger.debug(
+        { swap_id: swap.swap_id, state: swap.state, transferId: transfer.transferId },
+        'invoice:payment — deposit already covered/concluding, ignoring (SDK handles auto-return on closed invoice)',
+      );
       return;
     }
 
@@ -672,11 +677,11 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Only proceed if the swap is still in PARTIAL_DEPOSIT or DEPOSIT_INVOICE_CREATED
-    if (
-      swap.state !== SwapState.PARTIAL_DEPOSIT &&
-      swap.state !== SwapState.DEPOSIT_INVOICE_CREATED
-    ) {
+    // Only proceed if the swap is still in PARTIAL_DEPOSIT.
+    // The timeout timer is only scheduled on first deposit (→ PARTIAL_DEPOSIT),
+    // so DEPOSIT_INVOICE_CREATED should never reach here via the timer. If it
+    // does (e.g., stale re-registration), ignore it — there are no deposits to refund.
+    if (swap.state !== SwapState.PARTIAL_DEPOSIT) {
       logger.info(
         { swap_id: swapId, state: swap.state },
         'Timeout fired but swap already advanced, ignoring',

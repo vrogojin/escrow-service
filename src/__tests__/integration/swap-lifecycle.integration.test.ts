@@ -314,7 +314,7 @@ describe('SwapLifecycle Integration Tests', () => {
       ctx.timeoutManager.destroy();
     });
 
-    it('should bounce payment on already-covered swap with reason ALREADY_COVERED', async () => {
+    it('should ignore late payment on completed swap (SDK handles auto-return on closed invoice)', async () => {
       const ctx = await setupOrchestrator();
       const manifest = createManifest();
 
