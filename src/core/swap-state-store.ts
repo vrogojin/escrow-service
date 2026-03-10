@@ -12,7 +12,7 @@
  * Supports optimistic locking via the version field on each SwapRecord.
  */
 
-import { SwapState, isTerminalState } from './state-machine.js';
+import { SwapState, isTerminalState, isValidTransition } from './state-machine.js';
 import type { SwapRecord, SwapStateStore, ResolvedAddresses } from './types.js';
 import type { SwapManifest } from './manifest-validator.js';
 
@@ -130,6 +130,10 @@ export class InMemorySwapStateStore implements SwapStateStore {
     const record = this.swaps.get(swapId);
     if (!record || record.version !== expectedVersion) {
       return null;
+    }
+
+    if (!isValidTransition(record.state, newState)) {
+      throw new Error(`Invalid state transition: ${record.state} → ${newState} (swap ${swapId})`);
     }
 
     record.state = newState;

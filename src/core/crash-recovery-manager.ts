@@ -494,13 +494,28 @@ export class CrashRecoveryManager {
    * invoice shows PARTIAL state (a deposit arrived during crash window).
    */
   private async _advanceToPartialDeposit(swap: SwapRecord): Promise<void> {
-    const now = Date.now();
-    const timeoutAt = now + swap.manifest.timeout * 1000;
+    // Use the invoice's lastActivityAt as the best approximation of first
+    // deposit time (it's updated on each payment), falling back to now.
+    // This prevents the timeout window from being artificially extended by
+    // the duration of the crash outage.
+    let firstDepositAt = Date.now();
+    if (swap.deposit_invoice_id) {
+      try {
+        const status = await this.invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
+        if (status.lastActivityAt) {
+          firstDepositAt = status.lastActivityAt;
+        }
+      } catch {
+        // Fall back to now if status retrieval fails
+        logger.warn({ swap_id: swap.swap_id }, 'Recovery: could not retrieve invoice status for deposit timestamp, using now');
+      }
+    }
+    const timeoutAt = firstDepositAt + swap.manifest.timeout * 1000;
 
     const updated = this.stateStore.updateState(
       swap.swap_id,
       SwapState.PARTIAL_DEPOSIT,
-      { first_deposit_at: now, timeout_at: timeoutAt },
+      { first_deposit_at: firstDepositAt, timeout_at: timeoutAt },
       swap.version,
     );
 
@@ -838,8 +853,19 @@ export class CrashRecoveryManager {
     const requiredB = BigInt(swap.manifest.party_b_value_to_change);
 
     if (partyAAmount >= requiredA && partyBAmount >= requiredB) {
-      // Still covered by correct parties — proceed to conclusion
-      logger.info({ swap_id: swap.swap_id }, 'Recovery: Coverage still valid from correct parties, proceeding to conclusion');
+      // Still covered by correct parties — close the deposit invoice first, then conclude
+      logger.info({ swap_id: swap.swap_id }, 'Recovery: Coverage still valid from correct parties, closing invoice and proceeding to conclusion');
+      if (swap.deposit_invoice_id) {
+        try {
+          await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
+        } catch (err) {
+          if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
+            logger.info({ swap_id: swap.swap_id }, 'Recovery: Deposit invoice already closed');
+          } else {
+            throw err;
+          }
+        }
+      }
       await this._concludeFromClosed(swap);
     } else {
       // Coverage regressed — revert to PARTIAL_DEPOSIT

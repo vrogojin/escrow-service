@@ -1,7 +1,43 @@
 import { InMemorySwapStateStore } from '../swap-state-store.js';
 import { SwapState } from '../state-machine.js';
-import type { SwapManifest, ResolvedAddresses } from '../types.js';
+import type { SwapManifest, ResolvedAddresses, SwapRecord } from '../types.js';
 import { computeSwapId } from '../../utils/hash.js';
+
+/**
+ * Walk a swap through valid state transitions to reach the target state.
+ * Returns the final SwapRecord after all transitions.
+ */
+function walkToState(
+  store: InMemorySwapStateStore,
+  swapId: string,
+  target: SwapState,
+  startVersion: number,
+  updates?: Partial<SwapRecord>,
+): SwapRecord {
+  const paths: Record<string, SwapState[]> = {
+    [SwapState.DEPOSIT_INVOICE_CREATED]: [SwapState.DEPOSIT_INVOICE_CREATED],
+    [SwapState.PARTIAL_DEPOSIT]: [SwapState.DEPOSIT_INVOICE_CREATED, SwapState.PARTIAL_DEPOSIT],
+    [SwapState.DEPOSIT_COVERED]: [SwapState.DEPOSIT_INVOICE_CREATED, SwapState.DEPOSIT_COVERED],
+    [SwapState.CONCLUDING]: [SwapState.DEPOSIT_INVOICE_CREATED, SwapState.DEPOSIT_COVERED, SwapState.CONCLUDING],
+    [SwapState.COMPLETED]: [SwapState.DEPOSIT_INVOICE_CREATED, SwapState.DEPOSIT_COVERED, SwapState.CONCLUDING, SwapState.COMPLETED],
+    [SwapState.TIMED_OUT]: [SwapState.DEPOSIT_INVOICE_CREATED, SwapState.PARTIAL_DEPOSIT, SwapState.TIMED_OUT],
+    [SwapState.CANCELLING]: [SwapState.DEPOSIT_INVOICE_CREATED, SwapState.PARTIAL_DEPOSIT, SwapState.TIMED_OUT, SwapState.CANCELLING],
+    [SwapState.CANCELLED]: [SwapState.DEPOSIT_INVOICE_CREATED, SwapState.PARTIAL_DEPOSIT, SwapState.TIMED_OUT, SwapState.CANCELLING, SwapState.CANCELLED],
+    [SwapState.FAILED]: [SwapState.FAILED],
+  };
+  const steps = paths[target];
+  if (!steps) throw new Error(`No path to ${target}`);
+
+  let version = startVersion;
+  let result: SwapRecord | null = null;
+  for (let i = 0; i < steps.length; i++) {
+    const isLast = i === steps.length - 1;
+    result = store.updateState(swapId, steps[i], isLast ? (updates ?? {}) : {}, version);
+    if (!result) throw new Error(`Failed transition to ${steps[i]} at version ${version}`);
+    version = result.version;
+  }
+  return result!;
+}
 
 function createTestManifest(overrides?: Partial<SwapManifest>): SwapManifest {
   const base = {
@@ -94,16 +130,14 @@ describe('InMemorySwapStateStore', () => {
       const manifest = createTestManifest();
       const addresses = createTestResolvedAddresses();
 
-      const created = store.create(manifest, addresses);
+      store.create(manifest, addresses);
       const payoutAInvoiceId = 'b'.repeat(64);
       const payoutBInvoiceId = 'c'.repeat(64);
 
-      const updated = store.updateState(
-        manifest.swap_id,
-        SwapState.CONCLUDING,
-        { payout_a_invoice_id: payoutAInvoiceId, payout_b_invoice_id: payoutBInvoiceId },
-        1,
-      );
+      walkToState(store, manifest.swap_id, SwapState.CONCLUDING, 1, {
+        payout_a_invoice_id: payoutAInvoiceId,
+        payout_b_invoice_id: payoutBInvoiceId,
+      });
 
       const foundByA = store.findByInvoiceId(payoutAInvoiceId);
       const foundByB = store.findByInvoiceId(payoutBInvoiceId);
@@ -185,22 +219,19 @@ describe('InMemorySwapStateStore', () => {
       const manifest = createTestManifest();
       const addresses = createTestResolvedAddresses();
 
-      const created = store.create(manifest, addresses);
+      store.create(manifest, addresses);
       const payoutAInvoiceId = 'b'.repeat(64);
       const payoutBInvoiceId = 'c'.repeat(64);
 
-      const updated = store.updateState(
-        manifest.swap_id,
-        SwapState.CONCLUDING,
-        { payout_a_invoice_id: payoutAInvoiceId, payout_b_invoice_id: payoutBInvoiceId },
-        1,
-      );
+      const updated = walkToState(store, manifest.swap_id, SwapState.CONCLUDING, 1, {
+        payout_a_invoice_id: payoutAInvoiceId,
+        payout_b_invoice_id: payoutBInvoiceId,
+      });
 
       expect(updated).not.toBeNull();
       expect(updated?.state).toBe(SwapState.CONCLUDING);
       expect(updated?.payout_a_invoice_id).toBe(payoutAInvoiceId);
       expect(updated?.payout_b_invoice_id).toBe(payoutBInvoiceId);
-      expect(updated?.version).toBe(2);
     });
   });
 
@@ -226,13 +257,8 @@ describe('InMemorySwapStateStore', () => {
       const manifest = createTestManifest();
       const addresses = createTestResolvedAddresses();
 
-      const created = store.create(manifest, addresses);
-      const updated = store.updateState(
-        manifest.swap_id,
-        SwapState.COMPLETED,
-        {},
-        1,
-      );
+      store.create(manifest, addresses);
+      walkToState(store, manifest.swap_id, SwapState.COMPLETED, 1);
 
       const nonTerminal = store.findNonTerminal();
       expect(nonTerminal).toHaveLength(0);
@@ -255,8 +281,8 @@ describe('InMemorySwapStateStore', () => {
       store.create(manifest2, addresses);
       store.create(manifest3, addresses);
 
-      store.updateState(manifest1.swap_id, SwapState.CANCELLED, {}, 1);
-      store.updateState(manifest2.swap_id, SwapState.FAILED, {}, 1);
+      walkToState(store, manifest1.swap_id, SwapState.CANCELLED, 1);
+      store.updateState(manifest2.swap_id, SwapState.FAILED, {}, 1); // ANNOUNCED → FAILED is valid
 
       const nonTerminal = store.findNonTerminal();
       expect(nonTerminal).toHaveLength(1);

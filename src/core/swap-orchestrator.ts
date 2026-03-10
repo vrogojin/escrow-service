@@ -27,6 +27,7 @@ import type { SwapStateStore, AnnounceResult, SwapRecord } from './types.js';
 import type { SwapManifest } from './manifest-validator.js';
 import type { InvoiceTransferRef } from './accounting-types.js';
 import { isSphereError } from './accounting-types.js';
+import { ManifestValidationError } from '../sphere/orchestrator-interfaces.js';
 import { CrashRecoveryManager } from './crash-recovery-manager.js';
 
 // =============================================================================
@@ -209,13 +210,11 @@ export class SwapOrchestrator {
    * @returns AnnounceResult with the swap_id, deposit_invoice_id, and is_new flag.
    * @throws Error if manifest is invalid, address resolution fails, or invoice creation fails.
    */
-  async announce(manifest: SwapManifest): Promise<AnnounceResult> {
+  async announce(manifest: SwapManifest, _announcerNpub?: string): Promise<AnnounceResult> {
     // 1. Validate manifest
     const validation = validateManifest(manifest);
     if (!validation.valid) {
-      throw new Error(
-        `Invalid manifest: ${validation.errors.map((e) => `${e.field}: ${e.message}`).join(', ')}`,
-      );
+      throw new ManifestValidationError(validation.errors);
     }
 
     // 2. Check for existing swap
@@ -746,8 +745,14 @@ export class SwapOrchestrator {
           await this._onInvoiceCancelled({ invoiceId: swap.deposit_invoice_id });
           return;
         } else if (err.code === 'INVOICE_ALREADY_CLOSED') {
-          // Coverage won the race — abort cancellation
-          logger.info({ swap_id: swapId }, 'Invoice already closed (coverage won race), aborting cancellation');
+          // Coverage won the race — the invoice was closed (covered) before
+          // cancelInvoice could run.  The swap is stuck in CANCELLING because
+          // the invoice:covered event likely already fired (and was rejected
+          // because the swap was no longer in a deposit-accepting state).
+          // Transition to FAILED so crash recovery can pick this up and
+          // resume conclusion.
+          logger.warn({ swap_id: swapId }, 'Invoice already closed (coverage won race) — transitioning to FAILED for crash recovery');
+          await this._transitionToFailed(cancelling, 'Timeout/coverage race: invoice closed before cancellation');
           return;
         }
       }
