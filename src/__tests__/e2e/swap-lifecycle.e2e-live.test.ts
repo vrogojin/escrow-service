@@ -93,7 +93,7 @@ const POLL_INTERVAL_MS = 3_000;
 const FAUCET_WAIT_MS = 120_000;
 const SWAP_COMPLETE_WAIT_MS = 90_000;
 const PAYOUT_RECEIVE_WAIT_MS = 90_000;
-const BOUNCE_WAIT_MS = 30_000;
+// (BOUNCE_WAIT_MS removed — third-party deposits are accepted, not bounced)
 
 // =============================================================================
 // Helpers
@@ -747,11 +747,11 @@ describe('Live E2E: Swap Lifecycle (Unicity testnet)', () => {
   );
 
   // ---------------------------------------------------------------------------
-  // Test 3 — Bounce path: payment from unknown sender is returned immediately
+  // Test 3 — Third-party deposit: Charlie deposits on behalf of Party A
   // ---------------------------------------------------------------------------
 
   it(
-    'should bounce payment from unknown sender',
+    'should accept third-party deposit from Charlie (on behalf of Party A) and complete swap',
     async () => {
       const { stateStore, orchestrator, timeoutManager } =
         buildOrchestratorStack(sphereEscrow);
@@ -763,21 +763,13 @@ describe('Live E2E: Swap Lifecycle (Unicity testnet)', () => {
         const partyBAddress = sphereB.identity!.directAddress!;
 
         /*
-         * Create a swap between Party A and Party B.
-         * Party C (represented by sphereEscrow's own wallet, acting as an
-         * uninvolved third party) will attempt to send UCT to this invoice.
-         * Because the escrow address IS the Party C stand-in here, we instead
-         * deliberately send from Party B to a UCT slot (Party A's slot) — an
-         * action that the orchestrator recognises as WRONG_CURRENCY for Party B
-         * or UNKNOWN_SENDER for the combined asset.
+         * Charlie is NOT a party in the manifest, but deposits UCT on behalf
+         * of Party A. In the new model, anyone can deposit — party side is
+         * determined by currency type, not sender address. Charlie's UCT
+         * payment goes toward asset slot 0 (party_a_currency).
          *
-         * The cleanest approach: use Party A as the sender of USDU (Party B's
-         * currency). This will be flagged as WRONG_CURRENCY for Party A, which
-         * triggers a bounce.
-         *
-         * Alternatively: a truly unknown sender would require a fourth wallet.
-         * Since the test brief specifies "third party", we initialise a
-         * temporary wallet inline just for this test.
+         * Party B then deposits USDU normally → both slots covered → swap completes.
+         * Party A receives USDU, Party B receives UCT.
          */
         const manifest = buildManifest(
           partyAAddress,
@@ -794,23 +786,14 @@ describe('Live E2E: Swap Lifecycle (Unicity testnet)', () => {
         const invoiceMemo = `INV:${depositInvoiceId}:F`;
 
         // ----- Initialise a third wallet (Charlie) -----
-        // Charlie is not part of the manifest; any payment from Charlie to the
-        // escrow invoice should be bounced back.
         const { sphere: sphereCharlie, nametag: charlieNametag } =
           await initWallet('charlie');
 
-        // Fund Charlie with UCT so he has something to send
+        // Fund Charlie with UCT
         await requestFaucet(charlieNametag, 'unicity', 1);
         await waitForBalance(sphereCharlie, COIN_UCT, COIN_UCT, 90_000);
 
-        // Record Charlie's UCT balance before sending
-        const charlieBefore = sphereCharlie.payments.getBalance(TOKEN_ID_UCT);
-        const charlieUctBefore =
-          charlieBefore.find((b) => b.coinId === TOKEN_ID_UCT)?.totalAmount ?? '0';
-
-        // Charlie sends UCT to the escrow with the invoice memo — this should
-        // be rejected because Charlie is not a party in the manifest.
-        // invoiceRefundAddress is needed so the escrow can route the bounce back.
+        // Charlie deposits UCT on behalf of Party A
         const charlieAddress = sphereCharlie.identity!.directAddress!;
         const charlieSend = await sphereCharlie.payments.send({
           coinId: TOKEN_ID_UCT,
@@ -822,35 +805,38 @@ describe('Live E2E: Swap Lifecycle (Unicity testnet)', () => {
         });
         expect(charlieSend.status).not.toBe('failed');
 
-        // ----- Wait for the bounce to arrive back at Charlie -----
-        const bounceDeadlineMs = Date.now() + BOUNCE_WAIT_MS;
-        let bounceArrived = false;
+        // Wait for the deposit to be processed (PARTIAL_DEPOSIT)
+        await waitForSwapState(
+          stateStore,
+          manifest.swap_id,
+          SwapState.PARTIAL_DEPOSIT,
+          30_000,
+        );
 
-        while (Date.now() < bounceDeadlineMs) {
-          await sphereCharlie.payments.receive();
-          const charlieAfter = sphereCharlie.payments.getBalance(TOKEN_ID_UCT);
-          const charlieUctAfter =
-            charlieAfter.find((b) => b.coinId === TOKEN_ID_UCT)
-              ?.totalAmount ?? '0';
+        // Party B deposits USDU
+        const bAddress = sphereB.identity!.directAddress!;
+        const bSend = await sphereB.payments.send({
+          coinId: TOKEN_ID_USDU,
+          amount: AMOUNT_USDU,
+          recipient: escrowAddress,
+          memo: invoiceMemo,
+          invoiceRefundAddress: bAddress,
+          transferMode: 'instant',
+        });
+        expect(bSend.status).not.toBe('failed');
 
-          // Bounce confirmed when Charlie's balance returns to pre-send level
-          if (BigInt(charlieUctAfter) >= BigInt(charlieUctBefore)) {
-            bounceArrived = true;
-            break;
-          }
-          await sleep(POLL_INTERVAL_MS);
-        }
+        // Wait for COMPLETED — both slots covered, payouts executed
+        await waitForSwapState(
+          stateStore,
+          manifest.swap_id,
+          SwapState.COMPLETED,
+          30_000,
+        );
 
-        expect(
-          bounceArrived,
-          `Charlie's UCT payment was not bounced back within ${BOUNCE_WAIT_MS}ms. ` +
-          `Balance before send: ${charlieUctBefore}`,
-        ).toBe(true);
-
-        // ----- The original swap must still be open and unaffected -----
-        const swapAfterBounce = stateStore.findBySwapId(manifest.swap_id);
-        expect(swapAfterBounce).not.toBeNull();
-        expect(swapAfterBounce!.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
+        const finalSwap = stateStore.findBySwapId(manifest.swap_id)!;
+        expect(finalSwap.state).toBe(SwapState.COMPLETED);
+        expect(finalSwap.payout_a_invoice_id).toBeTruthy();
+        expect(finalSwap.payout_b_invoice_id).toBeTruthy();
 
         // ----- Cleanup Charlie's sphere -----
         await sphereCharlie.destroy().catch(() => {});
@@ -860,6 +846,6 @@ describe('Live E2E: Swap Lifecycle (Unicity testnet)', () => {
         timeoutManager.destroy();
       }
     },
-    60_000, // 1 minute
+    90_000, // 1.5 minutes
   );
 });

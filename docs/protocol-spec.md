@@ -70,7 +70,7 @@ Request re-delivery of an invoice token. Used when a party lost their deposit or
 }
 ```
 
-The escrow responds with an `invoice_delivery` message containing the requested token. The requesting party must be one of the swap's designated parties. **Note on authorization:** The DM sender is identified by their Nostr npub key, which exists in a different key space from the DIRECT:// chain addresses in the manifest. The escrow must maintain a mapping between Nostr npubs and chain addresses. This mapping is established during the `announce` phase: the DM sender's npub is recorded when they submit the manifest and is associated with the party role they claim. **Trust assumption:** There is no cryptographic proof linking a Nostr npub to a DIRECT:// chain address — the mapping is trust-based. The announcer claims a party role but the escrow cannot verify this claim at announcement time. Role misidentification only affects DM-level authorization (status queries, invoice re-delivery); it does not affect on-chain payment validation, which uses cryptographic `senderAddress`. A stronger protocol could require a signed proof linking the npub to the chain address, but this is not implemented in the current design. **Note:** The `invoice:payment` event reveals the payer's on-chain `senderAddress`, NOT their Nostr npub — on-chain payments do not disclose the DM identity. Parties who did not announce via DM cannot use `request_invoice` — they must first establish their Nostr identity by sending an `announce` message.
+The escrow responds with an `invoice_delivery` message containing the requested token. The requesting party must be one of the swap's designated parties. **Note on authorization:** The DM sender is identified by their Nostr npub key, which exists in a different key space from the DIRECT:// chain addresses in the manifest. The escrow must maintain a mapping between Nostr npubs and chain addresses. This mapping is established during the `announce` phase: the DM sender's npub is recorded when they submit the manifest and is associated with the party role they claim. **Trust assumption:** There is no cryptographic proof linking a Nostr npub to a DIRECT:// chain address — the mapping is trust-based. The announcer claims a party role but the escrow cannot verify this claim at announcement time. Role misidentification only affects DM-level authorization (status queries, invoice re-delivery); it does not affect on-chain deposit validation, which is based solely on the deposited token's currency type. A stronger protocol could require a signed proof linking the npub to the chain address, but this is not implemented in the current design. **Note:** The `invoice:payment` event reveals the payer's on-chain `senderAddress`, NOT their Nostr npub — on-chain payments do not disclose the DM identity. Parties who did not announce via DM cannot use `request_invoice` — they must first establish their Nostr identity by sending an `announce` message.
 
 ### 1.2 Escrow → Party Messages
 
@@ -145,13 +145,13 @@ Response to a `status` query.
 The escrow derives per-party coverage from `getInvoiceStatus(depositInvoiceId)`:
 
 1. Get `status.targets[0].coinAssets` — the array of per-coin balance summaries
-2. Asset at index 0 corresponds to `party_a_currency_to_change`, index 1 to `party_b_currency_to_change`
-3. For each asset, iterate `coinAssets[i].transfers` (the raw `InvoiceTransferRef[]` array) to find the party's contribution:
-   - Use each transfer's `senderAddress` field (the cryptographically-authenticated on-chain sender) — **not** `effectiveSender` from `senderBalances`, which is `refundAddress ?? senderAddress` and includes the self-asserted (unverified) `refundAddress`
-   - Sum `amount` from transfers whose `senderAddress` matches the party's resolved DIRECT address
-   - Set `party_X_covered = true` if the summed amount >= the requested amount
-   - **Important:** Do not use `senderBalances` for identity verification — its keys are `effectiveSender` values, which include the self-asserted (unverified) `refundAddress` field
-4. If a party has no matching transfers, `party_X_amount = "0"` and `party_X_covered = false`
+2. Asset at index 0 corresponds to `party_a_currency_to_change`; index 1 to `party_b_currency_to_change`
+3. For each asset, read the aggregate coverage directly from the coin asset summary:
+   - `party_a_covered = coinAssets[0].isCovered` (true if `netCoveredAmount >= requestedAmount`)
+   - `party_a_amount = coinAssets[0].netCoveredAmount` (total net deposits for party A's currency slot)
+   - `party_b_covered = coinAssets[1].isCovered`
+   - `party_b_amount = coinAssets[1].netCoveredAmount`
+4. These fields reflect the aggregate of **all** payers who contributed to each currency slot, regardless of their sender addresses. Anyone who deposited the correct currency contributes to the slot total.
 
 **Authorization:** Status queries are only served if the requesting party's Nostr DM pubkey is associated with one of the swap's parties. Since Nostr npub keys and DIRECT:// chain addresses are in different key spaces, the escrow must establish this association during the announce phase (the DM sender who submits the manifest is recorded as one of the swap's parties). Queries from unrecognized npubs receive an `error` response with `"Unauthorized"`.
 
@@ -193,7 +193,7 @@ Sent to a party when their payment is bounced back by the escrow.
 {
   "type": "bounce_notification",
   "swap_id": "<64 hex chars>",
-  "reason": "UNKNOWN_SENDER" | "WRONG_CURRENCY" | "SWAP_NOT_FOUND" | "SWAP_CLOSED" | "ALREADY_COVERED",
+  "reason": "WRONG_CURRENCY" | "SWAP_NOT_FOUND" | "SWAP_CLOSED" | "ALREADY_COVERED",
   "returned_amount": "<amount string>",
   "returned_currency": "<coinId>"
 }
@@ -361,12 +361,8 @@ The on-chain transfer message encodes the invoice reference:
 On each `invoice:payment` event, the escrow:
 
 1. Calls `getInvoiceStatus(depositInvoiceId)` to get the current balance
-2. Inspects the payment event's transfer data or iterates `targets[0].coinAssets[i].transfers` (raw `InvoiceTransferRef[]`) to identify the payer by their `senderAddress` field (cryptographically-authenticated on-chain address)
-3. Resolves the sender's DIRECT address to determine which party they are:
-   - Match against party A's resolved DIRECT address
-   - Match against party B's resolved DIRECT address
-4. Validates currency: party A must pay `party_a_currency_to_change`, party B must pay `party_b_currency_to_change`
-5. If wrong sender or wrong currency → calls `returnInvoicePayment()`:
+2. Identifies which currency asset the incoming transfer funded by inspecting `targets[0].coinAssets[i]`. Asset index 0 corresponds to `party_a_currency_to_change`; index 1 to `party_b_currency_to_change`. **Party side is determined by currency type, not sender address.** Anyone may deposit on behalf of either side.
+3. If the deposited token's currency does not match either declared asset → calls `returnInvoicePayment()` with reason `WRONG_CURRENCY`:
 
 ```typescript
 // recipient must be effectiveSender (refundAddress ?? senderAddress),
@@ -374,22 +370,22 @@ On each `invoice:payment` event, the escrow:
 // senderBalances keyed by effectiveSender.
 const recipient = transfer.refundAddress ?? transfer.senderAddress;
 if (!recipient) {
-  // senderAddress is null (masked predicate) and no refundAddress —
-  // cannot return payment. Log for manual intervention.
+  // No return address available — cannot bounce.
+  // Log for manual intervention.
   log.warn(`Cannot return payment: no return address for transfer ${transfer.transferId}`);
   return;
 }
 await accounting.returnInvoicePayment(depositInvoiceId, {
-  recipient,                      // DIRECT:// address to return to
-  amount: paymentAmount,          // amount to return (smallest units)
+  recipient,                        // DIRECT:// address to return to
+  amount: paymentAmount,            // amount to return (smallest units)
   coinId: wrongCoinId,
-  freeText: 'Bounce: UNKNOWN_SENDER',  // optional annotation
+  freeText: 'Bounce: WRONG_CURRENCY',  // optional annotation
 });
 ```
 
-**Note on identity vs routing:** The escrow uses `senderAddress` (cryptographic) for identity verification (determining which party sent the payment), but uses `effectiveSender` (`refundAddress ?? senderAddress`) for return routing. This asymmetry is intentional: `senderAddress` cannot be forged but `refundAddress` is the sender's declared return path. Auto-return also sends to `effectiveSender`, not raw `senderAddress`.
+**Return routing:** All returns (including wrong-currency bounces and timeout auto-returns) route to `effectiveSender` (`refundAddress ?? senderAddress`). The `refundAddress` field is the payer's declared return path and is used for routing — it is not used for party identification. Surplus overpayments are also returned to original payers via `effectiveSender` tracked in the invoice's auto-return dedup ledger.
 
-6. **Already-covered check:** Before processing, verify the swap is not already in `DEPOSIT_COVERED` or later. If a party retries a payment with a new `transferId` after the invoice is already covered, bounce with reason `ALREADY_COVERED`.
+4. **Already-covered check:** Before processing, verify the swap is not already in `DEPOSIT_COVERED` or later. If a payment arrives with a new `transferId` after the invoice is already covered, bounce with reason `ALREADY_COVERED`.
 
 On first valid deposit:
 - Swap transitions: `DEPOSIT_INVOICE_CREATED → PARTIAL_DEPOSIT`
@@ -402,8 +398,8 @@ On first valid deposit:
 When both parties have fully paid, the AccountingModule fires `invoice:covered`. The escrow:
 
 1. **State guard:** only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT`
-2. **Re-validate per-party coverage:** call `getInvoiceStatus()` and iterate `coinAssets[i].transfers` to verify that party A's `senderAddress` (the on-chain address, **not** `effectiveSender` from `senderBalances`) contributed to asset 0 and party B's to asset 1. The `invoice:covered` event only means aggregate amounts are met — an unauthorized sender could have contributed before being bounced. If validation fails, return the unauthorized payment and wait.
-3. **Check for swapped-currency deposits:** Verify that each party paid their **own** required currency. Party A must contribute to asset 0 (`party_a_currency`) and party B to asset 1 (`party_b_currency`). If party A paid `party_b_currency` (or vice versa), bounce the payment with reason `WRONG_CURRENCY` even though the aggregate amounts may show coverage.
+2. **Re-validate per-currency coverage:** call `getInvoiceStatus()` and verify that `coinAssets[0]` (`party_a_currency_to_change`) and `coinAssets[1]` (`party_b_currency_to_change`) are each individually covered at the required amounts (`isCovered === true` and `netCoveredAmount >= requestedAmount`). The `invoice:covered` event only means aggregate amounts are met — it does not guarantee that the two distinct currency slots are both individually satisfied. If either slot is not individually covered, bounce the excess wrong-currency payment and wait.
+3. **No sender identity check:** Coverage is valid regardless of who paid each side. The escrow does not verify that party A specifically sent `party_a_currency` — any payer contributing the correct currency to the correct asset slot is accepted.
 4. Transitions: `PARTIAL_DEPOSIT → DEPOSIT_COVERED` (or `DEPOSIT_INVOICE_CREATED → DEPOSIT_COVERED`). Note: `DEPOSIT_COVERED` is a transient state — the escrow immediately proceeds to closing and payout creation within the same handler.
 5. Cancels the timeout timer (if running)
 6. Closes the deposit invoice: `closeInvoice(depositInvoiceId)` — do **not** pass `{autoReturn: true}` (see architecture.md §Event-Driven Flow)
@@ -460,7 +456,7 @@ Each party independently verifies the swap:
 
 ### Timer Start
 
-The timeout timer starts when the **first valid deposit** is received (first `invoice:payment` event that passes sender validation). This matches the existing escrow behavior.
+The timeout timer starts when the **first valid deposit** is received (first `invoice:payment` event where the deposited currency matches one of the two expected asset slots). This matches the existing escrow behavior.
 
 ### Timer Duration
 
@@ -539,16 +535,15 @@ When the escrow returns a payment via `returnInvoicePayment()`, it includes a re
 
 | Reason | Description |
 |---|---|
-| `UNKNOWN_SENDER` | Sender does not match party A or party B |
-| `WRONG_CURRENCY` | Sender paid the wrong currency for their role |
+| `WRONG_CURRENCY` | Deposited token's currency does not match either expected asset slot |
 | `SWAP_NOT_FOUND` | No swap case matches the invoice |
 | `SWAP_CLOSED` | Swap is in a terminal state (COMPLETED, CANCELLED, FAILED) |
-| `ALREADY_COVERED` | The party's required asset is already fully covered |
+| `ALREADY_COVERED` | The relevant asset slot is already fully covered |
 
 The bounce-back uses the `:B` (back) direction code in the invoice memo:
 
 ```
-INV:<invoice_id>:B Bounce: UNKNOWN_SENDER
+INV:<invoice_id>:B Bounce: WRONG_CURRENCY
 ```
 
 ### Retry Semantics
@@ -662,23 +657,30 @@ Use resolved DIRECT addresses for:
 
 Resolved addresses are cached in the swap case to avoid re-resolution. This prevents a nametag reassignment mid-swap from causing party misidentification.
 
-### Sender Matching
+### Currency-Based Party Identification
 
-When validating deposit senders, the escrow compares the transfer's **on-chain sender address** (`InvoiceTransferRef.senderAddress`) against both parties' cached resolved DIRECT addresses:
+Deposit payments are attributed to a party side by **currency type**, not by sender address. The escrow identifies which slot a payment fills by inspecting the asset index in `targets[0].coinAssets`:
 
 ```typescript
-function identifyParty(senderAddress: string, swap: SwapCase): 'A' | 'B' | null {
-  if (senderAddress === swap.resolved_party_a_address) return 'A';
-  if (senderAddress === swap.resolved_party_b_address) return 'B';
+function identifyPartySide(
+  coinAssetIndex: number,
+  swap: SwapCase,
+): 'A' | 'B' | null {
+  // coinAssets[0] is party_a_currency_to_change
+  if (coinAssetIndex === 0) return 'A';
+  // coinAssets[1] is party_b_currency_to_change
+  if (coinAssetIndex === 1) return 'B';
   return null;
 }
 ```
 
-**Security note:** The escrow must use `senderAddress` (the cryptographically-authenticated on-chain sender), **not** `effectiveSender` (which is `refundAddress ?? senderAddress`). The `refundAddress` field (`inv.ra` in the on-chain message) is self-asserted by the sender without cryptographic proof of ownership — a malicious sender could set `inv.ra` to party A's address to impersonate them. The `senderAddress` is derived from the transfer's cryptographic signature and cannot be forged.
+This replaces the former `identifyParty(senderAddress, swap)` function. Sender identity is no longer used to route or validate deposits.
 
-DIRECT address comparison is **case-sensitive exact string match** (matching the SDK's convention — see `balance-computer.ts` line 12 and `isTarget()` which uses `Set.has()`). The escrow MUST store the exact DIRECT address format returned by the SDK's address resolution methods, without modification. If addresses are compared at the application level (e.g., `identifyParty()`), the comparison must also be case-sensitive. **No case normalization is applied** — JCS (RFC 8785) preserves string values exactly as-is, and the SDK performs case-sensitive matching throughout. Addresses must be used in exactly the format provided by the SDK's resolution methods.
+**Return routing:** When bouncing a wrong-currency payment, the return destination is `effectiveSender` (`refundAddress ?? senderAddress`). The `refundAddress` field (`inv.ra` in the on-chain message) is the payer's declared return path and is used for routing only — it is not used for party identification. Auto-return on timeout also routes to `effectiveSender`.
 
-**Migration note:** The existing escrow codebase (`address.ts`) applies `normalizeAddress()` which lowercases the hex portion of DIRECT addresses. This is **incompatible** with the SDK's case-sensitive matching. The new `identifyParty()` implementation must use the SDK-returned address strings verbatim — do not pipe them through `normalizeAddress()`. The `normalizeAddress()` function should be deprecated or restricted to display-only contexts.
+**Resolved addresses are still required** for payout invoice target creation and for DM authorization (associating a Nostr npub with a party role). DIRECT address comparison remains **case-sensitive exact string match** when used for those purposes.
+
+**Migration note:** The existing escrow codebase (`address.ts`) applies `normalizeAddress()` which lowercases the hex portion of DIRECT addresses. This is **incompatible** with the SDK's case-sensitive matching when addresses are used for payout targets or DM authorization. The `normalizeAddress()` function should be deprecated or restricted to display-only contexts.
 
 ## 8. Verification Protocol
 

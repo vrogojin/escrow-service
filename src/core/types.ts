@@ -54,16 +54,16 @@ export interface SwapStateStore {
 }
 
 /**
- * Result of deposit validation — which party sent the deposit.
+ * Result of deposit validation — which party side the deposit contributes to.
+ * Party side is determined by coinId (currency type), not sender address.
  */
 export interface DepositValidationResult {
-  party: 'A' | 'B' | null; // null = unknown sender
-  senderAddress: string | null; // cryptographic address (null for masked predicates)
+  partySide: 'A' | 'B' | null; // null = wrong currency (coinId matches neither asset)
   effectiveSender: string | null; // refundAddress ?? senderAddress (for return routing)
   coinId: string;
   amount: string;
   transferId: string;
-  reason?: 'UNKNOWN_SENDER' | 'WRONG_CURRENCY' | 'MASKED_PREDICATE';
+  reason?: 'WRONG_CURRENCY';
 }
 
 /**

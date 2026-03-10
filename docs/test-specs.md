@@ -48,7 +48,7 @@ All test descriptions use the `should <behavior>` pattern:
 
 ```typescript
 it('should transition to PARTIAL_DEPOSIT on first valid payment', ...)
-it('should bounce payment from unknown sender', ...)
+it('should bounce payment with wrong currency', ...)
 ```
 
 ### 1.3 New Test Helpers
@@ -220,7 +220,7 @@ interface LiveTestContext {
   escrowWallet: SphereInstance;
   partyAWallet: SphereInstance;
   partyBWallet: SphereInstance;
-  charlieWallet: SphereInstance;  // unauthorized third party
+  charlieWallet: SphereInstance;  // third-party depositor (tests that any sender may deposit into correct currency slot)
 
   // Resolved addresses
   escrowAddress: string;    // DIRECT://...
@@ -348,39 +348,34 @@ should return empty array for terminal states
 
 ### 2.2 SwapOrchestrator — `swap-orchestrator.test.ts`
 
-**~63 tests** covering the central coordinator's event handling, state guards, race conditions, and DM delivery.
+**~55 tests** covering the central coordinator's event handling, state guards, race conditions, and DM delivery.
 
-#### `invoice:payment` Event Handling (~15 tests)
+#### `invoice:payment` Event Handling (~14 tests)
 
 ```
 should look up swap by deposit invoice ID on payment event
-should call getInvoiceStatus() and iterate coinAssets[i].transfers to identify sender by InvoiceTransferRef.senderAddress (not InvoiceSenderBalance.senderAddress)
-should use cached resolved_party_a_address from SwapRecord for identity matching (not re-resolve nametag)
+should call getInvoiceStatus() and iterate coinAssets[i].transfers to identify deposit by InvoiceTransferRef.coinId (not senderAddress)
 should transition DEPOSIT_INVOICE_CREATED → PARTIAL_DEPOSIT on first valid deposit
 should start timeout timer on first valid deposit
 should NOT start timeout timer on second valid deposit (already running)
-should call returnInvoicePayment() when sender does not match party A or party B
-should call returnInvoicePayment() when sender paid wrong currency (party A paid party B's currency)
+should accept deposit from charlie (third party) when charlie pays party_a_currency into asset[0]
+should accept deposit from charlie (third party) when charlie pays party_b_currency into asset[1]
+should call returnInvoicePayment() when sender paid wrong currency (party A's currency into asset[1] slot)
 should use effectiveSender (refundAddress ?? senderAddress) as recipient for returnInvoicePayment()
-should bounce payment with senderAddress === null (masked predicate)
-should bounce payment from charlie even when charlie's refundAddress spoofs party A's DIRECT address — identity check uses InvoiceTransferRef.senderAddress (charlie's), not effectiveSender (party A's)
+should accept payment with senderAddress === null (masked predicate) when coinId matches the correct asset slot
 should ignore payment event when swap is in TIMED_OUT or later state
 should not call returnInvoicePayment() when swap state is CANCELLED (let autoReturn handle it)
 should deliver bounce_notification DM to bounced sender in the invoice:payment handler (not only in invoice:covered)
 should not call closeInvoice() or transition to DEPOSIT_COVERED within the payment handler (even when coverage is met — invoice:covered handles that)
 ```
 
-#### `invoice:covered` Event Handling (~24 tests)
+#### `invoice:covered` Event Handling (~20 tests)
 
 ```
 should transition PARTIAL_DEPOSIT → DEPOSIT_COVERED on coverage
 should transition DEPOSIT_INVOICE_CREATED → DEPOSIT_COVERED (both deposits arrive before first event)
-should re-validate per-party coverage using InvoiceTransferRef.senderAddress (not InvoiceSenderBalance.senderAddress which holds effectiveSender)
-should reject coverage impersonation where refundAddress spoofs party A address but InvoiceTransferRef.senderAddress is a third party
-  Setup: createMockTransferRef({ transferId: 'tx1', senderAddress: charlieAddress, refundAddress: partyAAddress, coinId: partyACurrency, amount: partyAFullAmount })
-  Assert: does NOT transition to DEPOSIT_COVERED; calls returnInvoicePayment() with recipient=partyAAddress (effectiveSender) and amount limited to charlie's deposit (not party A's aggregated balance)
-should NOT proceed if unauthorized sender contributed to coverage (return and wait)
-should NOT proceed if parties paid correct amounts into swapped currency slots (party A into asset[1], party B into asset[0])
+should re-validate coverage by checking that asset[0] netCoveredAmount >= party_a_value and asset[1] netCoveredAmount >= party_b_value (currency-slot check only — sender identity irrelevant)
+should NOT proceed if asset slots are swapped (party_a_currency paid into asset[1], party_b_currency paid into asset[0])
 should cancel timeout timer on coverage
 should call closeInvoice(depositInvoiceId) without autoReturn — spy verifies options argument is undefined or {} (never { autoReturn: true })
 should create two payout invoices with correct cross-currency targets
@@ -396,8 +391,7 @@ should deliver bounce_notification DM to bounced sender with reason code when re
 should send payment_confirmation DM to party A with party_b_currency and party_b_value (not party A's own currency — negative transposition test)
 should send payment_confirmation DM to party B with party_a_currency and party_a_value (both parties receive individual confirmations)
 should transition CONCLUDING → COMPLETED after both payouts and DM delivery succeed
-should use case-sensitive exact string match for DIRECT:// address comparison during re-validation
-should NOT apply normalizeAddress() to resolved DIRECT addresses — setup party with uppercase hex in DIRECT address, verify full resolution → storage → comparison pipeline preserves case and matches SDK-returned senderAddress
+should accept charlie's contribution toward asset[0] coverage when charlie paid party_a_currency — coverage check is currency-only, payout goes to party A regardless of depositor
 ```
 
 #### `invoice:cancelled` Event Handling (~3 tests)
@@ -428,12 +422,12 @@ should not call returnInvoicePayment() when swap state is COMPLETED or FAILED (t
 should handle optimistic lock null return (version mismatch) by aborting the current operation and re-reading state (not silently continuing)
 ```
 
-#### Rate Limiting — Unauthorized Payment Flooding (~3 tests)
+#### Rate Limiting — Wrong-Currency Payment Flooding (~3 tests)
 
 ```
 should not call returnInvoicePayment() more than N times per minute per invoice (rate limit)
-should log unauthorized payments that exceed the rate limit without returning immediately
-should not starve legitimate deposit processing when flooded with unauthorized payments
+should log wrong-currency payments that exceed the rate limit without returning immediately
+should not starve legitimate deposit processing when flooded with wrong-currency payments
 ```
 
 ---
@@ -525,7 +519,7 @@ should re-attempt createInvoice() when re-announce arrives for swap stuck in ANN
 
 ```
 should return status_result with swap state and deposit_status for authorized party
-should derive per-party coverage from coinAssets[i].transfers using senderAddress
+should derive per-party coverage from coinAssets[i].netCoveredAmount vs requestedAmount (currency-slot check)
 should reject status query from unauthorized npub with error response
 should reject status query from party A of swap 1 when querying swap 2 (cross-swap authorization scoping)
 should reject status query from attacker who announced first (attacker npub in role map, but attacker's DIRECT address ≠ resolved party address) — npub presence in role map is insufficient; DIRECT address back-check required
@@ -608,42 +602,34 @@ Note: The existing manifest validator tests cover swap_id format, party address 
 
 ### 2.8 Deposit Validation — `deposit-validation.test.ts`
 
-**~20 tests** covering the sender verification logic described in `docs/architecture.md` §Deposit Validation.
+**~14 tests** covering the currency-slot identification logic described in `docs/architecture.md` §Deposit Validation.
 
-#### Sender Identification (~5 tests)
+Party identification is by **asset/currency type** (coinId), not by sender address. Any sender — including masked predicates and third parties — may deposit into the correct currency slot. The only bounce reason is `WRONG_CURRENCY`.
 
-```
-should identify party A by matching senderAddress against resolved_party_a_address
-should identify party B by matching senderAddress against resolved_party_b_address
-should return null for senderAddress that matches neither party
-should use case-sensitive exact string match for DIRECT:// address comparison
-should NOT use effectiveSender/senderBalances keys for identity verification
-```
-
-#### Masked Predicate Handling (~4 tests)
+#### Currency-Slot Identification (~5 tests)
 
 ```
-should treat senderAddress === null as unknown sender and trigger bounce
-should log warning when senderAddress is null and no refundAddress (cannot return)
-should bounce masked-predicate payment to refundAddress when refundAddress is provided (senderAddress=null, refundAddress=someAddress)
-should bounce and flag as suspicious when masked-predicate sender sets refundAddress to a swap party's DIRECT address — senderAddress is null so identity cannot be verified; payment MUST be bounced (not just logged)
+should accept any sender paying party_a_currency_to_change into asset[0] (coinId match — sender identity irrelevant)
+should accept any sender paying party_b_currency_to_change into asset[1] (coinId match — sender identity irrelevant)
+should accept deposit from charlie (third-party) when charlie pays party_a_currency into asset[0]
+should accept deposit with senderAddress === null (masked predicate) when coinId matches asset[0]
+should bounce payment with WRONG_CURRENCY when coinId does not match either asset slot
 ```
 
-#### Currency Matching (~3 tests)
+#### Third-Party Deposit Tests (~2 tests)
 
 ```
-should accept party A paying party_a_currency_to_change (asset index 0)
-should accept party B paying party_b_currency_to_change (asset index 1)
-should bounce party A paying party_b_currency_to_change with reason WRONG_CURRENCY
+should accept deposit from charlie if charlie pays party_a_currency to asset[0] — swap transitions to PARTIAL_DEPOSIT
+should accept deposit from charlie if charlie pays party_b_currency to asset[1] — swap transitions to DEPOSIT_COVERED when combined with prior party deposit
 ```
 
 #### Return Routing (~4 tests)
 
 ```
-should use effectiveSender (refundAddress ?? senderAddress) for returnInvoicePayment recipient
-should use raw senderAddress when no refundAddress is provided
-should use refundAddress when sender provided one (even though identity verified via senderAddress)
-should pass the specific transfer amount (not aggregated senderBalance) to returnInvoicePayment when refundAddress collides with a legitimate party's effectiveSender key
+should use effectiveSender (refundAddress ?? senderAddress) for returnInvoicePayment recipient on WRONG_CURRENCY bounce
+should use raw senderAddress when no refundAddress is provided on WRONG_CURRENCY bounce
+should use refundAddress when sender provided one on WRONG_CURRENCY bounce
+should pass the specific transfer amount (not aggregated senderBalance) to returnInvoicePayment
 ```
 
 #### Return Failure Handling (~1 test)
@@ -665,7 +651,7 @@ should correctly compare netCoveredAmount >= requestedAmount with BigInt arithme
 
 **~43 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
 
-Each test sets up a swap in a specific (swap state, invoice state) pair, then runs the recovery procedure and verifies the resulting action. All re-validation steps must use `InvoiceTransferRef.senderAddress` (cryptographic) for identity verification — not `InvoiceSenderBalance.senderAddress` (which holds `effectiveSender`).
+Each test sets up a swap in a specific (swap state, invoice state) pair, then runs the recovery procedure and verifies the resulting action. All re-validation steps check coverage by currency slot (coinId against asset index) — sender identity is not evaluated.
 
 #### ANNOUNCED Recovery (~1 test)
 
@@ -679,7 +665,7 @@ should re-create deposit invoice when swap is ANNOUNCED with no invoice (creatio
 should re-subscribe to events when swap is DEPOSIT_INVOICE_CREATED and invoice is OPEN
 should treat EXPIRED invoice as equivalent to OPEN and re-subscribe (dueDate is informational)
 should re-register timeout with remaining time when invoice is PARTIAL
-should resume conclusion when invoice is COVERED (re-validate using InvoiceTransferRef.senderAddress, not senderBalances) — setup MUST include refundAddress≠senderAddress on at least one transfer so effectiveSender diverges from senderAddress, proving the test distinguishes the two fields
+should resume conclusion when invoice is COVERED (re-validate by checking asset[0].netCoveredAmount >= party_a_value and asset[1].netCoveredAmount >= party_b_value — currency-slot check only)
 should transition to CANCELLED when invoice is CANCELLED
 should transition to FAILED when invoice is unexpectedly CLOSED
 ```
@@ -689,7 +675,7 @@ should transition to FAILED when invoice is unexpectedly CLOSED
 ```
 should re-register timeout with remaining time when invoice is PARTIAL
 should treat EXPIRED invoice as equivalent to PARTIAL and re-register timeout
-should resume conclusion when invoice is COVERED (re-validate using InvoiceTransferRef.senderAddress, not senderBalances) — setup MUST include refundAddress≠senderAddress on at least one transfer so effectiveSender diverges from senderAddress
+should resume conclusion when invoice is COVERED (re-validate by currency-slot coverage amounts — sender identity not checked)
 should transition to CANCELLED when invoice is CANCELLED (timeout fired during crash)
 should transition to FAILED when invoice is unexpectedly CLOSED with partial coverage
 ```
@@ -697,8 +683,8 @@ should transition to FAILED when invoice is unexpectedly CLOSED with partial cov
 #### DEPOSIT_COVERED Recovery (~5 tests)
 
 ```
-should re-validate coverage and revert to PARTIAL_DEPOSIT if coverage regressed and valid parties' payments alone do not meet thresholds (OPEN/PARTIAL/EXPIRED)
-should re-validate coverage and proceed with conclusion if valid parties' payments alone still meet thresholds despite aggregate regression (OPEN/PARTIAL/EXPIRED — auto-returns reduced total but correct-party deposits suffice)
+should re-validate coverage and revert to PARTIAL_DEPOSIT if asset slot amounts no longer meet thresholds (OPEN/PARTIAL/EXPIRED — auto-returns may have reduced netCoveredAmount below requestedAmount)
+should re-validate coverage and proceed with conclusion if asset slot amounts still meet thresholds despite aggregate regression (OPEN/PARTIAL/EXPIRED — some auto-returns occurred but remaining deposits in each slot still suffice)
 should transition to CANCELLED if invoice is CANCELLED and all deposits auto-returned
 should transition to FAILED if invoice is CANCELLED but auto-returns are incomplete (funds at risk)
 should create payout invoices and proceed with conclusion if invoice is CLOSED but payouts missing
@@ -768,7 +754,7 @@ should deliver deposit invoice tokens to both parties via DM on announcement
 ### Bounce Scenarios (~4 tests)
 
 ```
-should bounce payment from unknown sender and continue accepting valid deposits
+should accept deposit from third-party charlie when charlie pays party_a_currency into asset[0]
 should bounce payment with wrong currency and continue accepting valid deposits
 should bounce payment on already-covered swap with reason ALREADY_COVERED
 should bounce payment on cancelled swap (autoReturn handles it, handler ignores)
@@ -844,7 +830,7 @@ beforeAll(async () => {
   //    - escrow: 0 (funded by deposits)
   //    - partyA (alice): 10000 UCT
   //    - partyB (bob): 10000 USDU
-  //    - charlie: 5000 UCT (for unauthorized payment tests)
+  //    - charlie: 5000 UCT (for third-party deposit tests — charlie deposits on behalf of party A)
   // 4. Start escrow service instance with escrowWallet's AccountingModule
   // 5. Wait for all wallets to confirm funding (poll getBalance until non-zero)
 }, 120_000);
@@ -931,14 +917,15 @@ should handle timeout when both parties deposit but one underfunds
 
 **Flakiness**: Medium. Timer precision depends on escrow service's setTimeout accuracy. Use generous poll windows. Timeout tests are inherently slow (90s minimum).
 
-### D. Bounce-Back (~3 tests)
+### D. Bounce-Back and Third-Party Deposits (~3 tests)
 
 ```
-should bounce payment from unknown sender (charlie) and return funds
-  - Announce swap between alice and bob
-  - Charlie pays into deposit invoice
-  - Poll: charlie's balance restored (funds returned via returnInvoicePayment)
-  - Swap state remains DEPOSIT_INVOICE_CREATED
+should accept deposit from charlie (third-party) into correct currency slot
+  - Announce swap between alice (UCT) and bob (USDU)
+  - Charlie pays 1000 UCT into deposit invoice (party_a_currency slot)
+  - Poll: swap state transitions to PARTIAL_DEPOSIT (charlie's deposit counted toward asset[0])
+  - Bob pays 500 USDU — swap reaches DEPOSIT_COVERED and completes
+  - Verify: party A receives USDU payout, party B receives UCT payout (charlie's contribution)
 
 should bounce payment with wrong currency
   - Party A (should pay UCT) sends USDU instead
@@ -952,7 +939,7 @@ should handle post-cancellation payment (auto-return)
   - Poll: party A's funds auto-returned (autoReturn on cancelInvoice handles this)
 ```
 
-**Flakiness**: Medium. Bounce-back depends on transfer propagation and return confirmation. Post-cancellation test requires tight timing; use 60s timeout + delay before late payment.
+**Flakiness**: Medium. Third-party deposit test depends on transfer propagation and state polling. Wrong-currency bounce depends on returnInvoicePayment confirmation. Post-cancellation test requires tight timing; use 60s timeout + delay before late payment.
 
 ### E. DM Protocol (~5 tests)
 
@@ -1133,7 +1120,7 @@ The live E2E tests cover the complete trader-creation → topup → escrow → e
 | `MockAccountingModule.returnInvoicePayment()` | `AccountingModule.returnInvoicePayment(string, ReturnPaymentParams)` | Returns `TransferResult` (not void) |
 | `createMockTransferRef()` | `InvoiceTransferRef` | Includes `transferId`, `senderAddress: string | null`, `refundAddress?`, `amount`, `coinId`, `direction`, `paymentDirection`, `destinationAddress`, `timestamp`, `confirmed` |
 | `InMemorySwapStateStore` schema | `SwapStateStore` interface | Fields match `docs/architecture.md` §SwapStateStore: `swap_id`, `manifest`, `state`, `deposit_invoice_id`, `payout_a_invoice_id`, `payout_b_invoice_id`, `resolved_party_a_address`, `resolved_party_b_address`, `first_deposit_at`, `timeout_at`, `version` |
-| `createMockInvoiceStatus()` | `InvoiceStatus` | `targets[0].coinAssets[i].transfers` uses `InvoiceTransferRef[]`; `senderBalances` is `InvoiceSenderBalance[]` (array, not Map) — tests verify that identity checks use `transfers[].senderAddress` (cryptographic, from `InvoiceTransferRef`) not `InvoiceSenderBalance.senderAddress` (which holds `effectiveSender`) |
+| `createMockInvoiceStatus()` | `InvoiceStatus` | `targets[0].coinAssets[i].transfers` uses `InvoiceTransferRef[]`; `senderBalances` is `InvoiceSenderBalance[]` (array, not Map) — tests verify that deposit classification uses `transfers[].coinId` against asset slot index, not `senderAddress` or `senderBalances` |
 
 ---
 
@@ -1142,15 +1129,15 @@ The live E2E tests cover the complete trader-creation → topup → escrow → e
 | Category | File | Count |
 |---|---|---|
 | **Unit** | state-machine.test.ts | ~38 |
-| | swap-orchestrator.test.ts | ~63 |
+| | swap-orchestrator.test.ts | ~55 |
 | | invoice-manager.test.ts | ~14 |
 | | timeout-manager.test.ts | ~14 |
 | | message-handler.test.ts | ~25 |
 | | swap-state-store.test.ts | ~12 |
 | | manifest-validator.test.ts | ~4 |
-| | deposit-validation.test.ts | ~20 |
+| | deposit-validation.test.ts | ~14 |
 | | crash-recovery.test.ts | ~43 |
-| **Unit subtotal** | | **~233** |
+| **Unit subtotal** | | **~219** |
 | **Integration** | swap-lifecycle.integration.test.ts | ~25 |
 | **Live E2E** | swap-lifecycle.e2e-live.test.ts | ~22 |
-| **Total** | | **~280** |
+| **Total** | | **~266** |

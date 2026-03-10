@@ -71,7 +71,7 @@ Application-level timer that fires after `manifest.timeout` seconds from the fir
 On timeout:
 1. Calls `cancelInvoice(depositInvoiceId, { autoReturn: true })`
 2. The AccountingModule handles returning all deposited funds to their original senders via the auto-return deduplication ledger
-3. No manual RefundProcessor needed — auto-return covers all return logistics (given the unmasked-predicate precondition — see Deposit Validation). If a sender has `senderAddress === null` and no `refundAddress`, auto-return has no destination and the return will fail; these funds require manual intervention.
+3. No manual RefundProcessor needed — auto-return covers all return logistics. The auto-return dedup ledger routes each return to `effectiveSender` (`refundAddress ?? senderAddress`). If a payer provided neither a `refundAddress` nor an unmasked `senderAddress`, auto-return has no destination and the return will fail; these funds require manual intervention.
 
 ### MessageHandler (Simplified)
 
@@ -122,9 +122,7 @@ const depositInvoice = await accounting.createInvoice({
 });
 ```
 
-Both parties pay into the same invoice. The AccountingModule tracks per-sender balances automatically via the invoice-transfer index. The escrow validates that the correct party paid the correct currency by iterating `coinAssets[i].transfers` (the raw `InvoiceTransferRef[]` array) and matching each transfer's cryptographically-authenticated `senderAddress` against the resolved party addresses. **Do not use `senderBalances`** for identity verification — its keys are `effectiveSender` values (`refundAddress ?? senderAddress`), where `refundAddress` is self-asserted by the sender (not cryptographically verified).
-
-**Precondition: unmasked predicates required.** The `InvoiceTransferRef.senderAddress` field is `string | null` — it is `null` when the sender uses a masked predicate. The escrow's deposit validation relies on `senderAddress` for identity verification, so **both parties must use unmasked predicates** (DIRECT:// addresses derived from their public keys). If a party uses a masked predicate, their `senderAddress` will be `null` and the escrow cannot verify their identity. This precondition must be enforced during manifest validation: the resolved DIRECT:// addresses for both parties must be non-null before proceeding.
+Both parties pay into the same invoice. The AccountingModule tracks per-sender balances automatically via the invoice-transfer index. The escrow identifies which party side a payment covers by matching the **coin asset type** of the transferred token against the manifest's declared currencies — not by the sender's address. Anyone can deposit on behalf of a party; what matters is which currency slot the token fills.
 
 ### Payout Invoices
 
@@ -213,11 +211,10 @@ The SwapOrchestrator subscribes to AccountingModule events and maps them to swap
 Fired when a payment referencing the deposit invoice is received. The handler:
 
 1. Looks up the swap by deposit invoice ID
-2. Inspects `getInvoiceStatus()` and iterates `targets[0].coinAssets[i].transfers` to identify the sender via each transfer's `senderAddress` (the cryptographically-authenticated on-chain address — **not** `senderBalances`, whose keys are self-asserted `effectiveSender` values). Transfers with `senderAddress === null` (masked predicates) are treated as unknown senders and bounced.
-3. Validates that the sender matches a swap party and paid the correct currency
-4. If wrong sender or wrong currency: calls `returnInvoicePayment()` to bounce
-5. If first valid deposit: transitions to `PARTIAL_DEPOSIT`, starts timeout timer
-6. Does NOT need to check coverage here — `invoice:covered` handles that
+2. Inspects `getInvoiceStatus()` and identifies which currency asset the incoming transfer funded by checking `targets[0].coinAssets[i]`. The side (party A or party B) is determined by the asset's currency type, **not** by the sender's address. Anyone may deposit on behalf of a side.
+3. If the deposited token's currency does not match either `party_a_currency_to_change` or `party_b_currency_to_change`: calls `returnInvoicePayment()` to bounce with reason `WRONG_CURRENCY`
+4. If first valid deposit: transitions to `PARTIAL_DEPOSIT`, starts timeout timer
+5. Does NOT need to check coverage here — `invoice:covered` handles that
 
 ### `invoice:covered`
 
@@ -225,7 +222,7 @@ Fired when all requested assets in the deposit invoice reach their targets. The 
 
 1. Verifies the invoice ID maps to an active swap
 2. **State guard:** only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT` — ignore if already `DEPOSIT_COVERED` or later (idempotency)
-3. **Re-validate per-party coverage:** call `getInvoiceStatus()` and iterate `coinAssets[i].transfers` to verify that the correct party paid the correct currency using each transfer's `senderAddress` (not `senderBalances`). The `invoice:covered` event only means the aggregate amounts are met — it does not guarantee that the right senders paid the right assets. An unauthorized sender could have covered an asset before the bounce-back completed. If validation fails, do NOT proceed — return the unauthorized payment and remain in `PARTIAL_DEPOSIT` (or `DEPOSIT_INVOICE_CREATED`). The `invoice:covered` event fires on every payment event where all targets meet their coverage thresholds, so it will fire again naturally once the correct party's payment restores coverage.
+3. **Re-validate per-currency coverage:** call `getInvoiceStatus()` and verify that `coinAssets[0]` (party A's currency) and `coinAssets[1]` (party B's currency) are each individually covered at the required amounts. The `invoice:covered` event only means the aggregate amounts are met — it does not guarantee that the two distinct currency slots are both individually satisfied (e.g., someone could have overpaid one currency while the other remains uncovered). If either slot is not individually covered at the correct threshold, do NOT proceed — bounce the wrong-currency payment and remain in `PARTIAL_DEPOSIT` (or `DEPOSIT_INVOICE_CREATED`). The `invoice:covered` event fires on every payment event where all targets meet their coverage thresholds, so it will fire again naturally once the correct currencies restore full coverage.
 4. Transitions to `DEPOSIT_COVERED`
 5. Cancels the timeout timer (if running)
 6. Closes the deposit invoice: `closeInvoice(depositInvoiceId)` — do **not** pass `{autoReturn: true}` here. Surplus handling, if needed, should be done after payouts complete. Passing `autoReturn: true` on close would trigger surplus returns concurrently with payout `payInvoice()` calls, creating a race for the escrow's token balance.
@@ -267,15 +264,17 @@ timeoutManager.schedule(swapId, timeoutMs, async () => {
 
 ## Deposit Validation
 
-The deposit invoice accepts payments from anyone — the AccountingModule does not have `allowedSenders` filtering (see `docs/sdk-gaps.md`). The escrow performs application-level sender validation:
+The deposit invoice accepts payments from anyone. Party identification is by **currency type**, not by sender address. The escrow's application-level validation is:
 
 1. On `invoice:payment`, call `getInvoiceStatus(depositInvoiceId)`
-2. Iterate `targets[0].coinAssets[i].transfers` (the raw `InvoiceTransferRef[]` array) and use each transfer's `senderAddress` field to find the new sender. **Do not use `senderBalances`** — its keys are `effectiveSender` (`refundAddress ?? senderAddress`), where `refundAddress` is self-asserted by the sender (set via `inv.ra` in the on-chain message) without cryptographic proof of ownership. A malicious sender could set `inv.ra` to another party's address to impersonate them. The `senderAddress` is derived from the transfer's cryptographic signature and cannot be forged, but **can be `null`** for masked-predicate senders — treat `null` as an unknown sender and bounce. Note: `targets[0]` is correct because the deposit invoice has a single target (the escrow address).
-3. Resolve the sender's DIRECT address to determine which party they are
-4. If the sender is not party A or party B: `returnInvoicePayment()` to bounce back. **Important:** The `recipient` parameter must be the `effectiveSender` (`refundAddress ?? senderAddress`), not raw `senderAddress`, because the SDK's `returnInvoicePayment()` validates the balance cap against `senderBalances` which are keyed by `effectiveSender`. Using raw `senderAddress` when the sender provided a `refundAddress` would fail the balance cap check or send to the wrong address. Note: identity verification still uses `senderAddress` (cryptographic), but return routing uses `effectiveSender`.
-5. If the sender paid the wrong currency (party A paid party B's currency): bounce back
+2. Identify which currency asset the incoming transfer funded by inspecting `targets[0].coinAssets[i]`. Note: `targets[0]` is correct because the deposit invoice has a single target (the escrow address). Asset index 0 corresponds to `party_a_currency_to_change`; index 1 to `party_b_currency_to_change`.
+3. If the deposited token's currency does not match either declared asset — i.e., the coin type falls outside both party A's and party B's expected currencies — call `returnInvoicePayment()` to bounce with reason `WRONG_CURRENCY`. This is the **only** bounce reason for deposit payments.
 
-**Address resolution:** Party addresses in the manifest may be nametags (`@alice`) or PROXY addresses. The AccountingModule tracks senders by their DIRECT:// address. The escrow must resolve manifest addresses to DIRECT:// for matching. Nametag resolution uses the sphere-sdk's nametag lookup; PROXY addresses resolve via the PROXY→DIRECT mapping.
+**Return routing:** The `recipient` parameter of `returnInvoicePayment()` must be `effectiveSender` (`refundAddress ?? senderAddress`), not raw `senderAddress`, because the SDK validates the balance cap against `senderBalances` keyed by `effectiveSender`. If both `refundAddress` and `senderAddress` are absent or null, auto-return has no destination — log for manual intervention.
+
+**Masked predicates:** `InvoiceTransferRef.senderAddress` may be `null` when the sender uses a masked predicate. This does not affect validation — currency type is still determinable from the asset the transfer credited. The payment is accepted normally if the currency matches; surplus (overpayment) is returned to `effectiveSender` via the auto-return dedup ledger on timeout or close. If neither `refundAddress` nor `senderAddress` is present, surplus return will fail and require manual intervention.
+
+**Address resolution:** Party addresses in the manifest may be nametags (`@alice`) or PROXY addresses. Resolution is still required for payout invoice target addresses and for DM authorization (associating a Nostr npub with a party role). Resolved DIRECT:// addresses are cached in the swap case at announcement time. Resolution is **not** used for deposit validation — currency type alone determines the party side.
 
 ## What Gets Eliminated
 
@@ -329,12 +328,12 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 | `DEPOSIT_INVOICE_CREATED` | `EXPIRED` | `dueDate` passed but no deposits arrived. Treat as equivalent to `OPEN` — the escrow enforces timeout at the application level, not via `dueDate`. Re-subscribe to events. |
 | `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT` | `PARTIAL` | Re-register timeout timer with remaining time, re-subscribe to events |
 | `PARTIAL_DEPOSIT` | `EXPIRED` | `dueDate` passed with partial deposits. Treat as equivalent to `PARTIAL` — re-register timeout timer. Note: if the invoice becomes fully covered, the SDK state will be `COVERED` (which takes priority over `EXPIRED` in the state computation). |
-| `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT` | `COVERED` | Coverage achieved during crash — re-validate per-sender coverage (correct party paid correct currency via `senderAddress` in transfers), then resume conclusion (step 5 of `invoice:covered` handler). The `COVERED` state is dynamically computed and may change if auto-returns execute between crash and recovery. |
+| `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT` | `COVERED` | Coverage achieved during crash — re-validate per-currency coverage (both `coinAssets[0]` and `coinAssets[1]` individually covered at their required amounts), then resume conclusion (step 5 of `invoice:covered` handler). The `COVERED` state is dynamically computed and may change if auto-returns execute between crash and recovery. |
 | `PARTIAL_DEPOSIT` | `CLOSED` | Deposit closed unexpectedly with only partial coverage — investigate and transition to `FAILED` |
 | `PARTIAL_DEPOSIT` | `CANCELLED` | Timeout fired during crash — transition to `CANCELLED` |
 | `DEPOSIT_INVOICE_CREATED` | `CANCELLED` | Manual or unexpected cancellation before any deposit — transition to `CANCELLED` |
 | `DEPOSIT_INVOICE_CREATED` | `CLOSED` | Deposit closed without the escrow tracking it — investigate and transition to `FAILED` |
-| `DEPOSIT_COVERED` | `OPEN` or `PARTIAL` or `EXPIRED` | Coverage regressed during crash window — auto-returns or late return-direction transfers reduced `netCoveredAmount` below threshold. Re-validate per-sender coverage. If valid coverage can be restored (correct parties' payments alone still meet thresholds), proceed with conclusion. If not, revert swap to `PARTIAL_DEPOSIT`, re-subscribe to events, and re-register timeout with remaining time. |
+| `DEPOSIT_COVERED` | `OPEN` or `PARTIAL` or `EXPIRED` | Coverage regressed during crash window — auto-returns or late return-direction transfers reduced `netCoveredAmount` below threshold. Re-validate per-currency coverage (check each `coinAssets[i]` individually). If both currency slots are still individually covered at the required amounts, proceed with conclusion. If not, revert swap to `PARTIAL_DEPOSIT`, re-subscribe to events, and re-register timeout with remaining time. |
 | `DEPOSIT_COVERED` | `CANCELLED` | Deposit cancelled after coverage (e.g., admin action during crash window) — check if deposits were auto-returned (inspect auto-return dedup ledger). If all returned, transition to `CANCELLED`. If partially returned or no returns, transition to `FAILED` for manual intervention. |
 | `DEPOSIT_COVERED` | `CLOSED` | Deposit closed before payouts created — create payout invoices if missing, persist as `CONCLUDING`, then proceed with payouts |
 | `CONCLUDING` | `CLOSED` | Payouts may be partially complete — check each payout invoice individually (see below) |
@@ -371,12 +370,9 @@ All four error codes should be caught and treated as success conditions during c
 
 ## Security Considerations
 
-### Wrong-Sender Validation
+### Wrong-Currency Validation
 
-Without `allowedSenders` on `InvoiceRequestedAsset` (see SDK gaps), any address can pay the deposit invoice. The escrow must:
-- Check every `invoice:payment` event against the swap manifest's party addresses
-- Immediately return unauthorized payments via `returnInvoicePayment()`
-- Log unauthorized payment attempts for monitoring
+Any address can pay the deposit invoice. The only validation the escrow performs on deposit payments is a **currency-type check**: if the deposited token's currency does not match either `party_a_currency_to_change` or `party_b_currency_to_change`, the payment is returned via `returnInvoicePayment()` with reason `WRONG_CURRENCY`. There is no sender identity check — anyone may contribute to either party's side.
 
 ### Nametag-to-DIRECT Resolution
 
@@ -399,17 +395,17 @@ The AccountingModule's per-invoice async mutex (`invoiceGates` in AccountingModu
 
 If horizontal scaling is required in the future, the escrow must introduce its own distributed coordination (e.g., Redis-based advisory locks keyed by `swap_id`) or the AccountingModule must add a distributed locking adapter (see `docs/sdk-gaps.md` gap #6).
 
-### Unauthorized Payment Flooding (DOS Mitigation)
+### Wrong-Currency Payment Flooding (DOS Mitigation)
 
-Without `allowedSenders` (see SDK gaps), any address can pay the deposit invoice. A malicious actor could flood the invoice with small unauthorized payments, forcing the escrow to:
+Any address can pay the deposit invoice with any token. A malicious actor could flood the invoice with small wrong-currency payments, forcing the escrow to:
 - Process an `invoice:payment` event for each payment
-- Call `getInvoiceStatus()` to identify the sender
-- Call `returnInvoicePayment()` to bounce each payment back
+- Call `getInvoiceStatus()` to check the currency type
+- Call `returnInvoicePayment()` to bounce each wrong-currency payment back
 
 **Mitigations:**
-- **Rate limiting:** The escrow should rate-limit `returnInvoicePayment()` calls per invoice (e.g., max 10 bounces per minute). Excess unauthorized payments are logged but not immediately returned — they can be batch-returned later or on invoice cancellation via `autoReturn`.
-- **Monitoring:** Log unauthorized payment attempts with sender addresses for operational alerting.
-- **Future SDK support:** The `allowedSenders` gap (#1 in sdk-gaps.md) would eliminate this attack surface entirely by rejecting unauthorized payments at the SDK level.
+- **Rate limiting:** The escrow should rate-limit `returnInvoicePayment()` calls per invoice (e.g., max 10 bounces per minute). Excess wrong-currency payments are logged but not immediately returned — they can be batch-returned later or on invoice cancellation via `autoReturn`.
+- **Monitoring:** Log wrong-currency payment attempts with currency types for operational alerting.
+- **Future SDK support:** An `allowedCurrencies` filter on `InvoiceRequestedAsset` (analogous to the existing `allowedSenders` gap) would eliminate this attack surface entirely by rejecting wrong-currency payments at the SDK level.
 
 ### Invoice Token Security
 

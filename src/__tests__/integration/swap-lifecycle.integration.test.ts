@@ -242,17 +242,18 @@ describe('SwapLifecycle Integration Tests', () => {
   });
 
   describe('Bounce Scenarios', () => {
-    it('should bounce payment from unknown sender and continue accepting valid deposits', async () => {
+    it('should bounce payment with wrong currency from any sender and continue accepting valid deposits', async () => {
       const ctx = await setupOrchestrator();
       const manifest = createManifest();
 
       const announced = await ctx.orchestrator.announce(manifest);
 
+      // Charlie sends an unrecognised currency — coinId matches neither party_a nor party_b currency
       const transferCharlie = createMockTransferRef({
         transferId: 'tx_charlie',
         senderAddress: CHARLIE_ADDRESS,
         amount: '100',
-        coinId: 'UCT',
+        coinId: 'EUR',
       });
       ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferCharlie);
       await new Promise((r) => setTimeout(r, 10));
@@ -999,17 +1000,18 @@ describe('SwapLifecycle Integration Tests', () => {
       ctx.timeoutManager.destroy();
     });
 
-    it('should send bounce_notification DMs for rejected payments', async () => {
+    it('should send bounce_notification DMs for rejected payments (wrong currency)', async () => {
       const ctx = await setupOrchestrator();
       const manifest = createManifest();
 
       const announced = await ctx.orchestrator.announce(manifest);
 
+      // Send a payment with a currency that matches neither party's expected currency
       const transfer = createMockTransferRef({
         transferId: 'tx_charlie',
         senderAddress: CHARLIE_ADDRESS,
         amount: '100',
-        coinId: 'UCT',
+        coinId: 'EUR',
       });
       ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer);
       await new Promise((r) => setTimeout(r, 10));
@@ -1018,7 +1020,7 @@ describe('SwapLifecycle Integration Tests', () => {
         CHARLIE_ADDRESS,
         expect.objectContaining({
           type: 'bounce_notification',
-          reason: 'UNKNOWN_SENDER',
+          reason: 'WRONG_CURRENCY',
         }),
       );
 

@@ -20,7 +20,7 @@
 import { logger } from '../utils/logger.js';
 import { SwapState, isTerminalState } from './state-machine.js';
 import { validateManifest } from './manifest-validator.js';
-import { validateDeposit, getEffectiveSender, identifyParty } from './deposit-validator.js';
+import { validateDeposit, getEffectiveSender } from './deposit-validator.js';
 import type { InvoiceManager } from './invoice-manager.js';
 import type { TimeoutManager } from './timeout-manager.js';
 import type { SwapStateStore, AnnounceResult, SwapRecord } from './types.js';
@@ -329,8 +329,8 @@ export class SwapOrchestrator {
    * Per architecture.md §Event-Driven Flow (invoice:payment):
    * 1. Look up swap by deposit invoice ID
    * 2. State guard: ignore if TIMED_OUT or later
-   * 3. Validate sender via identifyParty() using senderAddress (cryptographic)
-   * 4. If invalid: returnPayment() using effectiveSender as recipient
+   * 3. Validate currency via identifyPartySide() using coinId
+   * 4. If wrong currency: returnPayment() using effectiveSender as recipient
    * 5. If first valid deposit: transition to PARTIAL_DEPOSIT, start timeout
    */
   async _onInvoicePayment(payload: InvoicePaymentPayload): Promise<void> {
@@ -380,39 +380,14 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Validate the sender
-    const validation = validateDeposit(
-      transfer,
-      swap.resolved_party_a_address,
-      swap.resolved_party_b_address,
-      swap.manifest,
-    );
-
-    if (validation.reason === 'MASKED_PREDICATE') {
-      // Cannot verify identity — bounce if effectiveSender is available
-      logger.warn(
-        { swap_id: swap.swap_id, transferId: transfer.transferId },
-        'invoice:payment — masked predicate sender, cannot verify identity',
-      );
-      await this._bouncePayment(swap, invoiceId, transfer, 'UNKNOWN_SENDER');
-      return;
-    }
-
-    if (validation.reason === 'UNKNOWN_SENDER') {
-      logger.warn(
-        { swap_id: swap.swap_id, transferId: transfer.transferId, senderAddress: transfer.senderAddress },
-        'invoice:payment — unknown sender, bouncing',
-      );
-      await this._bouncePayment(swap, invoiceId, transfer, 'UNKNOWN_SENDER');
-      return;
-    }
+    // Validate the deposit — party side is determined by currency, not sender
+    const validation = validateDeposit(transfer, swap.manifest);
 
     if (validation.reason === 'WRONG_CURRENCY') {
       logger.warn(
         {
           swap_id: swap.swap_id,
           transferId: transfer.transferId,
-          party: validation.party,
           coinId: transfer.coinId,
         },
         'invoice:payment — wrong currency, bouncing',
@@ -442,7 +417,7 @@ export class SwapOrchestrator {
         logger.info(
           {
             swap_id: swap.swap_id,
-            party: validation.party,
+            partySide: validation.partySide,
             coinId: transfer.coinId,
             amount: transfer.amount,
           },
@@ -455,7 +430,7 @@ export class SwapOrchestrator {
       logger.info(
         {
           swap_id: swap.swap_id,
-          party: validation.party,
+          partySide: validation.partySide,
           coinId: transfer.coinId,
           amount: transfer.amount,
           state: swap.state,
@@ -470,7 +445,7 @@ export class SwapOrchestrator {
    *
    * Per architecture.md §Event-Driven Flow (invoice:covered):
    * 1. Look up swap, state guard
-   * 2. Re-validate per-party coverage using senderAddress from transfers
+   * 2. Re-validate per-currency-slot coverage (coinId matches asset index)
    * 3. Transition to DEPOSIT_COVERED, cancel timeout
    * 4. Close deposit invoice (no autoReturn)
    * 5. Create payout invoices
@@ -500,8 +475,10 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Re-validate per-party coverage: iterate coinAssets[i].transfers and check
-    // that party A contributed to asset 0 and party B contributed to asset 1
+    // Re-validate per-currency-slot coverage: the SDK's invoice:covered means
+    // both asset slots are fully covered. We verify coinAssets exist and have
+    // forward payments with matching coinIds. Sender identity is NOT checked —
+    // anyone can deposit on behalf of A or B.
     const invoiceStatus = await this.invoiceManager.getInvoiceStatus(invoiceId);
     const target = invoiceStatus.targets[0];
     if (!target) {
@@ -517,66 +494,27 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Validate asset 0: party A must have covered it with their address
-    const partyACoverage = assetA.transfers.some(
+    // Validate asset 0 has forward payments with party_a_currency
+    const slotACovered = assetA.transfers.some(
       (t) => t.paymentDirection === 'forward' &&
-             t.senderAddress !== null &&
-             identifyParty(t.senderAddress, swap.resolved_party_a_address, swap.resolved_party_b_address) === 'A' &&
              t.coinId === swap.manifest.party_a_currency_to_change,
     );
 
-    // Validate asset 1: party B must have covered it with their address
-    const partyBCoverage = assetB.transfers.some(
+    // Validate asset 1 has forward payments with party_b_currency
+    const slotBCovered = assetB.transfers.some(
       (t) => t.paymentDirection === 'forward' &&
-             t.senderAddress !== null &&
-             identifyParty(t.senderAddress, swap.resolved_party_a_address, swap.resolved_party_b_address) === 'B' &&
              t.coinId === swap.manifest.party_b_currency_to_change,
     );
 
-    if (!partyACoverage || !partyBCoverage) {
+    if (!slotACovered || !slotBCovered) {
       logger.warn(
         {
           swap_id: swap.swap_id,
-          partyACoverage,
-          partyBCoverage,
+          slotACovered,
+          slotBCovered,
         },
-        'invoice:covered — coverage not validated per party, waiting for correct payment',
+        'invoice:covered — currency-slot coverage validation failed, waiting',
       );
-
-      // Best-effort bounce of unauthorized payments that caused false coverage.
-      // Continue bouncing remaining transfers even if one bounce fails.
-      for (const transfer of assetA.transfers) {
-        if (transfer.paymentDirection !== 'forward') continue;
-        if (transfer.senderAddress === null) continue;
-        const party = identifyParty(
-          transfer.senderAddress,
-          swap.resolved_party_a_address,
-          swap.resolved_party_b_address,
-        );
-        if (party !== 'A') {
-          try {
-            await this._bouncePayment(swap, invoiceId, transfer, 'UNKNOWN_SENDER');
-          } catch {
-            // Already logged inside _bouncePayment; continue bouncing others
-          }
-        }
-      }
-      for (const transfer of assetB.transfers) {
-        if (transfer.paymentDirection !== 'forward') continue;
-        if (transfer.senderAddress === null) continue;
-        const party = identifyParty(
-          transfer.senderAddress,
-          swap.resolved_party_a_address,
-          swap.resolved_party_b_address,
-        );
-        if (party !== 'B') {
-          try {
-            await this._bouncePayment(swap, invoiceId, transfer, 'UNKNOWN_SENDER');
-          } catch {
-            // Already logged inside _bouncePayment; continue bouncing others
-          }
-        }
-      }
       return;
     }
 
@@ -960,7 +898,7 @@ export class SwapOrchestrator {
     swap: SwapRecord,
     invoiceId: string,
     transfer: InvoiceTransferRef,
-    reason: 'UNKNOWN_SENDER' | 'WRONG_CURRENCY' | 'ALREADY_COVERED',
+    reason: 'WRONG_CURRENCY' | 'ALREADY_COVERED',
   ): Promise<void> {
     const recipient = getEffectiveSender(transfer);
 

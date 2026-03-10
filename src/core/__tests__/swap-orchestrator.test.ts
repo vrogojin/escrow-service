@@ -130,12 +130,13 @@ describe('SwapOrchestrator', () => {
       expect(Math.abs((remainingBefore ?? 0) - (remainingAfter ?? 0))).toBeLessThan(50);
     });
 
-    it('should bounce payment from unknown sender (call returnPayment)', async () => {
-      const { orchestrator, mockAccounting, messageSender } = await setupOrchestrator();
+    it('should accept deposit from any sender if coinId matches expected currency', async () => {
+      const { orchestrator, mockAccounting, stateStore } = await setupOrchestrator();
       const manifest = createTestManifest();
 
       const announced = await orchestrator.announce(manifest);
 
+      // Charlie (not a named party) deposits USD — valid because coinId matches party A's currency slot
       const transfer = createMockTransferRef({
         transferId: 'tx1',
         senderAddress: CHARLIE_ADDRESS,
@@ -147,14 +148,11 @@ describe('SwapOrchestrator', () => {
 
       await new Promise((r) => setTimeout(r, 10));
 
-      expect(mockAccounting._getCallOrder()).toContain('returnInvoicePayment');
-      expect(messageSender.sendToAddress).toHaveBeenCalledWith(
-        CHARLIE_ADDRESS,
-        expect.objectContaining({
-          type: 'bounce_notification',
-          reason: 'UNKNOWN_SENDER',
-        }),
-      );
+      // Payment must NOT be bounced — it covers the USD slot regardless of sender
+      expect(mockAccounting._getCallOrder()).not.toContain('returnInvoicePayment');
+
+      const swap = stateStore.findBySwapId(manifest.swap_id);
+      expect(swap!.state).toBe(SwapState.PARTIAL_DEPOSIT);
     });
 
     it('should bounce payment when sender paid wrong currency', async () => {
@@ -163,11 +161,12 @@ describe('SwapOrchestrator', () => {
 
       const announced = await orchestrator.announce(manifest);
 
+      // GBP matches neither party_a_currency (USD) nor party_b_currency (EUR) — must be bounced
       const transfer = createMockTransferRef({
         transferId: 'tx1',
         senderAddress: PARTY_A_ADDRESS,
         amount: '1000000',
-        coinId: 'EUR',
+        coinId: 'GBP',
       });
 
       mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer);
@@ -184,35 +183,43 @@ describe('SwapOrchestrator', () => {
       );
     });
 
-    it('should use effectiveSender as recipient for returnPayment (not senderAddress)', async () => {
-      const { orchestrator, mockAccounting } = await setupOrchestrator();
+    it('should use effectiveSender (refundAddress) as recipient for returnPayment on WRONG_CURRENCY', async () => {
+      const { orchestrator, mockAccounting, messageSender } = await setupOrchestrator();
       const manifest = createTestManifest();
 
       const announced = await orchestrator.announce(manifest);
 
+      // Sender pays an unknown currency (GBP) with a refundAddress set.
+      // The bounce should be routed to refundAddress, not senderAddress.
       const transfer = createMockTransferRef({
         transferId: 'tx1',
         senderAddress: CHARLIE_ADDRESS,
         refundAddress: 'DIRECT://0xrefund',
         amount: '1000000',
-        coinId: 'USD',
+        coinId: 'GBP',
       });
 
       mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer);
 
       await new Promise((r) => setTimeout(r, 10));
 
-      const invoiceState = mockAccounting._getInvoiceState(announced.deposit_invoice_id);
-      const transfers = invoiceState?.transfers ?? [];
-      expect(transfers.length).toBe(1);
+      expect(mockAccounting._getCallOrder()).toContain('returnInvoicePayment');
+      expect(messageSender.sendToAddress).toHaveBeenCalledWith(
+        'DIRECT://0xrefund',
+        expect.objectContaining({
+          type: 'bounce_notification',
+          reason: 'WRONG_CURRENCY',
+        }),
+      );
     });
 
-    it('should bounce payment with senderAddress === null (masked predicate)', async () => {
-      const { orchestrator, mockAccounting } = await setupOrchestrator();
+    it('should accept deposit from masked predicate sender if coinId matches', async () => {
+      const { orchestrator, mockAccounting, stateStore } = await setupOrchestrator();
       const manifest = createTestManifest();
 
       const announced = await orchestrator.announce(manifest);
 
+      // senderAddress is null (masked predicate) but coinId matches USD slot — must be accepted
       const transfer = createMockTransferRef({
         transferId: 'tx1',
         senderAddress: null,
@@ -225,7 +232,10 @@ describe('SwapOrchestrator', () => {
 
       await new Promise((r) => setTimeout(r, 10));
 
-      expect(mockAccounting._getCallOrder()).toContain('returnInvoicePayment');
+      expect(mockAccounting._getCallOrder()).not.toContain('returnInvoicePayment');
+
+      const swap = stateStore.findBySwapId(manifest.swap_id);
+      expect(swap!.state).toBe(SwapState.PARTIAL_DEPOSIT);
     });
 
     it('should ignore payment event when swap is in TIMED_OUT state', async () => {
@@ -251,12 +261,14 @@ describe('SwapOrchestrator', () => {
       expect(mockAccounting._getCallOrder()).not.toContain('returnInvoicePayment');
     });
 
-    it('should bounce payment from charlie even when charlie refundAddress spoofs party A DIRECT address', async () => {
-      const { orchestrator, mockAccounting } = await setupOrchestrator();
+    it('should accept deposit from charlie even when refundAddress is set to party A address', async () => {
+      const { orchestrator, mockAccounting, stateStore } = await setupOrchestrator();
       const manifest = createTestManifest();
 
       const announced = await orchestrator.announce(manifest);
 
+      // Charlie deposits USD with refundAddress spoofed to party A's address.
+      // The new model does not check sender identity — USD matches slot A, so it is accepted.
       const transfer = createMockTransferRef({
         transferId: 'tx1',
         senderAddress: CHARLIE_ADDRESS,
@@ -269,7 +281,10 @@ describe('SwapOrchestrator', () => {
 
       await new Promise((r) => setTimeout(r, 10));
 
-      expect(mockAccounting._getCallOrder()).toContain('returnInvoicePayment');
+      expect(mockAccounting._getCallOrder()).not.toContain('returnInvoicePayment');
+
+      const swap = stateStore.findBySwapId(manifest.swap_id);
+      expect(swap!.state).toBe(SwapState.PARTIAL_DEPOSIT);
     });
 
     it('should not transition to DEPOSIT_COVERED within payment handler (that is invoice:covered job)', async () => {
@@ -324,22 +339,23 @@ describe('SwapOrchestrator', () => {
       expect([SwapState.DEPOSIT_COVERED, SwapState.CONCLUDING, SwapState.COMPLETED]).toContain(swap.state);
     });
 
-    it('should re-validate per-party coverage using transfers senderAddress', async () => {
+    it('should re-validate currency-slot coverage (not sender identity) on invoice:covered', async () => {
       const { orchestrator, mockAccounting, stateStore } = await setupOrchestrator();
       const manifest = createTestManifest();
 
       const announced = await orchestrator.announce(manifest);
 
+      // Deposits from any sender — only coinId matters for slot coverage
       const transferA = createMockTransferRef({
         transferId: 'tx1',
-        senderAddress: PARTY_A_ADDRESS,
+        senderAddress: CHARLIE_ADDRESS,
         amount: '1000000',
         coinId: 'USD',
       });
 
       const transferB = createMockTransferRef({
         transferId: 'tx2',
-        senderAddress: PARTY_B_ADDRESS,
+        senderAddress: CHARLIE_ADDRESS,
         amount: '850000',
         coinId: 'EUR',
       });
@@ -605,12 +621,13 @@ describe('SwapOrchestrator', () => {
       );
     });
 
-    it('should reject coverage from impersonator (charlie with correct amount but wrong senderAddress)', async () => {
+    it('should accept coverage when both currency slots are filled regardless of who sent each deposit', async () => {
       const { orchestrator, mockAccounting, stateStore } = await setupOrchestrator();
       const manifest = createTestManifest();
 
       const announced = await orchestrator.announce(manifest);
 
+      // Party A deposits USD, Charlie deposits EUR — both slots are filled
       const transfer1 = createMockTransferRef({
         transferId: 'tx1',
         senderAddress: PARTY_A_ADDRESS,
@@ -631,7 +648,7 @@ describe('SwapOrchestrator', () => {
       await orchestrator._onInvoiceCovered({ invoiceId: announced.deposit_invoice_id, confirmed: true });
 
       const swap = stateStore.findBySwapId(manifest.swap_id)!;
-      expect(swap.state).not.toBe(SwapState.DEPOSIT_COVERED);
+      expect([SwapState.DEPOSIT_COVERED, SwapState.CONCLUDING, SwapState.COMPLETED]).toContain(swap.state);
     });
 
     it('should handle INVOICE_ALREADY_CLOSED gracefully (proceed)', async () => {

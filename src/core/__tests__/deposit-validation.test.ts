@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
-  identifyParty,
-  validateCurrency,
+  identifyPartySide,
   getEffectiveSender,
   validateDeposit,
 } from '../deposit-validator.js';
@@ -9,7 +8,6 @@ import { createMockTransferRef } from '../../__tests__/helpers/mock-invoice-stat
 
 const PARTY_A_ADDRESS = 'DIRECT://0xaaaaaa';
 const PARTY_B_ADDRESS = 'DIRECT://0xbbbbbb';
-const CHARLIE_ADDRESS = 'DIRECT://0xcccccc';
 
 const MANIFEST = {
   swap_id: 'test-swap',
@@ -22,51 +20,20 @@ const MANIFEST = {
   timeout: 300,
 };
 
-describe('identifyParty', () => {
-  it('should identify party A by matching senderAddress against resolved_party_a_address', () => {
-    const result = identifyParty(PARTY_A_ADDRESS, PARTY_A_ADDRESS, PARTY_B_ADDRESS);
+describe('identifyPartySide', () => {
+  it("should return 'A' when coinId matches party_a_currency", () => {
+    const result = identifyPartySide('USD', MANIFEST);
     expect(result).toBe('A');
   });
 
-  it('should identify party B by matching senderAddress against resolved_party_b_address', () => {
-    const result = identifyParty(PARTY_B_ADDRESS, PARTY_A_ADDRESS, PARTY_B_ADDRESS);
+  it("should return 'B' when coinId matches party_b_currency", () => {
+    const result = identifyPartySide('EUR', MANIFEST);
     expect(result).toBe('B');
   });
 
-  it('should return null for senderAddress that matches neither party', () => {
-    const result = identifyParty(CHARLIE_ADDRESS, PARTY_A_ADDRESS, PARTY_B_ADDRESS);
+  it('should return null when coinId matches neither currency', () => {
+    const result = identifyPartySide('GBP', MANIFEST);
     expect(result).toBeNull();
-  });
-
-  it('should use case-sensitive exact string match for DIRECT:// address comparison', () => {
-    const result = identifyParty(
-      'DIRECT://0xAAAAAA',
-      PARTY_A_ADDRESS,
-      PARTY_B_ADDRESS,
-    );
-    expect(result).toBeNull();
-  });
-
-  it('should return null when senderAddress is null (masked predicate)', () => {
-    const result = identifyParty(null, PARTY_A_ADDRESS, PARTY_B_ADDRESS);
-    expect(result).toBeNull();
-  });
-});
-
-describe('validateCurrency', () => {
-  it('should accept party A paying party_a_currency_to_change', () => {
-    const result = validateCurrency('A', 'USD', MANIFEST);
-    expect(result).toBe(true);
-  });
-
-  it('should accept party B paying party_b_currency_to_change', () => {
-    const result = validateCurrency('B', 'EUR', MANIFEST);
-    expect(result).toBe(true);
-  });
-
-  it('should reject party A paying party_b_currency_to_change', () => {
-    const result = validateCurrency('A', 'EUR', MANIFEST);
-    expect(result).toBe(false);
   });
 });
 
@@ -120,57 +87,69 @@ describe('getEffectiveSender', () => {
 });
 
 describe('validateDeposit', () => {
-  it('should return valid result for party A with correct currency', () => {
+  it("should return partySide 'A' for valid party_a_currency deposit (any sender)", () => {
     const transfer = createMockTransferRef({
       transferId: 'tx1',
       senderAddress: PARTY_A_ADDRESS,
       amount: '1000000',
       coinId: 'USD',
     });
-    const result = validateDeposit(transfer, PARTY_A_ADDRESS, PARTY_B_ADDRESS, MANIFEST);
-    expect(result.party).toBe('A');
+    const result = validateDeposit(transfer, MANIFEST);
+    expect(result.partySide).toBe('A');
     expect(result.reason).toBeUndefined();
-    expect(result.senderAddress).toBe(PARTY_A_ADDRESS);
     expect(result.coinId).toBe('USD');
   });
 
-  it('should return MASKED_PREDICATE reason when senderAddress is null', () => {
+  it("should return partySide 'B' for valid party_b_currency deposit (any sender)", () => {
+    const transfer = createMockTransferRef({
+      transferId: 'tx1',
+      senderAddress: PARTY_B_ADDRESS,
+      amount: '850000',
+      coinId: 'EUR',
+    });
+    const result = validateDeposit(transfer, MANIFEST);
+    expect(result.partySide).toBe('B');
+    expect(result.reason).toBeUndefined();
+    expect(result.coinId).toBe('EUR');
+  });
+
+  it('should return WRONG_CURRENCY for unknown coinId', () => {
+    const transfer = createMockTransferRef({
+      transferId: 'tx1',
+      senderAddress: PARTY_A_ADDRESS,
+      amount: '1000000',
+      coinId: 'GBP',
+    });
+    const result = validateDeposit(transfer, MANIFEST);
+    expect(result.partySide).toBeNull();
+    expect(result.reason).toBe('WRONG_CURRENCY');
+  });
+
+  it('should accept deposit from unknown sender if currency matches', () => {
+    const transfer = createMockTransferRef({
+      transferId: 'tx1',
+      senderAddress: 'DIRECT://0xcccccc',
+      amount: '1000000',
+      coinId: 'USD',
+    });
+    const result = validateDeposit(transfer, MANIFEST);
+    expect(result.partySide).toBe('A');
+    expect(result.reason).toBeUndefined();
+  });
+
+  it('should accept deposit with null senderAddress (masked predicate) if currency matches', () => {
     const transfer = createMockTransferRef({
       transferId: 'tx1',
       senderAddress: null,
       amount: '1000000',
       coinId: 'USD',
     });
-    const result = validateDeposit(transfer, PARTY_A_ADDRESS, PARTY_B_ADDRESS, MANIFEST);
-    expect(result.party).toBeNull();
-    expect(result.reason).toBe('MASKED_PREDICATE');
+    const result = validateDeposit(transfer, MANIFEST);
+    expect(result.partySide).toBe('A');
+    expect(result.reason).toBeUndefined();
   });
 
-  it('should return UNKNOWN_SENDER when sender does not match either party', () => {
-    const transfer = createMockTransferRef({
-      transferId: 'tx1',
-      senderAddress: CHARLIE_ADDRESS,
-      amount: '1000000',
-      coinId: 'USD',
-    });
-    const result = validateDeposit(transfer, PARTY_A_ADDRESS, PARTY_B_ADDRESS, MANIFEST);
-    expect(result.party).toBeNull();
-    expect(result.reason).toBe('UNKNOWN_SENDER');
-  });
-
-  it('should return WRONG_CURRENCY when party A pays party B currency', () => {
-    const transfer = createMockTransferRef({
-      transferId: 'tx1',
-      senderAddress: PARTY_A_ADDRESS,
-      amount: '1000000',
-      coinId: 'EUR',
-    });
-    const result = validateDeposit(transfer, PARTY_A_ADDRESS, PARTY_B_ADDRESS, MANIFEST);
-    expect(result.party).toBe('A');
-    expect(result.reason).toBe('WRONG_CURRENCY');
-  });
-
-  it('should include effectiveSender in result for return routing', () => {
+  it('should populate effectiveSender from refundAddress ?? senderAddress', () => {
     const transfer = createMockTransferRef({
       transferId: 'tx1',
       senderAddress: PARTY_A_ADDRESS,
@@ -178,7 +157,7 @@ describe('validateDeposit', () => {
       amount: '1000000',
       coinId: 'USD',
     });
-    const result = validateDeposit(transfer, PARTY_A_ADDRESS, PARTY_B_ADDRESS, MANIFEST);
+    const result = validateDeposit(transfer, MANIFEST);
     expect(result.effectiveSender).toBe('DIRECT://0xrefund');
   });
 
@@ -189,7 +168,7 @@ describe('validateDeposit', () => {
       amount: '1000000',
       coinId: 'USD',
     });
-    const result = validateDeposit(transfer, PARTY_A_ADDRESS, PARTY_B_ADDRESS, MANIFEST);
+    const result = validateDeposit(transfer, MANIFEST);
     expect(result.transferId).toBe('tx123');
     expect(result.amount).toBe('1000000');
   });
@@ -201,22 +180,7 @@ describe('validateDeposit', () => {
       amount: '123456789012345678901234567890',
       coinId: 'USD',
     });
-    const result = validateDeposit(transfer, PARTY_A_ADDRESS, PARTY_B_ADDRESS, MANIFEST);
+    const result = validateDeposit(transfer, MANIFEST);
     expect(result.amount).toBe('123456789012345678901234567890');
-  });
-
-  it('should NOT use effectiveSender for identity (spoofing test: charlie senderAddress with partyA refundAddress still returns party=null)', () => {
-    const transfer = createMockTransferRef({
-      transferId: 'tx1',
-      senderAddress: CHARLIE_ADDRESS,
-      refundAddress: PARTY_A_ADDRESS,
-      amount: '1000000',
-      coinId: 'USD',
-    });
-    const result = validateDeposit(transfer, PARTY_A_ADDRESS, PARTY_B_ADDRESS, MANIFEST);
-    expect(result.party).toBeNull();
-    expect(result.reason).toBe('UNKNOWN_SENDER');
-    expect(result.senderAddress).toBe(CHARLIE_ADDRESS);
-    expect(result.effectiveSender).toBe(PARTY_A_ADDRESS);
   });
 });

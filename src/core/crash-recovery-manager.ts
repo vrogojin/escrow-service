@@ -15,7 +15,7 @@
 
 import { logger } from '../utils/logger.js';
 import { SwapState, isTerminalState } from './state-machine.js';
-import { identifyParty } from './deposit-validator.js';
+// Party identification is by currency slot, not sender address
 import { isSphereError } from './accounting-types.js';
 import type { InvoiceManager } from './invoice-manager.js';
 import type { TimeoutManager } from './timeout-manager.js';
@@ -559,31 +559,28 @@ export class CrashRecoveryManager {
       return;
     }
 
-    const partyACoverage = assetA.transfers.some(
+    // Currency-slot coverage: check that each asset slot has forward payments with matching coinId
+    const slotACovered = assetA.transfers.some(
       (t) =>
         t.paymentDirection === 'forward' &&
-        t.senderAddress !== null &&
-        identifyParty(t.senderAddress, swap.resolved_party_a_address, swap.resolved_party_b_address) === 'A' &&
         t.coinId === swap.manifest.party_a_currency_to_change,
     );
 
-    const partyBCoverage = assetB.transfers.some(
+    const slotBCovered = assetB.transfers.some(
       (t) =>
         t.paymentDirection === 'forward' &&
-        t.senderAddress !== null &&
-        identifyParty(t.senderAddress, swap.resolved_party_a_address, swap.resolved_party_b_address) === 'B' &&
         t.coinId === swap.manifest.party_b_currency_to_change,
     );
 
-    if (!partyACoverage || !partyBCoverage) {
-      // Coverage doesn't meet per-party validation.
+    if (!slotACovered || !slotBCovered) {
+      // Coverage doesn't meet per-currency-slot validation.
       // DEPOSIT_COVERED can only transition to CONCLUDING or FAILED (not PARTIAL_DEPOSIT).
       // Transition to FAILED — operator must manually verify coverage and intervene.
       logger.error(
-        { swap_id: swap.swap_id, partyACoverage, partyBCoverage },
-        'Recovery: DEPOSIT_COVERED per-party coverage validation failed — transitioning to FAILED (manual intervention required)',
+        { swap_id: swap.swap_id, slotACovered, slotBCovered },
+        'Recovery: DEPOSIT_COVERED currency-slot coverage validation failed — transitioning to FAILED (manual intervention required)',
       );
-      this._failSwap(swap, `Per-party coverage validation failed in DEPOSIT_COVERED recovery (A: ${partyACoverage}, B: ${partyBCoverage})`);
+      this._failSwap(swap, `Currency-slot coverage validation failed in DEPOSIT_COVERED recovery (A: ${slotACovered}, B: ${slotBCovered})`);
       return;
     }
 
@@ -829,31 +826,29 @@ export class CrashRecoveryManager {
       return;
     }
 
-    // Check if party A's net contribution still meets the threshold
-    const partyAAmount = assetA.transfers
+    // Check if each currency slot's net contribution still meets the threshold
+    const slotAAmount = assetA.transfers
       .filter(
         (t) =>
           t.paymentDirection === 'forward' &&
-          t.senderAddress !== null &&
-          identifyParty(t.senderAddress, swap.resolved_party_a_address, swap.resolved_party_b_address) === 'A',
+          t.coinId === swap.manifest.party_a_currency_to_change,
       )
       .reduce((sum, t) => BigInt(sum) + BigInt(t.amount), 0n);
 
-    const partyBAmount = assetB.transfers
+    const slotBAmount = assetB.transfers
       .filter(
         (t) =>
           t.paymentDirection === 'forward' &&
-          t.senderAddress !== null &&
-          identifyParty(t.senderAddress, swap.resolved_party_a_address, swap.resolved_party_b_address) === 'B',
+          t.coinId === swap.manifest.party_b_currency_to_change,
       )
       .reduce((sum, t) => BigInt(sum) + BigInt(t.amount), 0n);
 
     const requiredA = BigInt(swap.manifest.party_a_value_to_change);
     const requiredB = BigInt(swap.manifest.party_b_value_to_change);
 
-    if (partyAAmount >= requiredA && partyBAmount >= requiredB) {
-      // Still covered by correct parties — close the deposit invoice first, then conclude
-      logger.info({ swap_id: swap.swap_id }, 'Recovery: Coverage still valid from correct parties, closing invoice and proceeding to conclusion');
+    if (slotAAmount >= requiredA && slotBAmount >= requiredB) {
+      // Still covered — close the deposit invoice first, then conclude
+      logger.info({ swap_id: swap.swap_id }, 'Recovery: Coverage still valid, closing invoice and proceeding to conclusion');
       if (swap.deposit_invoice_id) {
         try {
           await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
@@ -870,10 +865,10 @@ export class CrashRecoveryManager {
       // Coverage regressed — DEPOSIT_COVERED can only go to CONCLUDING or FAILED.
       // Transition to FAILED — operator must manually verify and intervene.
       logger.error(
-        { swap_id: swap.swap_id, partyAAmount: String(partyAAmount), partyBAmount: String(partyBAmount) },
+        { swap_id: swap.swap_id, slotAAmount: String(slotAAmount), slotBAmount: String(slotBAmount) },
         'Recovery: DEPOSIT_COVERED coverage regressed — transitioning to FAILED (manual intervention required)',
       );
-      this._failSwap(swap, `Coverage regressed in DEPOSIT_COVERED recovery (A: ${String(partyAAmount)}/${String(requiredA)}, B: ${String(partyBAmount)}/${String(requiredB)})`);
+      this._failSwap(swap, `Coverage regressed in DEPOSIT_COVERED recovery (A: ${String(slotAAmount)}/${String(requiredA)}, B: ${String(slotBAmount)}/${String(requiredB)})`);
     }
   }
 
