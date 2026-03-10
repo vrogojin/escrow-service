@@ -16,11 +16,21 @@ import type {
 } from './accounting-types.js';
 import type { SwapManifest } from './manifest-validator.js';
 
+/** Minimal event emitter interface satisfied by Sphere.on()/off(). */
+export interface EventSource {
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  on(event: string, handler: Function): (() => void) | void;
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  off(event: string, handler: Function): void;
+}
+
 export interface InvoiceManagerDeps {
   /** AccountingModule from @unicitylabs/sphere-sdk (duck-typed as AccountingModule interface). */
   accounting: AccountingModule;
   /** Escrow's own DIRECT:// address — used as the deposit invoice target. */
   escrowAddress: string;
+  /** Event source for invoice events (typically the Sphere instance). */
+  eventSource?: EventSource;
 }
 
 /**
@@ -33,10 +43,13 @@ export interface InvoiceManagerDeps {
 export class InvoiceManager {
   private readonly accounting: AccountingModule;
   private readonly escrowAddress: string;
+  private readonly eventSource: EventSource;
 
   constructor(deps: InvoiceManagerDeps) {
     this.accounting = deps.accounting;
     this.escrowAddress = deps.escrowAddress;
+    // Use explicit eventSource if provided; fall back to accounting (works for mocks with on/off).
+    this.eventSource = deps.eventSource ?? (deps.accounting as unknown as EventSource);
   }
 
   /**
@@ -174,10 +187,7 @@ export class InvoiceManager {
    */
   // eslint-disable-next-line @typescript-eslint/ban-types
   on(event: string, handler: Function): void {
-    (this.accounting as unknown as { on(event: string, handler: Function): void }).on(
-      event,
-      handler,
-    );
+    this.eventSource.on(event, handler);
   }
 
   /**
@@ -188,9 +198,6 @@ export class InvoiceManager {
    */
   // eslint-disable-next-line @typescript-eslint/ban-types
   off(event: string, handler: Function): void {
-    (this.accounting as unknown as { off(event: string, handler: Function): void }).off(
-      event,
-      handler,
-    );
+    this.eventSource.off(event, handler);
   }
 }

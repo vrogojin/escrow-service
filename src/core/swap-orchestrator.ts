@@ -607,6 +607,14 @@ export class SwapOrchestrator {
         if (err.code === 'INVOICE_ALREADY_CLOSED') {
           // Already closed — proceed to payout creation
           logger.info({ swap_id: swap.swap_id }, 'Deposit invoice already closed, proceeding to payouts');
+        } else if (err.code === 'INVOICE_NOT_TARGET') {
+          // SDK's getActiveAddresses() may return empty if tracked addresses
+          // haven't loaded yet. The escrow IS the target (we created the invoice).
+          // Proceed — the invoice will be implicitly closed when we stop accepting payments.
+          logger.warn(
+            { swap_id: swap.swap_id },
+            'closeDepositInvoice returned INVOICE_NOT_TARGET (addresses not yet loaded), proceeding to payouts',
+          );
         } else if (err.code === 'INVOICE_ALREADY_CANCELLED') {
           // Timeout won the race — the invoice is cancelled and deposits are
           // being auto-returned. We cannot proceed with conclusion. The swap is
@@ -742,6 +750,13 @@ export class SwapOrchestrator {
         if (err.code === 'INVOICE_ALREADY_CANCELLED') {
           // Already cancelled — fire the cancelled event logic manually
           logger.info({ swap_id: swapId }, 'Invoice already cancelled on timeout handler');
+          await this._onInvoiceCancelled({ invoiceId: swap.deposit_invoice_id });
+          return;
+        } else if (err.code === 'INVOICE_NOT_TARGET') {
+          // SDK's getActiveAddresses() may return empty if tracked addresses
+          // haven't loaded yet. The escrow IS the target. Fire cancelled event
+          // manually since the actual cancel failed.
+          logger.warn({ swap_id: swapId }, 'cancelInvoice returned INVOICE_NOT_TARGET (addresses not loaded), treating as cancelled');
           await this._onInvoiceCancelled({ invoiceId: swap.deposit_invoice_id });
           return;
         } else if (err.code === 'INVOICE_ALREADY_CLOSED') {
