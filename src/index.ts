@@ -3,9 +3,14 @@ import { initializeWallet } from './sphere/wallet-manager.js';
 import { createMessageHandler } from './sphere/message-handler.js';
 import { SwapOrchestrator } from './core/swap-orchestrator.js';
 import { InvoiceManager } from './core/invoice-manager.js';
+import type { InvoiceManagerDeps } from './core/invoice-manager.js';
 import { InMemorySwapStateStore } from './core/swap-state-store.js';
 import { TimeoutManager } from './core/timeout-manager.js';
 import { logger } from './utils/logger.js';
+import type {
+  SwapOrchestrator as ISwapOrchestrator,
+  NpubRoleMap,
+} from './sphere/orchestrator-interfaces.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -19,13 +24,17 @@ async function main(): Promise<void> {
 
   // 2. Create invoice-based infrastructure
   // Access the AccountingModule via the Sphere instance.
-  // The type assertion is needed because the SDK's main export type
-  // doesn't expose the accounting property in all configurations.
-  const accounting = (sphere as any).accounting;
-  if (!accounting) {
+  // The SDK's main export type does not expose the accounting property in all
+  // configurations, so we use a type-safe property existence check instead of
+  // a blanket `as any` cast.
+  if (!sphere.accounting) {
     throw new Error('AccountingModule not available — ensure Sphere is initialized with accounting enabled');
   }
-  const invoiceManager = new InvoiceManager({ accounting, escrowAddress });
+  const invoiceManager = new InvoiceManager({
+    accounting: sphere.accounting as unknown as InvoiceManagerDeps['accounting'],
+    escrowAddress,
+    eventSource: sphere,
+  });
   const stateStore = new InMemorySwapStateStore();
 
   // 3. Create orchestrator with timeout manager
@@ -70,12 +79,17 @@ async function main(): Promise<void> {
 
   // 6. Start DM message handler
   // TODO: Wire up NpubRoleMap for full DM protocol support
+  const noopNpubRoleMap: NpubRoleMap = {
+    register: (_npub: string, _swapId: string, _party: 'A' | 'B'): void => {},
+    getRole: (_npub: string, _swapId: string): 'A' | 'B' | null => null,
+    getSwapIds: (_npub: string): string[] => [],
+  };
   const messageHandler = createMessageHandler({
     sphere,
-    orchestrator: orchestrator as any,
+    orchestrator: orchestrator as ISwapOrchestrator,
     stateStore,
-    invoiceManager: invoiceManager as any,
-    npubRoleMap: { register: () => {}, getRole: () => null, getSwapIds: () => [] } as any,
+    invoiceManager,
+    npubRoleMap: noopNpubRoleMap,
   });
   messageHandler.start();
 

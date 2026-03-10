@@ -200,4 +200,20 @@ export class InvoiceManager {
   off(event: string, handler: Function): void {
     this.eventSource.off(event, handler);
   }
+
+  /**
+   * Retrieve the serialised invoice token for a deposit invoice.
+   * TODO: Implement once the AccountingModule exposes token retrieval.
+   */
+  async getDepositInvoiceToken(_invoiceId: string): Promise<unknown | null> {
+    return null;
+  }
+
+  /**
+   * Retrieve the serialised invoice token for a payout invoice.
+   * TODO: Implement once the AccountingModule exposes token retrieval.
+   */
+  async getPayoutInvoiceToken(_invoiceId: string): Promise<unknown | null> {
+    return null;
+  }
 }
