@@ -171,10 +171,17 @@ export class CrashRecoveryManager {
 
     switch (invoiceState) {
       case 'OPEN':
-      case 'EXPIRED':
         // Normal — re-subscribe to events, no deposit yet
-        logger.info({ swap_id: swap.swap_id, invoiceState }, 'Recovery: DEPOSIT_INVOICE_CREATED + OPEN/EXPIRED — waiting for deposits');
+        logger.info({ swap_id: swap.swap_id, invoiceState }, 'Recovery: DEPOSIT_INVOICE_CREATED + OPEN — waiting for deposits');
         // Global event subscription (already set up by start()) handles this
+        break;
+
+      case 'EXPIRED':
+        // Invoice dueDate has passed — no new payments can succeed.
+        // No deposits were made (we'd be in PARTIAL_DEPOSIT otherwise).
+        // Cancel the invoice and transition to CANCELLED.
+        logger.info({ swap_id: swap.swap_id }, 'Recovery: DEPOSIT_INVOICE_CREATED + EXPIRED — cancelling swap (no deposits, invoice expired)');
+        this._failSwap(swap, 'Invoice expired before any deposits were received');
         break;
 
       case 'PARTIAL':
@@ -569,22 +576,14 @@ export class CrashRecoveryManager {
     );
 
     if (!partyACoverage || !partyBCoverage) {
-      // Coverage doesn't meet per-party validation — revert to PARTIAL_DEPOSIT
-      logger.warn(
+      // Coverage doesn't meet per-party validation.
+      // DEPOSIT_COVERED can only transition to CONCLUDING or FAILED (not PARTIAL_DEPOSIT).
+      // Transition to FAILED — operator must manually verify coverage and intervene.
+      logger.error(
         { swap_id: swap.swap_id, partyACoverage, partyBCoverage },
-        'Recovery: Per-party coverage validation failed, reverting to PARTIAL_DEPOSIT',
+        'Recovery: DEPOSIT_COVERED per-party coverage validation failed — transitioning to FAILED (manual intervention required)',
       );
-      const now = Date.now();
-      const timeoutAt = swap.timeout_at ?? now + swap.manifest.timeout * 1000;
-      const reverted = this.stateStore.updateState(
-        swap.swap_id,
-        SwapState.PARTIAL_DEPOSIT,
-        { first_deposit_at: swap.first_deposit_at ?? now, timeout_at: timeoutAt },
-        swap.version,
-      );
-      if (reverted) {
-        this._reRegisterTimeout(reverted);
-      }
+      this._failSwap(swap, `Per-party coverage validation failed in DEPOSIT_COVERED recovery (A: ${partyACoverage}, B: ${partyBCoverage})`);
       return;
     }
 
@@ -868,22 +867,13 @@ export class CrashRecoveryManager {
       }
       await this._concludeFromClosed(swap);
     } else {
-      // Coverage regressed — revert to PARTIAL_DEPOSIT
-      const now = Date.now();
-      const timeoutAt = swap.timeout_at ?? now + swap.manifest.timeout * 1000;
-      logger.warn(
+      // Coverage regressed — DEPOSIT_COVERED can only go to CONCLUDING or FAILED.
+      // Transition to FAILED — operator must manually verify and intervene.
+      logger.error(
         { swap_id: swap.swap_id, partyAAmount: String(partyAAmount), partyBAmount: String(partyBAmount) },
-        'Recovery: Coverage regressed, reverting to PARTIAL_DEPOSIT',
+        'Recovery: DEPOSIT_COVERED coverage regressed — transitioning to FAILED (manual intervention required)',
       );
-      const reverted = this.stateStore.updateState(
-        swap.swap_id,
-        SwapState.PARTIAL_DEPOSIT,
-        { first_deposit_at: swap.first_deposit_at ?? now, timeout_at: timeoutAt },
-        swap.version,
-      );
-      if (reverted) {
-        this._reRegisterTimeout(reverted);
-      }
+      this._failSwap(swap, `Coverage regressed in DEPOSIT_COVERED recovery (A: ${String(partyAAmount)}/${String(requiredA)}, B: ${String(partyBAmount)}/${String(requiredB)})`);
     }
   }
 

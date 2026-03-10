@@ -867,8 +867,12 @@ export class SwapOrchestrator {
       if (isSphereError(err) && (err.code === 'INVOICE_TERMINATED' || err.code === 'INVOICE_INVALID_AMOUNT')) {
         logger.info({ swap_id: swap.swap_id, payoutAId }, 'Payout A already covered (idempotent)');
       } else {
-        logger.error({ err, swap_id: swap.swap_id, payoutAId }, 'Failed to pay payout A invoice');
-        await this._transitionToFailed(concluding, `Payout A payment failed: ${String(err)}`);
+        logger.error({ err, swap_id: swap.swap_id, payoutAId, payoutBId }, 'Failed to pay payout A invoice');
+        const reloadedA = this.stateStore.findBySwapId(swap.swap_id);
+        await this._transitionToFailed(
+          reloadedA ?? concluding,
+          `Payout A payment failed. Payout invoices: A=${payoutAId}, B=${payoutBId}. Error: ${String(err)}`,
+        );
         return;
       }
     }
@@ -884,8 +888,17 @@ export class SwapOrchestrator {
       if (isSphereError(err) && (err.code === 'INVOICE_TERMINATED' || err.code === 'INVOICE_INVALID_AMOUNT')) {
         logger.info({ swap_id: swap.swap_id, payoutBId }, 'Payout B already covered (idempotent)');
       } else {
-        logger.error({ err, swap_id: swap.swap_id, payoutBId }, 'Failed to pay payout B invoice');
-        await this._transitionToFailed(concluding, `Payout B payment failed: ${String(err)}`);
+        // Payout A may have already succeeded — reload swap version before failing.
+        // Include payout invoice IDs so operators can complete payout B manually.
+        logger.error(
+          { err, swap_id: swap.swap_id, payoutAId, payoutBId },
+          'Failed to pay payout B invoice (payout A may have already succeeded)',
+        );
+        const reloaded = this.stateStore.findBySwapId(swap.swap_id);
+        await this._transitionToFailed(
+          reloaded ?? concluding,
+          `Payout B payment failed (payout A may be completed). Payout invoices: A=${payoutAId}, B=${payoutBId}. Error: ${String(err)}`,
+        );
         return;
       }
     }
