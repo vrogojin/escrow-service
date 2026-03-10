@@ -62,8 +62,8 @@ interface MockAccountingModule {
   // Invoice CRUD
   createInvoice(request: CreateInvoiceRequest): Promise<CreateInvoiceResult>;
   getInvoiceStatus(invoiceId: string): Promise<InvoiceStatus>;
-  closeInvoice(invoiceId: string, opts?: { autoReturn?: boolean }): Promise<void>;
-  cancelInvoice(invoiceId: string, opts?: { autoReturn?: boolean }): Promise<void>;
+  closeInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
+  cancelInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
   payInvoice(invoiceId: string, params: PayInvoiceParams): Promise<TransferResult>;
   returnInvoicePayment(invoiceId: string, params: ReturnPaymentParams): Promise<TransferResult>;
   importInvoice(token: TxfToken): Promise<InvoiceTerms>;
@@ -89,12 +89,17 @@ interface MockInvoiceState {
   isClosed: boolean;
   isCancelled: boolean;
 }
+
+// Note: InvoiceSenderBalance has these REQUIRED fields (no `?`):
+//   senderAddress: string, netBalance: string, forwardedAmount: string,
+//   returnedAmount: string, contacts: ReadonlyArray<{ address: string; url?: string }>
+// All mock senderBalances entries MUST include contacts (use [] for empty).
 ```
 
 Key behaviors:
 - `createInvoice()` generates a deterministic invoice ID from SHA-256 of the canonical terms
 - `_simulatePayment()` adds a transfer, updates balances, fires `invoice:payment` event
-- `_simulateCoverage()` fires `invoice:covered` event
+- `_simulateCoverage()` fires `invoice:covered` event with payload `{ invoiceId: string, confirmed: boolean }`
 - `closeInvoice()` on already-closed throws `INVOICE_ALREADY_CLOSED`; on cancelled throws `INVOICE_ALREADY_CANCELLED`
 - `cancelInvoice()` on already-cancelled throws `INVOICE_ALREADY_CANCELLED`; on closed throws `INVOICE_ALREADY_CLOSED`
 - `payInvoice()` with remaining = 0 throws `INVOICE_INVALID_AMOUNT` **only when `params.amount` is omitted** (SDK computes remaining internally). If `params.amount` is explicitly `'0'`, the code hits a different path — crash recovery tests MUST omit `amount` to trigger this guard. On terminated invoice throws `INVOICE_TERMINATED`.
@@ -140,9 +145,17 @@ function createMockTransferRef(opts: {
   destinationAddress?: string;   // default: escrow DIRECT address
   timestamp?: number;            // default: Date.now()
   confirmed?: boolean;           // default: true
-  senderPubkey?: string | null;  // null for masked predicates (not just undefined)
+  senderPubkey?: string;         // undefined for masked predicates (SDK type is `?: string`, not nullable)
   contact?: { address: string; url?: string };
 }): InvoiceTransferRef;
+
+function createMockSenderBalance(opts: {
+  senderAddress: string;         // required — effectiveSender (refundAddress ?? senderAddress)
+  netBalance: string;            // required — net amount after forwards and returns
+  forwardedAmount: string;       // required — total forwarded
+  returnedAmount?: string;       // default: '0'
+  contacts?: ReadonlyArray<{ address: string; url?: string }>;  // default: [] — REQUIRED field on SDK type (no `?`)
+}): InvoiceSenderBalance;
 ```
 
 **Event handler signature:** The `invoice:payment` handler registered via `accounting.on('invoice:payment', handler)` receives the payload **directly** as its argument (not wrapped in `event.data`):
@@ -321,12 +334,13 @@ should return false for DEPOSIT_COVERED
 should return false for CONCLUDING
 ```
 
-#### `getValidNextStates()` (~4 tests)
+#### `getValidNextStates()` (~5 tests)
 
 ```
 should return [DEPOSIT_INVOICE_CREATED, FAILED] for ANNOUNCED
 should return [PARTIAL_DEPOSIT, DEPOSIT_COVERED, TIMED_OUT, FAILED] for DEPOSIT_INVOICE_CREATED
 should return [DEPOSIT_COVERED, TIMED_OUT, FAILED] for PARTIAL_DEPOSIT
+should return [COMPLETED, FAILED] for CONCLUDING
 should return empty array for terminal states
 ```
 
@@ -334,9 +348,9 @@ should return empty array for terminal states
 
 ### 2.2 SwapOrchestrator — `swap-orchestrator.test.ts`
 
-**~55 tests** covering the central coordinator's event handling, state guards, race conditions, and DM delivery.
+**~63 tests** covering the central coordinator's event handling, state guards, race conditions, and DM delivery.
 
-#### `invoice:payment` Event Handling (~13 tests)
+#### `invoice:payment` Event Handling (~15 tests)
 
 ```
 should look up swap by deposit invoice ID on payment event
@@ -349,12 +363,14 @@ should call returnInvoicePayment() when sender does not match party A or party B
 should call returnInvoicePayment() when sender paid wrong currency (party A paid party B's currency)
 should use effectiveSender (refundAddress ?? senderAddress) as recipient for returnInvoicePayment()
 should bounce payment with senderAddress === null (masked predicate)
+should bounce payment from charlie even when charlie's refundAddress spoofs party A's DIRECT address — identity check uses InvoiceTransferRef.senderAddress (charlie's), not effectiveSender (party A's)
 should ignore payment event when swap is in TIMED_OUT or later state
 should not call returnInvoicePayment() when swap state is CANCELLED (let autoReturn handle it)
+should deliver bounce_notification DM to bounced sender in the invoice:payment handler (not only in invoice:covered)
 should not call closeInvoice() or transition to DEPOSIT_COVERED within the payment handler (even when coverage is met — invoice:covered handles that)
 ```
 
-#### `invoice:covered` Event Handling (~20 tests)
+#### `invoice:covered` Event Handling (~24 tests)
 
 ```
 should transition PARTIAL_DEPOSIT → DEPOSIT_COVERED on coverage
@@ -366,7 +382,7 @@ should reject coverage impersonation where refundAddress spoofs party A address 
 should NOT proceed if unauthorized sender contributed to coverage (return and wait)
 should NOT proceed if parties paid correct amounts into swapped currency slots (party A into asset[1], party B into asset[0])
 should cancel timeout timer on coverage
-should call closeInvoice(depositInvoiceId) without autoReturn — spy verifies opts argument is undefined or {} (never { autoReturn: true })
+should call closeInvoice(depositInvoiceId) without autoReturn — spy verifies options argument is undefined or {} (never { autoReturn: true })
 should create two payout invoices with correct cross-currency targets
 should NOT transpose payout invoices: payout A targets party A's DIRECT address with party B's currency, payout B targets party B's DIRECT address with party A's currency (negative test: fail if A's invoice targets A's own currency)
 should call closeInvoice(depositInvoiceId) BEFORE createInvoice() for payouts — ordered sequence: [closeInvoice, createInvoice(payoutA), createInvoice(payoutB)] verified via call-order spy
@@ -377,8 +393,11 @@ should transition to FAILED and cancel orphan payout invoice when first createIn
 should transition to FAILED when persist DEPOSIT_COVERED succeeds but closeInvoice() fails with unexpected error — swap is stranded but not lost (crash recovery can pick up)
 should deliver payout invoice tokens to both parties via DM after payouts succeed (before COMPLETED transition)
 should deliver bounce_notification DM to bounced sender with reason code when returnInvoicePayment() succeeds
+should send payment_confirmation DM to party A with party_b_currency and party_b_value (not party A's own currency — negative transposition test)
+should send payment_confirmation DM to party B with party_a_currency and party_a_value (both parties receive individual confirmations)
 should transition CONCLUDING → COMPLETED after both payouts and DM delivery succeed
 should use case-sensitive exact string match for DIRECT:// address comparison during re-validation
+should NOT apply normalizeAddress() to resolved DIRECT addresses — setup party with uppercase hex in DIRECT address, verify full resolution → storage → comparison pipeline preserves case and matches SDK-returned senderAddress
 ```
 
 #### `invoice:cancelled` Event Handling (~3 tests)
@@ -389,7 +408,7 @@ should persist CANCELLED state to SwapStateStore on invoice:cancelled
 should ignore invoice:cancelled if swap is not in CANCELLING state (idempotency guard)
 ```
 
-#### State Guards & Race Conditions (~14 tests)
+#### State Guards & Race Conditions (~15 tests)
 
 ```
 should ignore invoice:covered if swap is already in DEPOSIT_COVERED or later (idempotency)
@@ -400,6 +419,7 @@ should catch INVOICE_ALREADY_CLOSED in coverage path and proceed if same-operati
 should catch INVOICE_ALREADY_CANCELLED in coverage path and abort (timeout won)
 should catch INVOICE_ALREADY_CLOSED in timeout path and abort (coverage won)
 should transition to FAILED on unrecoverable error during conclusion
+should send error DM to both parties when transitioning to FAILED (parties need notification for manual intervention)
 should not call payInvoice() twice when invoice:covered fires concurrently before state transition completes (TOCTOU)
 should prevent second conclusion attempt after CONCLUDING state is persisted (state guard check)
 should not start duplicate timeout timer when two invoice:payment events fire concurrently for the same swap (second handler sees timer already running)
@@ -483,9 +503,9 @@ should not extend timeout window when re-registering after crash (if first_depos
 
 ### 2.5 MessageHandler — `message-handler.test.ts`
 
-**~19 tests** covering the DM-based protocol from `docs/protocol-spec.md`.
+**~25 tests** covering the DM-based protocol from `docs/protocol-spec.md`.
 
-#### `announce` Message (~6 tests)
+#### `announce` Message (~9 tests)
 
 ```
 should create swap case and return announce_result with deposit_invoice_id
@@ -493,21 +513,25 @@ should record sender npub association with party role
 should return existing swap case (is_new: false) when same manifest announced twice
 should return error message when manifest validation fails
 should reject announcement when nametag resolves to null (propagation delay — hard error, not soft warning)
+should resolve PROXY:// address to DIRECT:// and cache the resolved address at announcement time
 should allow second announcer to register additional npub for same party role only if their claim is consistent with existing mapping
+should not overwrite resolved_party_a_address or resolved_party_b_address on second announce (addresses are immutable after first resolution — prevents nametag reassignment attacks)
+should re-attempt createInvoice() when re-announce arrives for swap stuck in ANNOUNCED state (previous createInvoice() failed) — not create duplicate swap, not return is_new:false without retry
 ```
 
 **Note on announce-first attack:** The manifest is public (shared off-service). An attacker who obtains it can announce first, claiming a party role. The `announce` handler MUST NOT blindly trust the first npub — it should record the association but the `request_invoice` authorization must verify against the resolved DIRECT addresses, not just npub association. The npub-to-role mapping is a convenience for DM routing, NOT a security boundary. On-chain `senderAddress` (cryptographic) is the only identity authority.
 
-#### `status` Message (~4 tests)
+#### `status` Message (~5 tests)
 
 ```
 should return status_result with swap state and deposit_status for authorized party
 should derive per-party coverage from coinAssets[i].transfers using senderAddress
 should reject status query from unauthorized npub with error response
 should reject status query from party A of swap 1 when querying swap 2 (cross-swap authorization scoping)
+should reject status query from attacker who announced first (attacker npub in role map, but attacker's DIRECT address ≠ resolved party address) — npub presence in role map is insufficient; DIRECT address back-check required
 ```
 
-#### `request_invoice` Message (~5 tests)
+#### `request_invoice` Message (~6 tests)
 
 ```
 should re-deliver deposit invoice token to authorized party
@@ -515,6 +539,7 @@ should re-deliver payout invoice token to authorized party
 should reject request from party not associated with the swap
 should reject request for payout invoice when swap is not yet in CONCLUDING/COMPLETED
 should reject request_invoice when sender npub has no recorded association (never announced)
+should reject request_invoice from attacker who announced first (attacker npub in role map for party A, but attacker's DIRECT address ≠ resolved_party_a_address) — forces implementation to verify DIRECT address, not just npub-to-role mapping
 ```
 
 #### Legacy Message Compatibility (~1 test)
@@ -601,7 +626,7 @@ should NOT use effectiveSender/senderBalances keys for identity verification
 should treat senderAddress === null as unknown sender and trigger bounce
 should log warning when senderAddress is null and no refundAddress (cannot return)
 should bounce masked-predicate payment to refundAddress when refundAddress is provided (senderAddress=null, refundAddress=someAddress)
-should flag as suspicious when masked-predicate sender sets refundAddress to a swap party's DIRECT address (potential misdirection)
+should bounce and flag as suspicious when masked-predicate sender sets refundAddress to a swap party's DIRECT address — senderAddress is null so identity cannot be verified; payment MUST be bounced (not just logged)
 ```
 
 #### Currency Matching (~3 tests)
@@ -638,7 +663,7 @@ should correctly compare netCoveredAmount >= requestedAmount with BigInt arithme
 
 ### 2.9 Crash Recovery — `crash-recovery.test.ts`
 
-**~34 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
+**~43 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
 
 Each test sets up a swap in a specific (swap state, invoice state) pair, then runs the recovery procedure and verifies the resulting action. All re-validation steps must use `InvoiceTransferRef.senderAddress` (cryptographic) for identity verification — not `InvoiceSenderBalance.senderAddress` (which holds `effectiveSender`).
 
@@ -654,7 +679,7 @@ should re-create deposit invoice when swap is ANNOUNCED with no invoice (creatio
 should re-subscribe to events when swap is DEPOSIT_INVOICE_CREATED and invoice is OPEN
 should treat EXPIRED invoice as equivalent to OPEN and re-subscribe (dueDate is informational)
 should re-register timeout with remaining time when invoice is PARTIAL
-should resume conclusion when invoice is COVERED (re-validate using InvoiceTransferRef.senderAddress, not senderBalances)
+should resume conclusion when invoice is COVERED (re-validate using InvoiceTransferRef.senderAddress, not senderBalances) — setup MUST include refundAddress≠senderAddress on at least one transfer so effectiveSender diverges from senderAddress, proving the test distinguishes the two fields
 should transition to CANCELLED when invoice is CANCELLED
 should transition to FAILED when invoice is unexpectedly CLOSED
 ```
@@ -664,15 +689,16 @@ should transition to FAILED when invoice is unexpectedly CLOSED
 ```
 should re-register timeout with remaining time when invoice is PARTIAL
 should treat EXPIRED invoice as equivalent to PARTIAL and re-register timeout
-should resume conclusion when invoice is COVERED (re-validate using InvoiceTransferRef.senderAddress, not senderBalances)
+should resume conclusion when invoice is COVERED (re-validate using InvoiceTransferRef.senderAddress, not senderBalances) — setup MUST include refundAddress≠senderAddress on at least one transfer so effectiveSender diverges from senderAddress
 should transition to CANCELLED when invoice is CANCELLED (timeout fired during crash)
 should transition to FAILED when invoice is unexpectedly CLOSED with partial coverage
 ```
 
-#### DEPOSIT_COVERED Recovery (~4 tests)
+#### DEPOSIT_COVERED Recovery (~5 tests)
 
 ```
-should re-validate coverage and revert to PARTIAL_DEPOSIT if coverage regressed (OPEN/PARTIAL/EXPIRED)
+should re-validate coverage and revert to PARTIAL_DEPOSIT if coverage regressed and valid parties' payments alone do not meet thresholds (OPEN/PARTIAL/EXPIRED)
+should re-validate coverage and proceed with conclusion if valid parties' payments alone still meet thresholds despite aggregate regression (OPEN/PARTIAL/EXPIRED — auto-returns reduced total but correct-party deposits suffice)
 should transition to CANCELLED if invoice is CANCELLED and all deposits auto-returned
 should transition to FAILED if invoice is CANCELLED but auto-returns are incomplete (funds at risk)
 should create payout invoices and proceed with conclusion if invoice is CLOSED but payouts missing
@@ -690,20 +716,25 @@ should handle (CONCLUDING, OPEN) pair — deposit invoice still OPEN means close
 should handle (CONCLUDING, COVERED) pair — deposit invoice covered but not yet closed; close deposit invoice first, then proceed with payouts
 ```
 
-#### TIMED_OUT Recovery (~4 tests)
+#### TIMED_OUT Recovery (~6 tests)
 
 ```
 should call cancelInvoice() when swap is TIMED_OUT and invoice is still OPEN (deposits not yet returned)
 should call cancelInvoice() when swap is TIMED_OUT and invoice is PARTIAL (partial deposits to return)
+should call cancelInvoice() when swap is TIMED_OUT and invoice is EXPIRED (dueDate passed — still needs explicit cancel for autoReturn)
 should transition TIMED_OUT → CANCELLING when invoice is already CANCELLED (autoReturn completed during crash)
 should handle INVOICE_ALREADY_CLOSED during TIMED_OUT recovery (coverage won race — reconcile swap to DEPOSIT_COVERED and resume conclusion)
+should handle (TIMED_OUT, COVERED) — coverage arrived but closeInvoice() not yet called; call closeInvoice() first, then reconcile to DEPOSIT_COVERED and resume conclusion (distinct from CLOSED case where closeInvoice() already ran)
 ```
 
-#### CANCELLING Recovery (~2 tests)
+#### CANCELLING Recovery (~5 tests)
 
 ```
 should transition to CANCELLED when invoice is already CANCELLED
 should call cancelInvoice() when swap is CANCELLING but invoice is still OPEN (cancel didn't complete before crash)
+should call cancelInvoice() when swap is CANCELLING but invoice is still PARTIAL (cancel started but didn't complete)
+should call cancelInvoice() when swap is CANCELLING but invoice is EXPIRED (dueDate passed, cancel didn't complete)
+should handle (CANCELLING, COVERED) — coverage arrived after TIMED_OUT was persisted but before cancelInvoice() completed; call closeInvoice() first (coverage won), then resume conclusion via DEPOSIT_COVERED path
 ```
 
 #### Orphaned Invoice Detection (~2 tests)
@@ -1040,7 +1071,8 @@ Every (swap state, invoice state) pair from the crash recovery table in `docs/ar
 | PARTIAL_DEPOSIT | CANCELLED | crash-recovery.test.ts §PD Recovery #4 |
 | DEPOSIT_INVOICE_CREATED | CANCELLED | crash-recovery.test.ts §DIC Recovery #5 |
 | DEPOSIT_INVOICE_CREATED | CLOSED | crash-recovery.test.ts §DIC Recovery #6 |
-| DEPOSIT_COVERED | OPEN / PARTIAL / EXPIRED | crash-recovery.test.ts §DC Recovery #1 |
+| DEPOSIT_COVERED | OPEN / PARTIAL / EXPIRED (regressed, revert) | crash-recovery.test.ts §DC Recovery #1a |
+| DEPOSIT_COVERED | OPEN / PARTIAL / EXPIRED (valid coverage restorable, proceed) | crash-recovery.test.ts §DC Recovery #1b |
 | DEPOSIT_COVERED | CANCELLED (all returned) | crash-recovery.test.ts §DC Recovery #2a |
 | DEPOSIT_COVERED | CANCELLED (returns incomplete) | crash-recovery.test.ts §DC Recovery #2b → FAILED |
 | DEPOSIT_COVERED | CLOSED | crash-recovery.test.ts §DC Recovery #3 |
@@ -1049,10 +1081,15 @@ Every (swap state, invoice state) pair from the crash recovery table in `docs/ar
 | CONCLUDING | COVERED | crash-recovery.test.ts §CONCLUDING Recovery #7 — close deposit first |
 | TIMED_OUT | OPEN | crash-recovery.test.ts §TIMED_OUT Recovery #1 |
 | TIMED_OUT | PARTIAL | crash-recovery.test.ts §TIMED_OUT Recovery #2 |
-| TIMED_OUT | CANCELLED | crash-recovery.test.ts §TIMED_OUT Recovery #3 — autoReturn completed |
-| TIMED_OUT | CLOSED (INVOICE_ALREADY_CLOSED) | crash-recovery.test.ts §TIMED_OUT Recovery #4 — coverage won race |
+| TIMED_OUT | EXPIRED | crash-recovery.test.ts §TIMED_OUT Recovery #3 |
+| TIMED_OUT | CANCELLED | crash-recovery.test.ts §TIMED_OUT Recovery #4 — autoReturn completed |
+| TIMED_OUT | CLOSED (INVOICE_ALREADY_CLOSED) | crash-recovery.test.ts §TIMED_OUT Recovery #5 — coverage won race |
+| TIMED_OUT | COVERED | crash-recovery.test.ts §TIMED_OUT Recovery #6 — close first, then reconcile |
 | CANCELLING | CANCELLED | crash-recovery.test.ts §CANCELLING Recovery #1 |
 | CANCELLING | OPEN | crash-recovery.test.ts §CANCELLING Recovery #2 — cancel didn't complete |
+| CANCELLING | PARTIAL | crash-recovery.test.ts §CANCELLING Recovery #3 |
+| CANCELLING | EXPIRED | crash-recovery.test.ts §CANCELLING Recovery #4 |
+| CANCELLING | COVERED | crash-recovery.test.ts §CANCELLING Recovery #5 — coverage won, resume conclusion |
 
 ### 5.3 DM Message Type Coverage
 
@@ -1104,16 +1141,16 @@ The live E2E tests cover the complete trader-creation → topup → escrow → e
 
 | Category | File | Count |
 |---|---|---|
-| **Unit** | state-machine.test.ts | ~37 |
-| | swap-orchestrator.test.ts | ~55 |
+| **Unit** | state-machine.test.ts | ~38 |
+| | swap-orchestrator.test.ts | ~63 |
 | | invoice-manager.test.ts | ~14 |
 | | timeout-manager.test.ts | ~14 |
-| | message-handler.test.ts | ~19 |
+| | message-handler.test.ts | ~25 |
 | | swap-state-store.test.ts | ~12 |
 | | manifest-validator.test.ts | ~4 |
 | | deposit-validation.test.ts | ~20 |
-| | crash-recovery.test.ts | ~34 |
-| **Unit subtotal** | | **~209** |
+| | crash-recovery.test.ts | ~43 |
+| **Unit subtotal** | | **~233** |
 | **Integration** | swap-lifecycle.integration.test.ts | ~25 |
 | **Live E2E** | swap-lifecycle.e2e-live.test.ts | ~22 |
-| **Total** | | **~256** |
+| **Total** | | **~280** |
