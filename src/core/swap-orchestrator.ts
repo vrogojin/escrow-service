@@ -812,16 +812,34 @@ export class SwapOrchestrator {
           );
           return;
         } else if (err.code === 'INVOICE_ALREADY_CLOSED') {
-          // Coverage won the race — the invoice was closed (covered) before
-          // cancelInvoice could run. _onInvoiceCovered must have already
-          // CAS'd to DEPOSIT_COVERED (closeInvoice happens AFTER the CAS),
-          // so it owns the conclusion path. Any CAS attempt here with
-          // cancelling.version would fail because the version already advanced.
-          // Nothing to do — _onInvoiceCovered handles conclusion.
+          // The deposit invoice was closed — either by _onInvoiceCovered (coverage
+          // won the race and closeDepositInvoice succeeded) or because the invoice
+          // was covered. If _onInvoiceCovered already advanced the state past
+          // CANCELLING, our CAS below will fail and we'll defer to the winner.
+          // If _onInvoiceCovered failed (e.g., getInvoiceStatus threw — C6 scenario),
+          // the swap is still in CANCELLING and no one is driving conclusion.
+          // Contest CANCELLING → DEPOSIT_COVERED and resume conclusion ourselves.
           logger.info(
             { swap_id: swapId },
-            'Invoice already closed (coverage won race) — _onInvoiceCovered owns conclusion, no action needed',
+            'Invoice already closed (coverage won race) — contesting CANCELLING → DEPOSIT_COVERED',
           );
+          const contested = this.stateStore.updateState(
+            swapId,
+            SwapState.DEPOSIT_COVERED,
+            {},
+            cancelling.version,
+          );
+          if (contested) {
+            // We own conclusion now. Close is already done. Proceed to payouts.
+            this.timeoutManager.cancel(swapId);
+            await this._concludeSwap(contested);
+          } else {
+            // Another handler already advanced the state — they own conclusion.
+            logger.info(
+              { swap_id: swapId },
+              'CANCELLING → DEPOSIT_COVERED CAS failed — another handler owns conclusion',
+            );
+          }
           return;
         }
       }
