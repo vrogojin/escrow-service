@@ -170,7 +170,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     // DIRECT:// by the orchestrator at announce time).
     //
     // Case-sensitive exact string match — see protocol-spec §7.
-    const senderDirectAddress = `DIRECT://${npub}`;
+    const senderDirectAddress = `DIRECT://${npub.toLowerCase()}`;
 
     if (roleFromMap === 'A') {
       if (senderDirectAddress === swap.resolved_party_a_address) return 'A';
@@ -290,22 +290,26 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     // swap record.  We use those cached addresses to identify which party the
     // sender's DIRECT:// address corresponds to.
     const swap = stateStore.findBySwapId(result.swap_id);
+    let party: 'A' | 'B' | null = null;
     if (swap) {
-      const senderDirectAddress = `DIRECT://${senderPubkey}`;
-      let party: 'A' | 'B';
+      const senderDirectAddress = `DIRECT://${senderPubkey.toLowerCase()}`;
       if (senderDirectAddress === swap.resolved_party_a_address) {
         party = 'A';
       } else if (senderDirectAddress === swap.resolved_party_b_address) {
         party = 'B';
       } else {
         // Third party announced (griefing note from spec §3 Step 2).
-        // Still valid — record as party A by default so they receive the
-        // invoice.  The DIRECT address back-check on subsequent operations
-        // (status, request_invoice) will correctly reject them for sensitive
-        // operations.
-        party = 'A';
+        // Do NOT register a role or deliver invoice token — address doesn't
+        // match either party. They receive only the public announce_result
+        // (swap_id + invoice_id) which is non-sensitive.
+        logger.info(
+          { swap_id: result.swap_id },
+          'Third-party announcer — address matches neither party, skipping role registration and invoice delivery',
+        );
       }
-      npubRoleMap.register(senderPubkey, result.swap_id, party);
+      if (party) {
+        npubRoleMap.register(senderPubkey, result.swap_id, party);
+      }
     }
 
     await reply(senderPubkey, {
@@ -315,9 +319,10 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       is_new: result.is_new,
     });
 
-    // Deliver the deposit invoice token.
-    if (swap) {
-      const party = npubRoleMap.getRole(senderPubkey, result.swap_id) ?? 'A';
+    // Deliver the deposit invoice token only to verified parties.
+    // Use the already-computed party variable directly — avoid a redundant
+    // getRole() lookup that could race with concurrent register() calls.
+    if (swap && party !== null) {
       await deliverDepositInvoice(senderPubkey, swap, party);
     }
   }

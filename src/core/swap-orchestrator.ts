@@ -483,10 +483,15 @@ export class SwapOrchestrator {
       return;
     }
 
-    // State guard: only proceed if DEPOSIT_INVOICE_CREATED or PARTIAL_DEPOSIT
+    // State guard: proceed if the swap is in a state where coverage can be applied.
+    // TIMED_OUT and CANCELLING are included because coverage can contest a timeout —
+    // the CAS retry loop below handles TIMED_OUT/CANCELLING → DEPOSIT_COVERED
+    // transitions (coverage wins the race per architecture spec).
     if (
       swap.state !== SwapState.DEPOSIT_INVOICE_CREATED &&
-      swap.state !== SwapState.PARTIAL_DEPOSIT
+      swap.state !== SwapState.PARTIAL_DEPOSIT &&
+      swap.state !== SwapState.TIMED_OUT &&
+      swap.state !== SwapState.CANCELLING
     ) {
       logger.debug(
         { swap_id: swap.swap_id, state: swap.state },
@@ -551,7 +556,6 @@ export class SwapOrchestrator {
       // Retry in a bounded loop (up to 3 attempts total including the first).
       // Also accept TIMED_OUT as a contestable state: if coverage arrives while
       // timeout handling is in progress, coverage wins (SDK confirmed it).
-      let timedOutContested = false;
       const MAX_CAS_ATTEMPTS = 3;
       let attempt = 1; // first attempt already done above
       while (attempt < MAX_CAS_ATTEMPTS) {
@@ -576,9 +580,10 @@ export class SwapOrchestrator {
             { swap_id: swap.swap_id, attempt },
             'invoice:covered — DEPOSIT_COVERED CAS retry failed, re-attempting',
           );
-        } else if (reloaded.state === SwapState.TIMED_OUT) {
+        } else if (reloaded.state === SwapState.TIMED_OUT || reloaded.state === SwapState.CANCELLING) {
           // Timeout handler won the state transition race, but coverage arrived
-          // before cancellation completed. Coverage wins — contest TIMED_OUT.
+          // before cancellation completed. Coverage wins — contest TIMED_OUT or
+          // CANCELLING. Both transitions are valid per the state machine.
           coveredSwap = this.stateStore.updateState(
             reloaded.swap_id,
             SwapState.DEPOSIT_COVERED,
@@ -586,12 +591,11 @@ export class SwapOrchestrator {
             reloaded.version,
           );
           if (coveredSwap) {
-            timedOutContested = true;
             break;
           }
           logger.debug(
-            { swap_id: swap.swap_id, attempt },
-            'invoice:covered — DEPOSIT_COVERED CAS from TIMED_OUT retry failed, re-attempting',
+            { swap_id: swap.swap_id, attempt, fromState: reloaded.state },
+            'invoice:covered — DEPOSIT_COVERED CAS from timeout/cancelling retry failed, re-attempting',
           );
         } else {
           // Already advanced past any contestable state (DEPOSIT_COVERED, CONCLUDING, COMPLETED, etc.)
@@ -697,6 +701,7 @@ export class SwapOrchestrator {
     );
 
     if (cancelled) {
+      this._cleanupSwapResources(swap);
       logger.info({ swap_id: swap.swap_id }, 'Swap cancelled (auto-return continues asynchronously)');
 
       // Notify both parties
@@ -787,13 +792,15 @@ export class SwapOrchestrator {
           return;
         } else if (err.code === 'INVOICE_ALREADY_CLOSED') {
           // Coverage won the race — the invoice was closed (covered) before
-          // cancelInvoice could run.  The swap is stuck in CANCELLING because
-          // the invoice:covered event likely already fired (and was rejected
-          // because the swap was no longer in a deposit-accepting state).
-          // Transition to FAILED so crash recovery can pick this up and
-          // resume conclusion.
-          logger.warn({ swap_id: swapId }, 'Invoice already closed (coverage won race) — transitioning to FAILED for crash recovery');
-          await this._transitionToFailed(cancelling, 'Timeout/coverage race: invoice closed before cancellation');
+          // cancelInvoice could run. _onInvoiceCovered must have already
+          // CAS'd to DEPOSIT_COVERED (closeInvoice happens AFTER the CAS),
+          // so it owns the conclusion path. Any CAS attempt here with
+          // cancelling.version would fail because the version already advanced.
+          // Nothing to do — _onInvoiceCovered handles conclusion.
+          logger.info(
+            { swap_id: swapId },
+            'Invoice already closed (coverage won race) — _onInvoiceCovered owns conclusion, no action needed',
+          );
           return;
         }
       }
@@ -1000,6 +1007,7 @@ export class SwapOrchestrator {
     );
 
     if (completed) {
+      this._cleanupSwapResources(reloaded);
       logger.info({ swap_id: swap.swap_id }, 'Swap completed successfully');
     } else {
       logger.warn({ swap_id: swap.swap_id }, 'Version mismatch transitioning to COMPLETED (likely already completed)');
@@ -1123,7 +1131,7 @@ export class SwapOrchestrator {
     swap: SwapRecord,
     invoiceId: string,
     transfer: InvoiceTransferRef,
-    reason: 'WRONG_CURRENCY' | 'ALREADY_COVERED',
+    reason: 'WRONG_CURRENCY',
   ): Promise<void> {
     const recipient = getEffectiveSender(transfer);
 
@@ -1149,12 +1157,20 @@ export class SwapOrchestrator {
         freeText: `Bounce: ${reason}`,
       });
     } catch (err) {
-      if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_ALREADY_CANCELLED')) {
-        // Invoice became terminal while we tried to bounce — the SDK's
-        // auto-return (on cancel) or close-time surplus handling will deal with it.
+      if (isSphereError(err) && (
+        err.code === 'INVOICE_ALREADY_CLOSED' ||
+        err.code === 'INVOICE_ALREADY_CANCELLED' ||
+        err.code === 'INVOICE_RETURN_EXCEEDS_BALANCE'
+      )) {
+        // returnInvoicePayment can throw INVOICE_RETURN_EXCEEDS_BALANCE when the
+        // sender has no remaining balance (e.g., already returned via auto-return
+        // on cancel/close). The SDK does NOT throw INVOICE_ALREADY_CLOSED/CANCELLED
+        // from returnInvoicePayment, but we handle them defensively in case of
+        // future SDK changes. In all cases, the funds are handled by the SDK's
+        // auto-return mechanism.
         logger.info(
           { swap_id: swap.swap_id, transferId: transfer.transferId, code: err.code },
-          'Invoice terminal during bounce — payment handled by SDK auto-return',
+          'Bounce unnecessary — payment handled by SDK auto-return or balance exhausted',
         );
         return;
       }
@@ -1244,6 +1260,17 @@ export class SwapOrchestrator {
   /**
    * Transitions a swap to FAILED state and notifies both parties.
    */
+  /**
+   * Clean up per-swap in-memory resources (bounce counters, timers) when
+   * a swap reaches a terminal state to prevent unbounded memory growth.
+   */
+  private _cleanupSwapResources(swap: SwapRecord): void {
+    if (swap.deposit_invoice_id) {
+      this.bounceCounters.delete(swap.deposit_invoice_id);
+    }
+    this.timeoutManager.cancel(swap.swap_id);
+  }
+
   private async _transitionToFailed(swap: SwapRecord, errorMessage: string): Promise<void> {
     const failed = this.stateStore.updateState(
       swap.swap_id,
@@ -1253,6 +1280,7 @@ export class SwapOrchestrator {
     );
 
     if (failed) {
+      this._cleanupSwapResources(swap);
       logger.error({ swap_id: swap.swap_id, error: errorMessage }, 'Swap transitioned to FAILED');
 
       await this._notifyBothParties(swap.swap_id, {

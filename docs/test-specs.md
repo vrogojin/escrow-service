@@ -292,7 +292,9 @@ should allow PARTIAL_DEPOSIT → DEPOSIT_COVERED
 should allow PARTIAL_DEPOSIT → TIMED_OUT
 should allow DEPOSIT_COVERED → CONCLUDING
 should allow CONCLUDING → COMPLETED
+should allow TIMED_OUT → DEPOSIT_COVERED (coverage wins the race — SDK confirmed coverage)
 should allow TIMED_OUT → CANCELLING
+should allow CANCELLING → DEPOSIT_COVERED (coverage won — cancelInvoice got INVOICE_ALREADY_CLOSED)
 should allow CANCELLING → CANCELLED
 should allow any non-terminal state → FAILED
 ```
@@ -309,8 +311,6 @@ should reject CONCLUDING → CANCELLED
 should reject COMPLETED → any state (terminal)
 should reject CANCELLED → any state (terminal)
 should reject FAILED → any state (terminal)
-should reject TIMED_OUT → DEPOSIT_COVERED (timeout won the race)
-should reject CANCELLING → DEPOSIT_COVERED
 should reject CANCELLING → CONCLUDING
 ```
 

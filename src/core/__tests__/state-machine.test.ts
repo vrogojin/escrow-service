@@ -70,6 +70,14 @@ describe('SwapState state machine', () => {
       expect(isValidTransition(SwapState.CANCELLING, SwapState.CANCELLED)).toBe(true);
     });
 
+    it('should allow TIMED_OUT → DEPOSIT_COVERED (coverage wins over timeout)', () => {
+      expect(isValidTransition(SwapState.TIMED_OUT, SwapState.DEPOSIT_COVERED)).toBe(true);
+    });
+
+    it('should allow CANCELLING → DEPOSIT_COVERED (coverage won race)', () => {
+      expect(isValidTransition(SwapState.CANCELLING, SwapState.DEPOSIT_COVERED)).toBe(true);
+    });
+
     it('should allow any non-terminal state → FAILED', () => {
       expect(isValidTransition(SwapState.ANNOUNCED, SwapState.FAILED)).toBe(true);
       expect(isValidTransition(SwapState.DEPOSIT_INVOICE_CREATED, SwapState.FAILED)).toBe(true);
@@ -122,14 +130,6 @@ describe('SwapState state machine', () => {
       expect(isValidTransition(SwapState.FAILED, SwapState.ANNOUNCED)).toBe(false);
       expect(isValidTransition(SwapState.FAILED, SwapState.PARTIAL_DEPOSIT)).toBe(false);
       expect(isValidTransition(SwapState.FAILED, SwapState.CONCLUDING)).toBe(false);
-    });
-
-    it('should allow TIMED_OUT → DEPOSIT_COVERED (coverage wins over timeout)', () => {
-      expect(isValidTransition(SwapState.TIMED_OUT, SwapState.DEPOSIT_COVERED)).toBe(true);
-    });
-
-    it('should not allow CANCELLING → DEPOSIT_COVERED', () => {
-      expect(isValidTransition(SwapState.CANCELLING, SwapState.DEPOSIT_COVERED)).toBe(false);
     });
 
     it('should not allow CANCELLING → CONCLUDING', () => {

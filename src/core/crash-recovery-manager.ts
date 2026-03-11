@@ -177,11 +177,21 @@ export class CrashRecoveryManager {
         break;
 
       case 'EXPIRED':
-        // Invoice dueDate has passed — no new payments can succeed.
-        // No deposits were made (we'd be in PARTIAL_DEPOSIT otherwise).
-        // Cancel the invoice and transition to CANCELLED.
-        logger.info({ swap_id: swap.swap_id }, 'Recovery: DEPOSIT_INVOICE_CREATED + EXPIRED — cancelling swap (no deposits, invoice expired)');
-        this._failSwap(swap, 'Invoice expired before any deposits were received');
+        // Invoice dueDate has passed. The escrow enforces timeout at the
+        // application level (TimeoutManager), not via SDK dueDate.
+        // However, if no deposit has ever arrived (first_deposit_at is null),
+        // no timer is running and no event will ever advance this swap.
+        // Use FAILED (valid from DEPOSIT_INVOICE_CREATED) to avoid immortal record.
+        if (swap.first_deposit_at === null) {
+          logger.info({ swap_id: swap.swap_id, invoiceState }, 'Recovery: DEPOSIT_INVOICE_CREATED + EXPIRED with zero deposits — failing swap');
+          this._failSwap(swap, 'Invoice expired with zero deposits (no timer was running, swap would be immortal)');
+        } else {
+          // Deposits exist but state wasn't advanced to PARTIAL_DEPOSIT before crash.
+          // Advance to PARTIAL_DEPOSIT first (so _handleTimeout can fire correctly),
+          // then re-register the timeout.
+          logger.info({ swap_id: swap.swap_id, invoiceState }, 'Recovery: DEPOSIT_INVOICE_CREATED + EXPIRED with deposits — advancing to PARTIAL_DEPOSIT');
+          await this._advanceToPartialDeposit(swap);
+        }
         break;
 
       case 'PARTIAL':
@@ -374,7 +384,13 @@ export class CrashRecoveryManager {
           await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
         } catch (err) {
           if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
-            // Already closed — continue
+            // Already closed — continue to payouts
+          } else if (isSphereError(err) && err.code === 'INVOICE_NOT_TARGET') {
+            // Transient SDK condition (addresses not loaded) — do NOT proceed
+            // to _resumePayouts with deposit unclosed. Leave in CONCLUDING
+            // for next recovery cycle to retry.
+            logger.warn({ swap_id: swap.swap_id }, 'Recovery: CONCLUDING — closeDepositInvoice got INVOICE_NOT_TARGET (transient), will retry on next cycle');
+            return;
           } else if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CANCELLED') {
             logger.error({ swap_id: swap.swap_id }, 'Recovery: CONCLUDING — deposit was cancelled, transitioning to FAILED');
             this._failSwap(swap, 'Deposit invoice cancelled while swap was CONCLUDING');
@@ -414,7 +430,52 @@ export class CrashRecoveryManager {
       return;
     }
 
-    logger.info({ swap_id: swap.swap_id }, 'Recovery: TIMED_OUT — idempotently cancelling invoice');
+    // Check invoice state first — coverage may have won the race
+    let invoiceState: InvoiceState;
+    try {
+      const status = await this.invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
+      invoiceState = status.state;
+    } catch (err) {
+      if (isSphereError(err) && err.code === 'INVOICE_NOT_FOUND') {
+        // Invoice gone — transition to CANCELLED
+        const cancelling = this.stateStore.updateState(swap.swap_id, SwapState.CANCELLING, {}, swap.version);
+        if (cancelling) this._cancelSwap(cancelling);
+        return;
+      }
+      throw err;
+    }
+
+    if (invoiceState === 'COVERED' || invoiceState === 'CLOSED') {
+      // Coverage won the race — close the invoice (if not already closed),
+      // contest TIMED_OUT → DEPOSIT_COVERED, and resume conclusion.
+      logger.info({ swap_id: swap.swap_id, invoiceState }, 'Recovery: TIMED_OUT — coverage won race, resuming conclusion');
+      if (invoiceState === 'COVERED') {
+        try {
+          await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
+        } catch (err) {
+          if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
+            // Already closed or transient SDK condition — proceed
+          } else {
+            throw err;
+          }
+        }
+      }
+      // Contest TIMED_OUT → DEPOSIT_COVERED
+      const coveredSwap = this.stateStore.updateState(
+        swap.swap_id,
+        SwapState.DEPOSIT_COVERED,
+        {},
+        swap.version,
+      );
+      if (coveredSwap) {
+        await this._resumePayouts(coveredSwap);
+      } else {
+        logger.warn({ swap_id: swap.swap_id }, 'Recovery: TIMED_OUT — version mismatch contesting to DEPOSIT_COVERED');
+      }
+      return;
+    }
+
+    logger.info({ swap_id: swap.swap_id, invoiceState }, 'Recovery: TIMED_OUT — cancelling invoice');
 
     // Transition to CANCELLING before calling cancelInvoice
     const cancelling = this.stateStore.updateState(
@@ -436,9 +497,17 @@ export class CrashRecoveryManager {
         // Already cancelled — transition directly to CANCELLED
         this._cancelSwap(cancelling);
       } else if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
-        // Coverage won before timeout could cancel — unusual, investigate
-        logger.error({ swap_id: swap.swap_id }, 'Recovery: TIMED_OUT — invoice already closed, transitioning to FAILED');
-        this._failSwap(cancelling, 'Invoice already closed when attempting timeout cancellation');
+        // Coverage won after we checked — contest to DEPOSIT_COVERED and resume
+        logger.warn({ swap_id: swap.swap_id }, 'Recovery: TIMED_OUT — invoice closed during cancel, coverage won');
+        const coveredSwap = this.stateStore.updateState(
+          cancelling.swap_id,
+          SwapState.DEPOSIT_COVERED,
+          {},
+          cancelling.version,
+        );
+        if (coveredSwap) {
+          await this._resumePayouts(coveredSwap);
+        }
       } else {
         throw err;
       }
@@ -474,6 +543,35 @@ export class CrashRecoveryManager {
 
     if (invoiceState === 'CANCELLED') {
       this._cancelSwap(swap);
+    } else if (invoiceState === 'COVERED' || invoiceState === 'CLOSED') {
+      // Coverage won the race — close invoice if needed, contest to DEPOSIT_COVERED,
+      // and resume conclusion.
+      logger.info({ swap_id: swap.swap_id, invoiceState }, 'Recovery: CANCELLING — coverage won race, resuming conclusion');
+      if (invoiceState === 'COVERED') {
+        try {
+          await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
+        } catch (err) {
+          if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
+            // Already closed or transient SDK condition — proceed
+          } else {
+            throw err;
+          }
+        }
+      }
+      // Contest CANCELLING → DEPOSIT_COVERED (state machine permits this).
+      // Uses _resumePayouts (not _concludeSwap) to avoid re-creating payout
+      // invoices that may already exist from a partial prior conclusion attempt.
+      const coveredSwap = this.stateStore.updateState(
+        swap.swap_id,
+        SwapState.DEPOSIT_COVERED,
+        {},
+        swap.version,
+      );
+      if (coveredSwap) {
+        await this._resumePayouts(coveredSwap);
+      } else {
+        logger.warn({ swap_id: swap.swap_id }, 'Recovery: CANCELLING — version mismatch contesting to DEPOSIT_COVERED');
+      }
     } else {
       // Invoice not yet cancelled — retry cancelInvoice
       try {
@@ -483,8 +581,17 @@ export class CrashRecoveryManager {
         if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CANCELLED') {
           this._cancelSwap(swap);
         } else if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
-          logger.error({ swap_id: swap.swap_id }, 'Recovery: CANCELLING — invoice already closed, transitioning to FAILED');
-          this._failSwap(swap, 'Invoice already closed when attempting cancellation in CANCELLING state');
+          // Coverage won after we checked — contest to DEPOSIT_COVERED
+          logger.warn({ swap_id: swap.swap_id }, 'Recovery: CANCELLING — invoice closed during cancel, coverage won');
+          const coveredSwap = this.stateStore.updateState(
+            swap.swap_id,
+            SwapState.DEPOSIT_COVERED,
+            {},
+            swap.version,
+          );
+          if (coveredSwap) {
+            await this._resumePayouts(coveredSwap);
+          }
         } else {
           throw err;
         }
@@ -614,8 +721,8 @@ export class CrashRecoveryManager {
       try {
         await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
       } catch (err) {
-        if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
-          // Already closed — proceed
+        if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
+          // Already closed or transient SDK condition — proceed
         } else if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CANCELLED') {
           logger.error({ swap_id: swap.swap_id }, 'Recovery: Invoice was cancelled, failing swap');
           this._failSwap(coveredSwap, 'Invoice was cancelled when attempting to close during recovery');
@@ -901,8 +1008,8 @@ export class CrashRecoveryManager {
         try {
           await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
         } catch (err) {
-          if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
-            logger.info({ swap_id: swap.swap_id }, 'Recovery: Deposit invoice already closed');
+          if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
+            logger.info({ swap_id: swap.swap_id }, 'Recovery: Deposit invoice already closed or transient NOT_TARGET');
           } else {
             throw err;
           }

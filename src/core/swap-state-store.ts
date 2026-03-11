@@ -17,6 +17,17 @@ import type { SwapRecord, SwapStateStore, ResolvedAddresses } from './types.js';
 import type { SwapManifest } from './manifest-validator.js';
 
 /**
+ * Normalizes a DIRECT:// address by lowercasing the hex portion
+ * while preserving the DIRECT:// prefix.
+ */
+function normalizeDirectAddress(addr: string): string {
+  if (addr.startsWith('DIRECT://')) {
+    return 'DIRECT://' + addr.slice('DIRECT://'.length).toLowerCase();
+  }
+  return addr;
+}
+
+/**
  * Production in-memory implementation of SwapStateStore.
  *
  * Thread-safety: Node.js's single-threaded event loop means concurrent
@@ -58,8 +69,8 @@ export class InMemorySwapStateStore implements SwapStateStore {
       deposit_invoice_id: null,
       payout_a_invoice_id: null,
       payout_b_invoice_id: null,
-      resolved_party_a_address: resolvedAddresses.partyA,
-      resolved_party_b_address: resolvedAddresses.partyB,
+      resolved_party_a_address: normalizeDirectAddress(resolvedAddresses.partyA),
+      resolved_party_b_address: normalizeDirectAddress(resolvedAddresses.partyB),
       first_deposit_at: null,
       timeout_at: null,
       created_at: Date.now(),

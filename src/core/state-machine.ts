@@ -49,6 +49,7 @@ const VALID_TRANSITIONS: Record<string, Set<SwapState>> = {
     SwapState.FAILED,
   ]),
   [SwapState.CANCELLING]: new Set([
+    SwapState.DEPOSIT_COVERED, // coverage won the race — cancelInvoice got INVOICE_ALREADY_CLOSED
     SwapState.CANCELLED,
     SwapState.FAILED,
   ]),
