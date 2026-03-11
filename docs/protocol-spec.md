@@ -220,7 +220,7 @@ Created by the escrow when a manifest announcement is accepted.
 ```typescript
 InvoiceTerms {
   creator: escrowChainPubkey,       // escrow's secp256k1 pubkey
-  createdAt: swap.created_at,       // deterministic — swap's announcement timestamp
+  createdAt: swap.created_at,       // REQUIRES SDK GAP #8 — swap's announcement timestamp
   dueDate: swap.created_at + timeout * 1000,  // informational only
   memo: "Escrow deposit for swap <swap_id>",
   targets: [{
@@ -236,10 +236,10 @@ InvoiceTerms {
 **Key properties:**
 - Single target: the escrow's own DIRECT address
 - Two coin assets: one per party's required contribution
-- `createdAt` is set to `swap.created_at` (the swap's announcement timestamp from SwapStateStore) for deterministic invoice IDs — see `architecture.md` §Deterministic Invoice IDs
+- `createdAt` is set to `swap.created_at` (the swap's announcement timestamp from SwapStateStore) for deterministic invoice IDs — **requires SDK gap #8**; see `architecture.md` §Deterministic Invoice IDs. Without gap #8, the SDK uses `Date.now()` internally and invoice IDs are non-deterministic.
 - `dueDate` is set to `createdAt + timeout * 1000` but is informational only — the escrow enforces timeout at the application level
 - `creator` is the escrow's chain pubkey (non-anonymous — parties can verify the invoice creator)
-- Invoice token ID = SHA-256 of the canonical serialization of InvoiceTerms — fully deterministic from swap state
+- Invoice token ID = SHA-256 of the canonical serialization of InvoiceTerms — fully deterministic from swap state only when gap #8 is available (otherwise `createdAt` varies per call)
 
 ### 2.2 Payout Invoice Terms
 
@@ -250,7 +250,7 @@ Two separate invoices, created by the escrow after deposit coverage.
 ```typescript
 InvoiceTerms {
   creator: escrowChainPubkey,
-  createdAt: swap.created_at,  // deterministic — same as deposit invoice
+  createdAt: swap.created_at,  // REQUIRES SDK GAP #8 — same as deposit invoice
   memo: "Swap <swap_id> payout to Party A",
   targets: [{
     address: "DIRECT://<party_a_resolved_pubkey>",
@@ -266,7 +266,7 @@ InvoiceTerms {
 ```typescript
 InvoiceTerms {
   creator: escrowChainPubkey,
-  createdAt: swap.created_at,  // deterministic — same as deposit invoice
+  createdAt: swap.created_at,  // REQUIRES SDK GAP #8 — same as deposit invoice
   memo: "Swap <swap_id> payout to Party B",
   targets: [{
     address: "DIRECT://<party_b_resolved_pubkey>",
@@ -280,7 +280,7 @@ InvoiceTerms {
 **Key properties:**
 - Each payout invoice has exactly one target (the receiving party's DIRECT address)
 - Each has exactly one coin asset (the counter-currency the party should receive)
-- `createdAt` is `swap.created_at` for deterministic invoice IDs (see `architecture.md` §Deterministic Invoice IDs)
+- `createdAt` is `swap.created_at` for deterministic invoice IDs (**requires SDK gap #8**; see `architecture.md` §Deterministic Invoice IDs)
 - No `dueDate` — payout invoices are paid immediately by the escrow
 - Party addresses must be resolved to DIRECT:// format before invoice creation
 
@@ -317,7 +317,7 @@ Escrow: createInvoice({
   targets: [{ address: escrowAddress, assets: [partyACoin, partyBCoin] }],
   memo: "Escrow deposit for swap <swap_id>",
   dueDate: swap.created_at + timeout * 1000,
-  createdAt: swap.created_at,  // deterministic — see architecture.md §Deterministic Invoice IDs
+  createdAt: swap.created_at,  // REQUIRES SDK GAP #8 — see architecture.md §Deterministic Invoice IDs
 })
 ```
 

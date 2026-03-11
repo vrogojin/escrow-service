@@ -170,6 +170,7 @@ export interface ReturnPaymentParams {
  */
 export type SphereErrorCode =
   | 'INVOICE_NOT_FOUND'
+  | 'INVOICE_ALREADY_EXISTS'
   | 'INVOICE_ALREADY_CLOSED'
   | 'INVOICE_ALREADY_CANCELLED'
   | 'INVOICE_INVALID_AMOUNT'

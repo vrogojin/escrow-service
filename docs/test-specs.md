@@ -60,6 +60,9 @@ Mock implementation of the AccountingModule interface for unit/integration tests
 ```typescript
 interface MockAccountingModule {
   // Invoice CRUD
+  // NOTE: `createdAt` is a shim for SDK gap #8 (not yet in the real CreateInvoiceRequest).
+  // Tests using `createdAt` verify aspirational deterministic-ID behavior.
+  // Production code must NOT pass `createdAt` until gap #8 is merged into the SDK.
   createInvoice(request: CreateInvoiceRequest & { createdAt?: number }): Promise<CreateInvoiceResult>;
   getInvoiceStatus(invoiceId: string): Promise<InvoiceStatus>;
   closeInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
@@ -725,11 +728,13 @@ should handle (CANCELLING, COVERED) — coverage arrived after TIMED_OUT was per
 
 #### Deterministic Invoice ID Recovery (~4 tests)
 
+These tests exercise the target behavior (SDK gap #8). The mock supports `createdAt` passthrough as a gap #8 shim.
+
 ```
-should re-derive expected deposit invoice ID from swap.created_at and adopt existing invoice when deposit_invoice_id is null (ANNOUNCED recovery)
-should re-derive expected payout invoice IDs from swap.created_at and adopt existing invoices when payout_invoice_id is null (CONCLUDING recovery)
-should re-create deposit invoice with same deterministic ID when getInvoiceStatus returns INVOICE_NOT_FOUND (invoice was never created)
-should catch INVOICE_ALREADY_EXISTS on createInvoice() retry and treat as success (invoice created before crash, store write lost)
+should re-derive expected deposit invoice ID from swap.created_at and adopt existing invoice when deposit_invoice_id is null (ANNOUNCED recovery — requires gap #8)
+should re-derive expected payout invoice IDs from swap.created_at and adopt existing invoices when payout_invoice_id is null (CONCLUDING recovery — requires gap #8)
+should re-create deposit invoice with same deterministic ID when getInvoiceStatus returns INVOICE_NOT_FOUND (invoice was never created — requires gap #8)
+should catch INVOICE_ALREADY_EXISTS on concurrent createInvoice() within same process and treat as success (same-process guard only — does NOT fire after restart)
 ```
 
 #### Partial Payout Edge Cases (~1 test)
@@ -1079,10 +1084,10 @@ Every (swap state, invoice state) pair from the crash recovery table in `docs/ar
 | CANCELLING | PARTIAL | crash-recovery.test.ts §CANCELLING Recovery #3 |
 | CANCELLING | EXPIRED | crash-recovery.test.ts §CANCELLING Recovery #4 |
 | CANCELLING | COVERED | crash-recovery.test.ts §CANCELLING Recovery #5 — coverage won, resume conclusion |
-| ANNOUNCED (deposit_invoice_id=null) | (invoice exists) | crash-recovery.test.ts §Deterministic ID Recovery #1 — adopt via re-derived ID |
-| CONCLUDING (payout_id=null) | (payout exists) | crash-recovery.test.ts §Deterministic ID Recovery #2 — adopt via re-derived ID |
-| ANNOUNCED (deposit_invoice_id=null) | (no invoice) | crash-recovery.test.ts §Deterministic ID Recovery #3 — re-create with same ID |
-| ANNOUNCED (createInvoice retry) | INVOICE_ALREADY_EXISTS | crash-recovery.test.ts §Deterministic ID Recovery #4 — catch as success |
+| ANNOUNCED (deposit_invoice_id=null) | (invoice exists) | crash-recovery.test.ts §Deterministic ID Recovery #1 — adopt via re-derived ID (gap #8) |
+| CONCLUDING (payout_id=null) | (payout exists) | crash-recovery.test.ts §Deterministic ID Recovery #2 — adopt via re-derived ID (gap #8) |
+| ANNOUNCED (deposit_invoice_id=null) | (no invoice) | crash-recovery.test.ts §Deterministic ID Recovery #3 — re-create with same ID (gap #8) |
+| ANNOUNCED (concurrent createInvoice) | INVOICE_ALREADY_EXISTS | crash-recovery.test.ts §Deterministic ID Recovery #4 — same-process guard |
 
 ### 5.3 DM Message Type Coverage
 

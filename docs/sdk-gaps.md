@@ -461,7 +461,10 @@ When `createdAt` is omitted (default, backward compatible):
 
 The escrow uses the **persist-before-act** pattern: always write the invoice ID to SwapStateStore immediately after `createInvoice()` succeeds and before any dependent action. For crash recovery:
 - If the store has the invoice ID: use it directly (no re-derivation needed)
-- If the store lacks the invoice ID (crash between `createInvoice()` and store write): fall back to memo-based scanning via `getInvoices()` filtered by memo pattern `"Escrow deposit for swap <swap_id>"` or `"Swap <swap_id> payout to Party A/B"`
+- If the store lacks the invoice ID (crash between `createInvoice()` and store write): fall back to memo-based scanning via `getInvoices()` filtered by memo patterns:
+    - `"Escrow deposit for swap <swap_id>"`
+    - `"Swap <swap_id> payout to Party A"`
+    - `"Swap <swap_id> payout to Party B"`
 
 This workaround is **functional but fragile**: memo parsing couples crash recovery to free-text conventions, and the O(N) scan becomes expensive as invoice count grows. The `createdAt` passthrough eliminates both issues.
 
