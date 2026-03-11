@@ -1060,7 +1060,9 @@ Every transition from the state machine diagram in `docs/architecture.md` is cov
 | DEPOSIT_COVERED → CONCLUDING | state-machine.test.ts, swap-orchestrator §invoice:covered | swap-lifecycle §Happy Path | B.1 |
 | CONCLUDING → COMPLETED | state-machine.test.ts, swap-orchestrator §invoice:covered | swap-lifecycle §Happy Path | B.1 |
 | TIMED_OUT → CANCELLING | state-machine.test.ts | swap-lifecycle §Timeout | C.1 |
+| TIMED_OUT → DEPOSIT_COVERED | state-machine.test.ts, crash-recovery §TIMED_OUT Recovery | — | — |
 | CANCELLING → CANCELLED | state-machine.test.ts | swap-lifecycle §Timeout | C.1 |
+| CANCELLING → DEPOSIT_COVERED | state-machine.test.ts, crash-recovery §CANCELLING Recovery | — | — |
 | Any → FAILED | state-machine.test.ts | swap-lifecycle §Crash Recovery | — |
 
 ### 5.2 Crash Recovery Table Coverage

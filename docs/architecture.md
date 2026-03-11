@@ -305,9 +305,9 @@ Fired when a payment referencing the deposit invoice is received. The handler:
 Fired when all requested assets in the deposit invoice reach their targets. The handler:
 
 1. Verifies the invoice ID maps to an active swap
-2. **State guard:** only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT` — ignore if already `DEPOSIT_COVERED` or later (idempotency)
+2. **State guard:** only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT` — ignore if in any other state, including `DEPOSIT_COVERED`, `CONCLUDING`, `TIMED_OUT`, `CANCELLING`, and all terminal states (idempotency and race guard)
 3. **Re-validate per-currency coverage:** call `getInvoiceStatus()` and verify that `coinAssets[0]` (party A's currency) and `coinAssets[1]` (party B's currency) are each individually covered at the required amounts. The `invoice:covered` event only means the aggregate amounts are met — it does not guarantee that the two distinct currency slots are both individually satisfied (e.g., someone could have overpaid one currency while the other remains uncovered). If either slot is not individually covered at the correct threshold, do NOT proceed — bounce the wrong-currency payment and remain in `PARTIAL_DEPOSIT` (or `DEPOSIT_INVOICE_CREATED`). The `invoice:covered` event fires on every payment event where all targets meet their coverage thresholds, so it will fire again naturally once the correct currencies restore full coverage.
-4. Transitions to `DEPOSIT_COVERED`
+4. Transitions to `DEPOSIT_COVERED` (persist to SwapStateStore before proceeding — crash between this persist and the `CONCLUDING` persist at step 8 is handled by crash recovery)
 5. Cancels the timeout timer (if running)
 6. Closes the deposit invoice: `closeInvoice(depositInvoiceId)` — do **not** pass `{autoReturn: true}` here. Surplus handling, if needed, should be done after payouts complete. Passing `autoReturn: true` on close would trigger surplus returns concurrently with payout `payInvoice()` calls, creating a race for the escrow's token balance.
 7. Creates two payout invoices
@@ -334,17 +334,33 @@ The timeout timer is an application-level `setTimeout` (or persistent timer) tha
 // On first invoice:payment event for this swap
 const timeoutMs = manifest.timeout * 1000;
 timeoutManager.schedule(swapId, timeoutMs, async () => {
-  await accounting.cancelInvoice(depositInvoiceId, { autoReturn: true });
-  // cancelInvoice freezes balances, fires invoice:cancelled event,
-  // then begins auto-return (asynchronous, after event).
-  // invoice:cancelled handler transitions CANCELLING → CANCELLED
+  // 1. State guard: if already DEPOSIT_COVERED or later, no-op
+  const swap = await stateStore.findBySwapId(swapId);
+  if (swap.state !== SwapState.PARTIAL_DEPOSIT &&
+      swap.state !== SwapState.DEPOSIT_INVOICE_CREATED) return;
+  // 2. Persist TIMED_OUT before calling cancelInvoice (persist-before-act)
+  await stateStore.updateState(swapId, SwapState.TIMED_OUT, swap.version);
+  // 3. Cancel deposit invoice
+  try {
+    await accounting.cancelInvoice(depositInvoiceId, { autoReturn: true });
+    // cancelInvoice freezes balances, fires invoice:cancelled event,
+    // then begins auto-return (asynchronous, after event).
+    // invoice:cancelled handler transitions CANCELLING → CANCELLED
+  } catch (err) {
+    if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
+      // Coverage won the race — abort cancellation, reconcile to DEPOSIT_COVERED
+      await stateStore.updateState(swapId, SwapState.DEPOSIT_COVERED, ...);
+      // Resume conclusion path (create payouts, etc.)
+    } else { throw err; }
+  }
 });
 ```
 
-**Race condition: coverage vs timeout.** If `invoice:covered` fires at nearly the same time as the timeout:
-- The SwapOrchestrator uses swap state as the arbiter. If the swap has already transitioned to `DEPOSIT_COVERED`, the timeout callback is a no-op.
-- If the timeout fires first and the swap transitions to `TIMED_OUT`, a subsequent `invoice:covered` is ignored (swap is no longer in `PARTIAL_DEPOSIT`).
-- Both paths are safe because the escrow wraps `closeInvoice()` and `cancelInvoice()` in try-catch blocks. **Important semantic distinction:** catching `INVOICE_ALREADY_CLOSED` in the coverage path means "closure already happened, proceed." But catching `INVOICE_ALREADY_CANCELLED` in the coverage path means "the timeout won the race — abort conclusion, do NOT proceed to payout." Similarly, catching `INVOICE_ALREADY_CLOSED` in the timeout path means "coverage won the race — abort cancellation." The try-catch must distinguish between same-operation errors (safe to proceed) and opposite-operation errors (must abort the current path). The swap state guard is the primary arbiter; the try-catch is a safety net for the brief window between state check and SDK call.
+**Race condition: coverage vs timeout.** If `invoice:covered` fires at nearly the same time as the timeout, three outcomes are possible:
+- **Coverage wins:** The `invoice:covered` handler transitions to `DEPOSIT_COVERED` before the timeout fires. The timeout callback sees the swap is no longer in `PARTIAL_DEPOSIT`/`DEPOSIT_INVOICE_CREATED` and exits at the state guard (no-op).
+- **Timeout wins:** The timeout fires first and persists `TIMED_OUT`. The `invoice:covered` handler's state guard blocks further processing because `TIMED_OUT` is not in the permitted entry states (`DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT`) — the handler exits early.
+- **Interleaved (cross-terminal race):** The timeout persists `TIMED_OUT` and calls `cancelInvoice()`, but the `invoice:covered` handler had already called `closeInvoice()` before `TIMED_OUT` was persisted. `cancelInvoice()` throws `INVOICE_ALREADY_CLOSED`. The timeout callback catches this, aborts cancellation, and reconciles the swap to `DEPOSIT_COVERED` to resume the conclusion path (see transition table: `TIMED_OUT → DEPOSIT_COVERED`). The same pattern applies in `CANCELLING`: if `cancelInvoice()` throws `INVOICE_ALREADY_CLOSED`, the swap reconciles to `DEPOSIT_COVERED` (see transition table: `CANCELLING → DEPOSIT_COVERED`).
+- **Important semantic distinction:** catching `INVOICE_ALREADY_CLOSED` in the coverage path means "closure already happened, proceed." But catching `INVOICE_ALREADY_CANCELLED` in the coverage path means "the timeout won the race — abort conclusion, do NOT proceed to payout." Similarly, catching `INVOICE_ALREADY_CLOSED` in the timeout path means "coverage won the race — abort cancellation." The try-catch must distinguish between same-operation errors (safe to proceed) and opposite-operation errors (must abort the current path). The swap state guard is the primary arbiter; the try-catch is a safety net for the brief window between state check and SDK call.
 
 ## Deposit Validation
 
