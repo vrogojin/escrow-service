@@ -220,8 +220,8 @@ Created by the escrow when a manifest announcement is accepted.
 ```typescript
 InvoiceTerms {
   creator: escrowChainPubkey,       // escrow's secp256k1 pubkey
-  createdAt: Date.now(),            // creation timestamp (ms)
-  dueDate: Date.now() + timeout * 1000,  // informational only
+  createdAt: swap.created_at,       // deterministic — swap's announcement timestamp
+  dueDate: swap.created_at + timeout * 1000,  // informational only
   memo: "Escrow deposit for swap <swap_id>",
   targets: [{
     address: "DIRECT://<escrow_pubkey_hex>",  // escrow's DIRECT address
@@ -236,9 +236,10 @@ InvoiceTerms {
 **Key properties:**
 - Single target: the escrow's own DIRECT address
 - Two coin assets: one per party's required contribution
+- `createdAt` is set to `swap.created_at` (the swap's announcement timestamp from SwapStateStore) for deterministic invoice IDs — see `architecture.md` §Deterministic Invoice IDs
 - `dueDate` is set to `createdAt + timeout * 1000` but is informational only — the escrow enforces timeout at the application level
 - `creator` is the escrow's chain pubkey (non-anonymous — parties can verify the invoice creator)
-- Invoice token ID = SHA-256 of the canonical serialization of InvoiceTerms
+- Invoice token ID = SHA-256 of the canonical serialization of InvoiceTerms — fully deterministic from swap state
 
 ### 2.2 Payout Invoice Terms
 
@@ -249,7 +250,7 @@ Two separate invoices, created by the escrow after deposit coverage.
 ```typescript
 InvoiceTerms {
   creator: escrowChainPubkey,
-  createdAt: Date.now(),
+  createdAt: swap.created_at,  // deterministic — same as deposit invoice
   memo: "Swap <swap_id> payout to Party A",
   targets: [{
     address: "DIRECT://<party_a_resolved_pubkey>",
@@ -265,7 +266,7 @@ InvoiceTerms {
 ```typescript
 InvoiceTerms {
   creator: escrowChainPubkey,
-  createdAt: Date.now(),
+  createdAt: swap.created_at,  // deterministic — same as deposit invoice
   memo: "Swap <swap_id> payout to Party B",
   targets: [{
     address: "DIRECT://<party_b_resolved_pubkey>",
@@ -279,6 +280,7 @@ InvoiceTerms {
 **Key properties:**
 - Each payout invoice has exactly one target (the receiving party's DIRECT address)
 - Each has exactly one coin asset (the counter-currency the party should receive)
+- `createdAt` is `swap.created_at` for deterministic invoice IDs (see `architecture.md` §Deterministic Invoice IDs)
 - No `dueDate` — payout invoices are paid immediately by the escrow
 - Party addresses must be resolved to DIRECT:// format before invoice creation
 
@@ -314,7 +316,8 @@ The escrow creates a deposit invoice via `accounting.createInvoice()`:
 Escrow: createInvoice({
   targets: [{ address: escrowAddress, assets: [partyACoin, partyBCoin] }],
   memo: "Escrow deposit for swap <swap_id>",
-  dueDate: now + timeout * 1000
+  dueDate: swap.created_at + timeout * 1000,
+  createdAt: swap.created_at,  // deterministic — see architecture.md §Deterministic Invoice IDs
 })
 ```
 
@@ -427,6 +430,8 @@ await accounting.payInvoice(payoutBInvoiceId, {
 ```
 
 **Crash recovery warning:** When retrying `payInvoice()` during crash recovery, **omit the `amount` parameter**. The SDK will compute `remaining = requestedAmount - netCoveredAmount` and send only the uncovered remainder. If the payout was already completed before the crash, `remaining` will be `0` and the SDK throws `INVOICE_INVALID_AMOUNT` (safe to catch as success). The SDK may also throw `INVOICE_TERMINATED` (invoice already closed/cancelled — treat as success) or `INVOICE_NOT_FOUND` (invoice token not loaded after restart — re-import via `importInvoice()`, then retry). Passing an explicit `amount` during retry bypasses the zero-remaining guard and causes a **double-payment**.
+
+**Deterministic payout invoice IDs:** If a payout invoice ID is missing from the SwapStateStore (crash between `createInvoice()` and store write), the escrow re-derives the expected ID using `deriveInvoiceId()` with `createdAt: swap.created_at` and checks if it already exists. If found, adopt it; if not, re-create it (produces the same ID deterministically). See `architecture.md` §Deterministic Invoice IDs.
 
 ### Step 9: Payout Delivery and Confirmation
 

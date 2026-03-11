@@ -60,7 +60,7 @@ Mock implementation of the AccountingModule interface for unit/integration tests
 ```typescript
 interface MockAccountingModule {
   // Invoice CRUD
-  createInvoice(request: CreateInvoiceRequest): Promise<CreateInvoiceResult>;
+  createInvoice(request: CreateInvoiceRequest & { createdAt?: number }): Promise<CreateInvoiceResult>;
   getInvoiceStatus(invoiceId: string): Promise<InvoiceStatus>;
   closeInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
   cancelInvoice(invoiceId: string, options?: { autoReturn?: boolean }): Promise<void>;
@@ -97,7 +97,7 @@ interface MockInvoiceState {
 ```
 
 Key behaviors:
-- `createInvoice()` generates a deterministic invoice ID from SHA-256 of the canonical terms
+- `createInvoice()` generates a deterministic invoice ID from SHA-256 of the canonical terms. When `request.createdAt` is provided, it is used directly in `InvoiceTerms.createdAt`; when omitted, `Date.now()` is used (matching SDK gap #8 behavior). Throws `INVOICE_ALREADY_EXISTS` if the computed ID matches an existing invoice.
 - `_simulatePayment()` adds a transfer, updates balances, fires `invoice:payment` event
 - `_simulateCoverage()` fires `invoice:covered` event with payload `{ invoiceId: string, confirmed: boolean }`
 - `closeInvoice()` on already-closed throws `INVOICE_ALREADY_CLOSED`; on cancelled throws `INVOICE_ALREADY_CANCELLED`
@@ -649,7 +649,7 @@ should correctly compare netCoveredAmount >= requestedAmount with BigInt arithme
 
 ### 2.9 Crash Recovery — `crash-recovery.test.ts`
 
-**~43 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
+**~45 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
 
 Each test sets up a swap in a specific (swap state, invoice state) pair, then runs the recovery procedure and verifies the resulting action. All re-validation steps check coverage by currency slot (coinId against asset index) — sender identity is not evaluated.
 
@@ -723,11 +723,13 @@ should call cancelInvoice() when swap is CANCELLING but invoice is EXPIRED (dueD
 should handle (CANCELLING, COVERED) — coverage arrived after TIMED_OUT was persisted but before cancelInvoice() completed; call closeInvoice() first (coverage won), then resume conclusion via DEPOSIT_COVERED path
 ```
 
-#### Orphaned Invoice Detection (~2 tests)
+#### Deterministic Invoice ID Recovery (~4 tests)
 
 ```
-should detect invoices with matching memo but no corresponding swap in store
-should cancel orphaned invoices (or adopt if swap creation can be resumed)
+should re-derive expected deposit invoice ID from swap.created_at and adopt existing invoice when deposit_invoice_id is null (ANNOUNCED recovery)
+should re-derive expected payout invoice IDs from swap.created_at and adopt existing invoices when payout_invoice_id is null (CONCLUDING recovery)
+should re-create deposit invoice with same deterministic ID when getInvoiceStatus returns INVOICE_NOT_FOUND (invoice was never created)
+should catch INVOICE_ALREADY_EXISTS on createInvoice() retry and treat as success (invoice created before crash, store write lost)
 ```
 
 #### Partial Payout Edge Cases (~1 test)
@@ -791,7 +793,7 @@ should complete one swap while another is still in PARTIAL_DEPOSIT
 ```
 should resume PARTIAL_DEPOSIT swap on startup with correct remaining timeout
 should resume CONCLUDING swap on startup and complete payout
-should detect and handle orphaned invoices on startup
+should recover orphaned invoices via deterministic ID re-derivation on startup
 should reconcile DEPOSIT_COVERED swap with CANCELLED invoice (admin action during crash)
 ```
 
@@ -1077,6 +1079,10 @@ Every (swap state, invoice state) pair from the crash recovery table in `docs/ar
 | CANCELLING | PARTIAL | crash-recovery.test.ts §CANCELLING Recovery #3 |
 | CANCELLING | EXPIRED | crash-recovery.test.ts §CANCELLING Recovery #4 |
 | CANCELLING | COVERED | crash-recovery.test.ts §CANCELLING Recovery #5 — coverage won, resume conclusion |
+| ANNOUNCED (deposit_invoice_id=null) | (invoice exists) | crash-recovery.test.ts §Deterministic ID Recovery #1 — adopt via re-derived ID |
+| CONCLUDING (payout_id=null) | (payout exists) | crash-recovery.test.ts §Deterministic ID Recovery #2 — adopt via re-derived ID |
+| ANNOUNCED (deposit_invoice_id=null) | (no invoice) | crash-recovery.test.ts §Deterministic ID Recovery #3 — re-create with same ID |
+| ANNOUNCED (createInvoice retry) | INVOICE_ALREADY_EXISTS | crash-recovery.test.ts §Deterministic ID Recovery #4 — catch as success |
 
 ### 5.3 DM Message Type Coverage
 
@@ -1136,8 +1142,8 @@ The live E2E tests cover the complete trader-creation → topup → escrow → e
 | | swap-state-store.test.ts | ~12 |
 | | manifest-validator.test.ts | ~4 |
 | | deposit-validation.test.ts | ~14 |
-| | crash-recovery.test.ts | ~43 |
-| **Unit subtotal** | | **~219** |
+| | crash-recovery.test.ts | ~45 |
+| **Unit subtotal** | | **~221** |
 | **Integration** | swap-lifecycle.integration.test.ts | ~25 |
 | **Live E2E** | swap-lifecycle.e2e-live.test.ts | ~22 |
-| **Total** | | **~266** |
+| **Total** | | **~268** |

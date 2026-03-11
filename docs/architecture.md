@@ -102,6 +102,35 @@ Persists swap case metadata and state. The schema shrinks significantly because 
 
 **Eliminated fields:** `party_a_deposited`, `party_b_deposited`, `party_a_coin_id`, `party_b_coin_id` — all derivable from `getInvoiceStatus()`.
 
+## Deterministic Invoice IDs
+
+Invoice IDs in the AccountingModule are `SHA-256(canonicalSerialize(InvoiceTerms))`. The `InvoiceTerms` type includes a `createdAt` timestamp. By default, `createInvoice()` sets `createdAt = Date.now()`, making each invocation produce a different ID even for identical logical invoices. This is problematic for crash recovery: if the process crashes between `createInvoice()` and the SwapStateStore write, re-creating the invoice on restart produces a **different** ID, orphaning the original.
+
+**Solution:** The escrow passes `createdAt: swap.created_at` (the swap's announcement timestamp from SwapStateStore) to all `createInvoice()` calls. This requires SDK gap #8 (`createdAt` passthrough in `CreateInvoiceRequest` — see `docs/sdk-gaps.md`). With this, all invoice terms are fully deterministic from swap state:
+
+- **Deposit invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, dueDate: swap.created_at + timeout*1000, memo: "Escrow deposit for swap <swap_id>", targets: [...] }))`
+- **Payout A invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, memo: "Swap <swap_id> payout to Party A", targets: [{ address: resolvedPartyA, ... }] }))`
+- **Payout B invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, memo: "Swap <swap_id> payout to Party B", targets: [{ address: resolvedPartyB, ... }] }))`
+
+The escrow can **pre-compute** expected invoice IDs without calling the SDK, and verify whether an invoice already exists via `getInvoiceStatus(expectedId)`. This eliminates the need for memo-based orphan scanning (see §Crash Recovery).
+
+**Pre-computation helper:**
+
+```typescript
+function deriveInvoiceId(terms: InvoiceTerms): string {
+  return sha256Hex(canonicalSerialize(terms));
+}
+
+// Before any createInvoice() call, compute expected ID:
+const expectedDepositId = deriveInvoiceId({
+  creator: escrowChainPubkey,
+  createdAt: swap.created_at,
+  dueDate: swap.created_at + manifest.timeout * 1000,
+  memo: `Escrow deposit for swap ${manifest.swap_id}`,
+  targets: [{ address: escrowDirectAddress, assets: [...] }],
+});
+```
+
 ## Invoice Design
 
 ### Deposit Invoice
@@ -118,7 +147,8 @@ const depositInvoice = await accounting.createInvoice({
     ],
   }],
   memo: `Escrow deposit for swap ${manifest.swap_id}`,
-  dueDate: Date.now() + manifest.timeout * 1000,  // informational only
+  dueDate: swap.created_at + manifest.timeout * 1000,  // informational only
+  createdAt: swap.created_at,  // deterministic — see §Deterministic Invoice IDs
 });
 ```
 
@@ -138,6 +168,7 @@ const payoutA = await accounting.createInvoice({
     ],
   }],
   memo: `Swap ${manifest.swap_id} payout to Party A`,
+  createdAt: swap.created_at,  // deterministic — see §Deterministic Invoice IDs
 });
 ```
 
@@ -151,6 +182,7 @@ const payoutB = await accounting.createInvoice({
     ],
   }],
   memo: `Swap ${manifest.swap_id} payout to Party B`,
+  createdAt: swap.created_at,  // deterministic — see §Deterministic Invoice IDs
 });
 ```
 
@@ -340,7 +372,13 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 | `TIMED_OUT` | any | Call `cancelInvoice()` — idempotent if already cancelled |
 | `CANCELLING` | `CANCELLED` | Transition to `CANCELLED` |
 
-4. **Orphaned invoice detection:** If `createInvoice()` succeeded but the subsequent SwapStateStore write failed, the invoice exists in the AccountingModule but no swap references it. On startup, the escrow should scan `getInvoices()` for invoices whose memo matches `"Escrow deposit for swap <swap_id>"` but have no corresponding swap in SwapStateStore, and either adopt or cancel them.
+4. **Orphaned invoice recovery via deterministic IDs:** If `createInvoice()` succeeded but the subsequent SwapStateStore write failed, the invoice exists in the AccountingModule but the swap record's `deposit_invoice_id` is null. Because invoice IDs are deterministic (see §Deterministic Invoice IDs), the escrow can re-derive the expected deposit invoice ID from the swap's stored fields (`created_at`, manifest, escrow pubkey) without scanning. On startup, for any swap in `ANNOUNCED` state with `deposit_invoice_id = null`:
+   - Compute the expected deposit invoice ID using `deriveInvoiceId()` with `createdAt: swap.created_at`
+   - Call `getInvoiceStatus(expectedId)` — if found, adopt the invoice (update `deposit_invoice_id` in the store)
+   - If not found (`INVOICE_NOT_FOUND`), re-create the invoice — the deterministic `createdAt` ensures the same ID is produced
+   - This eliminates the need for memo-based `getInvoices()` scanning, which is O(N) in total invoice count
+
+   The same pattern applies to payout invoices during `CONCLUDING` recovery: if `payout_a_invoice_id` or `payout_b_invoice_id` is null, derive the expected ID and check before creating.
 
 5. **Partial payout recovery** (swap in `CONCLUDING`): Check each payout invoice individually:
    - If `payout_a_invoice_id` exists: call `getInvoiceStatus()` — if not yet covered, re-pay via `payInvoice()`
@@ -354,7 +392,7 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 
 To minimize recovery complexity, the escrow follows a **persist-before-act** pattern:
 
-1. Before `createInvoice()`: persist the swap in `ANNOUNCED` state with `deposit_invoice_id = null`. If `createInvoice()` succeeds, update the stored `deposit_invoice_id` to the actual value before delivering tokens. If the process crashes between `createInvoice()` and the update, orphaned invoice detection (step 4 above) handles recovery.
+1. Before `createInvoice()`: persist the swap in `ANNOUNCED` state with `deposit_invoice_id = null`. If `createInvoice()` succeeds, update the stored `deposit_invoice_id` to the actual value before delivering tokens. If the process crashes between `createInvoice()` and the update, deterministic ID re-derivation (step 4 above) handles recovery — the escrow re-derives the expected ID from `swap.created_at` and adopts or re-creates the invoice.
 2. Before `payInvoice()` calls: persist state as `CONCLUDING` with both payout invoice IDs populated (note: this happens after `closeInvoice()` and payout invoice creation — see covered handler steps 6-7)
 3. Before `cancelInvoice()`: persist state as `TIMED_OUT`
 
@@ -362,11 +400,12 @@ This ensures that on crash, the SwapStateStore always reflects the intended acti
 
 The AccountingModule operations are **not** idempotent on terminal invoices. The escrow's crash recovery must wrap each SDK call in a try-catch that handles these error codes:
 
+- `createInvoice()` throws `INVOICE_ALREADY_EXISTS` when the InvoiceTerms hash matches an existing invoice — with deterministic `createdAt`, this indicates the invoice was already created before the crash (safe to catch as success; retrieve the existing invoice by its deterministic ID)
 - `closeInvoice()` throws `INVOICE_ALREADY_CLOSED` (already closed) or `INVOICE_ALREADY_CANCELLED` (cancelled by timeout/admin)
 - `cancelInvoice()` throws `INVOICE_ALREADY_CANCELLED` (already cancelled) or `INVOICE_ALREADY_CLOSED` (coverage won the race)
 - `payInvoice()` throws `INVOICE_INVALID_AMOUNT` (remaining = 0, fully covered) or `INVOICE_TERMINATED` (invoice already closed/cancelled)
 
-All four error codes should be caught and treated as success conditions during crash recovery (the operation was already completed before the crash). However, cross-terminal errors (e.g., `INVOICE_ALREADY_CANCELLED` when trying to close) indicate a different outcome than expected — the recovery logic must check which terminal state the invoice is actually in and reconcile the swap state accordingly.
+All five error codes should be caught and treated as success conditions during crash recovery (the operation was already completed before the crash). However, cross-terminal errors (e.g., `INVOICE_ALREADY_CANCELLED` when trying to close) indicate a different outcome than expected — the recovery logic must check which terminal state the invoice is actually in and reconcile the swap state accordingly.
 
 ## Security Considerations
 
@@ -381,7 +420,7 @@ If party addresses use nametags, the escrow resolves them to DIRECT:// addresses
 ### Race Conditions
 
 - **Coverage vs timeout:** Handled by swap state machine — only one can win
-- **Duplicate announcements:** Invoice IDs are SHA-256 of canonical `InvoiceTerms`, which includes `createdAt` — so duplicate `createInvoice()` calls at different times produce **different** IDs. The escrow must check SwapStateStore for an existing swap with the same `swap_id` before creating a new invoice. If a swap already exists, return the existing swap case (`is_new: false`).
+- **Duplicate announcements:** With deterministic `createdAt` (see §Deterministic Invoice IDs), duplicate `createInvoice()` calls for the same swap produce the **same** invoice ID (since all InvoiceTerms fields are deterministic from swap state). The SDK throws `INVOICE_ALREADY_EXISTS` for identical terms, which the escrow catches and treats as success (the invoice was already created). The escrow also checks SwapStateStore for an existing swap with the same `swap_id` before creating a new invoice — if a swap already exists, it returns the existing swap case (`is_new: false`).
 - **Concurrent overpayment via TOCTOU race:** The per-invoice async mutex (`invoiceGates`) serializes the terminal-state check within `payInvoice()`, but the actual payment (`send()`) executes **outside** the gate to avoid blocking during network calls. Two concurrent `payInvoice()` calls that both pass the terminal check will both send. The escrow must prevent concurrent payout attempts at the application level by serializing the conclusion phase within SwapOrchestrator. The single-instance deployment constraint (see Deployment Constraint section) ensures no cross-process races. Per-sender balance tracking deduplicates by `transferId::coinId` for deposit-side tracking.
 
 ### Deployment Constraint: Single-Instance

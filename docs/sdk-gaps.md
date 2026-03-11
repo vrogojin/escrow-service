@@ -400,6 +400,73 @@ The escrow uses application-level filtering. For the current escrow use case (mo
 
 ---
 
+## 8. `createdAt` Passthrough in `CreateInvoiceRequest`
+
+**Priority: High**
+
+### Current SDK Behavior
+
+The `CreateInvoiceRequest` type does not expose a `createdAt` field. The SDK sets `createdAt = Date.now()` internally when building `InvoiceTerms` (AccountingModule.ts line 926):
+
+```typescript
+const terms: InvoiceTerms = {
+  creator: request.anonymous ? undefined : deps.identity.chainPubkey,
+  createdAt: Date.now(),  // ← always current timestamp
+  // ...
+};
+```
+
+Since the invoice ID is `SHA-256(canonicalSerialize(InvoiceTerms))` and `createdAt` is part of the serialized terms, each `createInvoice()` call produces a **different** invoice ID even when all other fields are identical.
+
+### Impact on Escrow
+
+Without deterministic invoice IDs, the escrow cannot:
+- **Pre-compute** expected invoice IDs from swap state (needed for crash recovery without orphan scanning)
+- **Safely re-create** invoices after crashes — re-calling `createInvoice()` produces a different ID, orphaning the original
+- **Verify** that a created invoice matches expectations without memo-based string parsing
+
+The escrow must fall back to:
+1. O(N) memo scanning via `getInvoices()` to find orphaned invoices (fragile and slow)
+2. Persisting invoice IDs before any subsequent action (the "persist-before-act" pattern), which works but adds recovery complexity
+
+### Proposed API Change
+
+Add an optional `createdAt` field to `CreateInvoiceRequest`:
+
+```typescript
+export interface CreateInvoiceRequest {
+  readonly targets: InvoiceTarget[];
+  readonly dueDate?: number;
+  readonly memo?: string;
+  readonly deliveryMethods?: string[];
+  readonly anonymous?: boolean;
+  /**
+   * Optional creation timestamp (ms). When provided, used instead of Date.now().
+   * Must be a positive integer ≤ Date.now() + 86400000 (1-day clock skew).
+   * Enables deterministic invoice IDs for crash recovery.
+   */
+  readonly createdAt?: number;
+}
+```
+
+When `createdAt` is provided:
+- The SDK uses it directly in `InvoiceTerms.createdAt` instead of calling `Date.now()`
+- Validation: must be a positive integer, ≤ `Date.now() + 86400000` (same clock skew check as `importInvoice()`)
+- The resulting invoice ID is deterministic for a given set of terms
+
+When `createdAt` is omitted (default, backward compatible):
+- Existing behavior: `Date.now()` is used
+
+### Workaround
+
+The escrow uses the **persist-before-act** pattern: always write the invoice ID to SwapStateStore immediately after `createInvoice()` succeeds and before any dependent action. For crash recovery:
+- If the store has the invoice ID: use it directly (no re-derivation needed)
+- If the store lacks the invoice ID (crash between `createInvoice()` and store write): fall back to memo-based scanning via `getInvoices()` filtered by memo pattern `"Escrow deposit for swap <swap_id>"` or `"Swap <swap_id> payout to Party A/B"`
+
+This workaround is **functional but fragile**: memo parsing couples crash recovery to free-text conventions, and the O(N) scan becomes expensive as invoice count grows. The `createdAt` passthrough eliminates both issues.
+
+---
+
 ## Summary
 
 | # | Gap | Priority | Blocking? | Workaround |
@@ -411,7 +478,8 @@ The escrow uses application-level filtering. For the current escrow use case (mo
 | 5 | `invoice:sender_unauthorized` event | Low | No | `invoice:payment` event + manual sender check |
 | 6 | Distributed locking / multi-instance support | **Medium** | No | Single-instance deployment with active-passive failover |
 | 7 | `getInvoices()` per-sender filtering | Low | No | Application-level filtering after retrieval |
+| 8 | `createdAt` passthrough in `CreateInvoiceRequest` | **High** | No | Persist-before-act + memo-based orphan scanning |
 
 **None of these gaps are blocking.** The escrow service can be fully implemented using the current AccountingModule API. The gaps represent opportunities for the SDK to reduce boilerplate and push common patterns into the framework. However, gap #1's workaround exposes a DOS surface (unauthorized payment flooding forces an event → validate → return loop per payment) that should be mitigated with application-level rate-limiting until `allowedSenders` is available.
 
-The highest-impact gap is **`allowedSenders`** (#1), which would eliminate the most complex application-level workaround (the payment → validate → bounce loop) and close the DOS vector from unauthorized payment flooding. Gap #6 (distributed locking) is **Medium** because it imposes a hard single-instance architectural constraint on all AccountingModule consumers. The remaining gaps are convenience improvements that reduce code duplication across invoice-issuing applications.
+The highest-impact gaps are **`allowedSenders`** (#1), which eliminates the most complex application-level workaround, and **`createdAt` passthrough** (#8), which enables deterministic invoice IDs for robust crash recovery without memo-based scanning. Gap #6 (distributed locking) is **Medium** because it imposes a hard single-instance architectural constraint on all AccountingModule consumers. The remaining gaps are convenience improvements that reduce code duplication across invoice-issuing applications.
