@@ -672,17 +672,18 @@ export class CrashRecoveryManager {
   private async _resumePayouts(swap: SwapRecord): Promise<void> {
     const manifest = swap.manifest;
 
-    // Ensure we have payout invoice IDs
-    let payoutAId = swap.payout_a_invoice_id;
-    let payoutBId = swap.payout_b_invoice_id;
-
     // Fetch the latest persisted swap record to get the most current version
-    // (the caller may have passed a stale record if they advanced state before calling us).
+    // and payout invoice IDs (the caller may have passed a stale record).
     let currentSwap = this.stateStore.findBySwapId(swap.swap_id);
     if (!currentSwap) {
       logger.error({ swap_id: swap.swap_id }, 'Recovery: Swap not found when resuming payouts');
       return;
     }
+
+    // Read payout IDs from the CURRENT store record, not the stale caller argument.
+    // A prior partial recovery may have already persisted payout_a_invoice_id.
+    let payoutAId = currentSwap.payout_a_invoice_id;
+    let payoutBId = currentSwap.payout_b_invoice_id;
 
     // If payout A is missing, create it and immediately persist its ID.
     // Persisting before creating payout B ensures that, if we crash between
@@ -690,13 +691,13 @@ export class CrashRecoveryManager {
     if (!payoutAId) {
       const result = await this.invoiceManager.createPayoutInvoice(
         manifest.swap_id,
-        swap.resolved_party_a_address,
+        currentSwap.resolved_party_a_address,
         manifest.party_b_currency_to_change,
         manifest.party_b_value_to_change,
         'A',
       );
       if (!result.success || !result.invoiceId) {
-        this._failSwap(swap, `Recovery: Failed to create payout A invoice: ${result.error ?? 'unknown'}`);
+        this._failSwap(currentSwap, `Recovery: Failed to create payout A invoice: ${result.error ?? 'unknown'}`);
         return;
       }
       payoutAId = result.invoiceId;
@@ -720,7 +721,7 @@ export class CrashRecoveryManager {
     if (!payoutBId) {
       const result = await this.invoiceManager.createPayoutInvoice(
         manifest.swap_id,
-        swap.resolved_party_b_address,
+        currentSwap.resolved_party_b_address,
         manifest.party_a_currency_to_change,
         manifest.party_a_value_to_change,
         'B',

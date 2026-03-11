@@ -34,10 +34,12 @@ const VALID_TRANSITIONS: Record<string, Set<SwapState>> = {
     SwapState.FAILED,
   ]),
   [SwapState.DEPOSIT_COVERED]: new Set([
+    SwapState.DEPOSIT_COVERED, // self-transition for metadata-only updates (e.g., payout invoice ID checkpoint)
     SwapState.CONCLUDING,
     SwapState.FAILED,
   ]),
   [SwapState.CONCLUDING]: new Set([
+    SwapState.CONCLUDING, // self-transition for metadata-only updates (e.g., payout B invoice ID checkpoint)
     SwapState.COMPLETED,
     SwapState.FAILED,
   ]),

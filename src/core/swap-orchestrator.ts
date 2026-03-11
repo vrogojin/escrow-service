@@ -611,10 +611,6 @@ export class SwapOrchestrator {
         return;
       }
 
-      if (timedOutContested) {
-        // Cancel the timeout timer since coverage won the contest over timeout.
-        this.timeoutManager.cancel(swap.swap_id);
-      }
     }
 
     // 4. Close deposit invoice (no autoReturn) BEFORE cancelling the timer.
@@ -1054,9 +1050,11 @@ export class SwapOrchestrator {
       if (!target) return;
 
       for (const coinAsset of target.coinAssets) {
-        // senderBalances is typed as unknown[] in our duck-typed interface
+        // senderBalances is typed as unknown[] in our duck-typed interface.
+        // The SDK's InvoiceSenderBalance.senderAddress IS the effectiveSender
+        // (refundAddress ?? senderAddress) — see SDK types.ts:155-162.
         const senderBalances = coinAsset.senderBalances as Array<{
-          senderAddress: string;
+          senderAddress: string; // effectiveSender per SDK contract
           netBalance: string;
         }>;
         if (!Array.isArray(senderBalances)) continue;

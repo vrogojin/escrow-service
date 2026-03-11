@@ -184,9 +184,10 @@ describe('SwapState state machine', () => {
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return [CONCLUDING, FAILED] for DEPOSIT_COVERED', () => {
+    it('should return [DEPOSIT_COVERED, CONCLUDING, FAILED] for DEPOSIT_COVERED', () => {
       const nextStates = getValidNextStates(SwapState.DEPOSIT_COVERED);
-      expect(nextStates).toHaveLength(2);
+      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toContain(SwapState.DEPOSIT_COVERED); // self-transition for metadata updates
       expect(nextStates).toContain(SwapState.CONCLUDING);
       expect(nextStates).toContain(SwapState.FAILED);
     });
