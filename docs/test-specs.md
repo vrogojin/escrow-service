@@ -264,7 +264,7 @@ async function createLiveTestContext(): Promise<LiveTestContext>;
 
 ### 2.1 State Machine — `state-machine.test.ts`
 
-**~38 tests** covering the new 10-state machine defined in `docs/architecture.md`.
+**~41 tests** covering the new 10-state machine defined in `docs/architecture.md`.
 
 The new state enum replaces the old one:
 
@@ -337,13 +337,16 @@ should return false for DEPOSIT_COVERED
 should return false for CONCLUDING
 ```
 
-#### `getValidNextStates()` (~5 tests)
+#### `getValidNextStates()` (~8 tests)
 
 ```
 should return [DEPOSIT_INVOICE_CREATED, FAILED] for ANNOUNCED
 should return [PARTIAL_DEPOSIT, DEPOSIT_COVERED, TIMED_OUT, FAILED] for DEPOSIT_INVOICE_CREATED
 should return [DEPOSIT_COVERED, TIMED_OUT, FAILED] for PARTIAL_DEPOSIT
+should return [CONCLUDING, FAILED] for DEPOSIT_COVERED
 should return [COMPLETED, FAILED] for CONCLUDING
+should return [CANCELLING, DEPOSIT_COVERED, FAILED] for TIMED_OUT
+should return [CANCELLED, DEPOSIT_COVERED, FAILED] for CANCELLING
 should return empty array for terminal states
 ```
 
@@ -445,7 +448,7 @@ should not starve legitimate deposit processing when flooded with wrong-currency
 should create invoice with escrow DIRECT address as single target
 should create invoice with two coin assets (party A currency + party B currency)
 should set memo to "Escrow deposit for swap <swap_id>"
-should set dueDate to now + timeout * 1000 (informational only)
+should set dueDate to swap.created_at + timeout * 1000 (informational only)
 ```
 
 #### `createPayoutInvoice()` (~3 tests)
@@ -500,7 +503,7 @@ should not extend timeout window when re-registering after crash (if first_depos
 
 ### 2.5 MessageHandler — `message-handler.test.ts`
 
-**~25 tests** covering the DM-based protocol from `docs/protocol-spec.md`.
+**~24 tests** covering the DM-based protocol from `docs/protocol-spec.md`.
 
 #### `announce` Message (~9 tests)
 
@@ -1115,7 +1118,7 @@ Every message type from `docs/protocol-spec.md` §1.1 and §1.2:
 | Escrow → Party | `status_result` | message-handler.test.ts §status |
 | Escrow → Party | `payment_confirmation` | swap-lifecycle §DM Integration |
 | Escrow → Party | `swap_cancelled` | swap-lifecycle §Timeout |
-| Escrow → Party | `bounce_notification` | swap-orchestrator §invoice:covered (bounce DM delivery) |
+| Escrow → Party | `bounce_notification` | swap-orchestrator §invoice:payment (wrong-currency bounce), swap-orchestrator §invoice:covered (bounce DM delivery) |
 | Party → Escrow | `deposit_instructions` | message-handler.test.ts §Legacy Message (alias for request_invoice) |
 | Escrow → Party | `error` | message-handler.test.ts §announce (validation failure), E.5 |
 
@@ -1151,16 +1154,16 @@ The live E2E tests cover the complete trader-creation → topup → escrow → e
 
 | Category | File | Count |
 |---|---|---|
-| **Unit** | state-machine.test.ts | ~38 |
+| **Unit** | state-machine.test.ts | ~41 |
 | | swap-orchestrator.test.ts | ~55 |
 | | invoice-manager.test.ts | ~14 |
 | | timeout-manager.test.ts | ~14 |
-| | message-handler.test.ts | ~25 |
+| | message-handler.test.ts | ~24 |
 | | swap-state-store.test.ts | ~12 |
 | | manifest-validator.test.ts | ~4 |
 | | deposit-validation.test.ts | ~14 |
 | | crash-recovery.test.ts | ~41 |
-| **Unit subtotal** | | **~217** |
+| **Unit subtotal** | | **~219** |
 | **Integration** | swap-lifecycle.integration.test.ts | ~25 |
 | **Live E2E** | swap-lifecycle.e2e-live.test.ts | ~22 |
-| **Total** | | **~264** |
+| **Total** | | **~266** |

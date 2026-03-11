@@ -113,8 +113,8 @@ Invoice IDs in the AccountingModule are `SHA-256(canonicalSerialize(InvoiceTerms
 When gap #8 is available, the escrow passes `createdAt: swap.created_at` (the swap's announcement timestamp from SwapStateStore) to all `createInvoice()` calls. With this, all invoice terms are fully deterministic from swap state:
 
 - **Deposit invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, dueDate: swap.created_at + timeout*1000, memo: "Escrow deposit for swap <swap_id>", targets: [...] }))`
-- **Payout A invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, memo: "Swap <swap_id> payout to Party A", dueDate: undefined (serializes as null), targets: [{ address: resolvedPartyA, ... }] }))`
-- **Payout B invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, memo: "Swap <swap_id> payout to Party B", dueDate: undefined (serializes as null), targets: [{ address: resolvedPartyB, ... }] }))`
+- **Payout A invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, memo: "Swap <swap_id> payout to Party A", dueDate: undefined (serializes as null), targets: [{ address: resolvedPartyA, assets: [{ coin: [partyB_currency, partyB_value] }] }] }))`
+- **Payout B invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, memo: "Swap <swap_id> payout to Party B", dueDate: undefined (serializes as null), targets: [{ address: resolvedPartyB, assets: [{ coin: [partyA_currency, partyA_value] }] }] }))`
 
 **Collision resistance:** All three invoice types embed the `swap_id` in their memos: deposit (`"Escrow deposit for swap <swap_id>"`), payout A (`"Swap <swap_id> payout to Party A"`), and payout B (`"Swap <swap_id> payout to Party B"`). Since `swap_id` is a content-addressed hash of the manifest, this ensures unique invoice IDs across swaps. Any change to the memo format must preserve `swap_id` embedding in all three — it is load-bearing for collision prevention.
 
@@ -281,7 +281,9 @@ COMPLETED
 | `DEPOSIT_COVERED` | `CONCLUDING` | Orchestrator starts conclusion |
 | `CONCLUDING` | `COMPLETED` | Both payout invoices paid |
 | `TIMED_OUT` | `CANCELLING` | `cancelInvoice()` called |
+| `TIMED_OUT` | `DEPOSIT_COVERED` | Cross-terminal race: coverage confirmed after timeout — `cancelInvoice()` throws `INVOICE_ALREADY_CLOSED` (SDK closed on coverage), abort cancellation and resume conclusion |
 | `CANCELLING` | `CANCELLED` | `invoice:cancelled` event fires (during `cancelInvoice()`, before auto-return begins) |
+| `CANCELLING` | `DEPOSIT_COVERED` | Cross-terminal race: `cancelInvoice()` throws `INVOICE_ALREADY_CLOSED` — coverage won, abort cancellation and resume conclusion |
 | Any non-terminal | `FAILED` | Unrecoverable error (invoice creation failure, payout failure, persistence failure) |
 
 ## Event-Driven Flow
@@ -418,6 +420,7 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 | `DEPOSIT_COVERED` | `OPEN` or `PARTIAL` or `EXPIRED` | Coverage regressed during crash window — auto-returns or late return-direction transfers reduced `netCoveredAmount` below threshold. Re-validate per-currency coverage (check each `coinAssets[i]` individually). If both currency slots are still individually covered at the required amounts, proceed with conclusion. If not, revert swap to `PARTIAL_DEPOSIT`, re-subscribe to events, and re-register timeout with remaining time. |
 | `DEPOSIT_COVERED` | `CANCELLED` | Deposit cancelled after coverage (e.g., admin action during crash window) — check if deposits were auto-returned (inspect auto-return dedup ledger). If all returned, transition to `CANCELLED`. If partially returned or no returns, transition to `FAILED` for manual intervention. |
 | `DEPOSIT_COVERED` | `CLOSED` | Deposit closed before payouts created — create payout invoices if missing, persist as `CONCLUDING`, then proceed with payouts |
+| `CONCLUDING` | `OPEN` or `COVERED` | Deposit invoice not yet closed (crash between `DEPOSIT_COVERED` persist and `closeInvoice()`) — call `closeInvoice(depositInvoiceId)` first, then proceed with payout creation as in the `CLOSED` path |
 | `CONCLUDING` | `CLOSED` | Payouts may be partially complete — check each payout invoice individually (see below) |
 | `TIMED_OUT` | any | Call `cancelInvoice()` — idempotent if already cancelled |
 | `CANCELLING` | `CANCELLED` | Transition to `CANCELLED` |
@@ -443,7 +446,7 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 To minimize recovery complexity, the escrow follows a **persist-before-act** pattern:
 
 1. Before `createInvoice()`: persist the swap in `ANNOUNCED` state with `deposit_invoice_id = null`. If `createInvoice()` succeeds, update the stored `deposit_invoice_id` to the actual value before delivering tokens. If the process crashes between `createInvoice()` and the update, orphaned invoice recovery (step 4 above) handles it — either via deterministic ID re-derivation (with gap #8) or memo-based scanning (without gap #8).
-2. Before `payInvoice()` calls: persist state as `CONCLUDING` with both payout invoice IDs populated (note: this happens after `closeInvoice()` and payout invoice creation — see covered handler steps 6-7)
+2. Before `payInvoice()` calls: persist state as `CONCLUDING` with both payout invoice IDs populated (note: this happens after `closeInvoice()` (step 6), payout invoice creation (step 7), and the persist itself (step 8) of the `invoice:covered` handler)
 3. Before `cancelInvoice()`: persist state as `TIMED_OUT`
 
 This ensures that on crash, the SwapStateStore always reflects the intended action, and the idempotent AccountingModule operations can safely resume.
