@@ -338,9 +338,12 @@ timeoutManager.schedule(swapId, timeoutMs, async () => {
   const swap = await stateStore.findBySwapId(swapId);
   if (swap.state !== SwapState.PARTIAL_DEPOSIT &&
       swap.state !== SwapState.DEPOSIT_INVOICE_CREATED) return;
-  // 2. Persist TIMED_OUT before calling cancelInvoice (persist-before-act)
-  await stateStore.updateState(swapId, SwapState.TIMED_OUT, swap.version);
-  // 3. Cancel deposit invoice
+  // 2. Persist TIMED_OUT (persist-before-act)
+  const v1 = await stateStore.updateState(swapId, SwapState.TIMED_OUT, swap.version);
+  // 3. Persist CANCELLING — required because invoice:cancelled fires
+  //    synchronously during cancelInvoice() and its handler expects CANCELLING state
+  await stateStore.updateState(swapId, SwapState.CANCELLING, v1);
+  // 4. Cancel deposit invoice
   try {
     await accounting.cancelInvoice(depositInvoiceId, { autoReturn: true });
     // cancelInvoice freezes balances, fires invoice:cancelled event,
@@ -438,8 +441,13 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 | `DEPOSIT_COVERED` | `CLOSED` | Deposit closed before payouts created — create payout invoices if missing, persist as `CONCLUDING`, then proceed with payouts |
 | `CONCLUDING` | `OPEN` or `COVERED` | Deposit invoice not yet closed (crash between `DEPOSIT_COVERED` persist and `closeInvoice()`) — call `closeInvoice(depositInvoiceId)` first, then proceed with payout creation as in the `CLOSED` path |
 | `CONCLUDING` | `CLOSED` | Payouts may be partially complete — check each payout invoice individually (see below) |
-| `TIMED_OUT` | any | Call `cancelInvoice()` — idempotent if already cancelled |
-| `CANCELLING` | `CANCELLED` | Transition to `CANCELLED` |
+| `TIMED_OUT` | `OPEN` or `PARTIAL` or `EXPIRED` | Call `cancelInvoice({ autoReturn: true })` — normal timeout cancellation path |
+| `TIMED_OUT` | `COVERED` | Coverage arrived before `closeInvoice()` — call `closeInvoice(depositInvoiceId)`, reconcile swap to `DEPOSIT_COVERED`, resume conclusion (do NOT call `cancelInvoice()` — that would destroy covered funds) |
+| `TIMED_OUT` | `CLOSED` | Coverage won and deposit already closed — reconcile swap to `DEPOSIT_COVERED`, resume conclusion |
+| `TIMED_OUT` | `CANCELLED` | Cancel completed during crash — transition to `CANCELLED` |
+| `CANCELLING` | `OPEN` or `PARTIAL` or `EXPIRED` | `cancelInvoice()` not yet called or interrupted — call `cancelInvoice({ autoReturn: true })` to complete the cancellation |
+| `CANCELLING` | `COVERED` | Coverage won the race — call `closeInvoice(depositInvoiceId)`, reconcile swap to `DEPOSIT_COVERED`, resume conclusion (mirrors `CANCELLING → DEPOSIT_COVERED` transition) |
+| `CANCELLING` | `CANCELLED` | Cancellation completed — transition to `CANCELLED` |
 
 4. **Orphaned invoice recovery:** If `createInvoice()` succeeded but the subsequent SwapStateStore write failed, the invoice exists in the AccountingModule but the swap record's `deposit_invoice_id` is null. On startup, for any swap in `ANNOUNCED` state with `deposit_invoice_id = null`:
 
@@ -463,7 +471,7 @@ To minimize recovery complexity, the escrow follows a **persist-before-act** pat
 
 1. Before `createInvoice()`: persist the swap in `ANNOUNCED` state with `deposit_invoice_id = null`. If `createInvoice()` succeeds, update the stored `deposit_invoice_id` to the actual value before delivering tokens. If the process crashes between `createInvoice()` and the update, orphaned invoice recovery (step 4 above) handles it — either via deterministic ID re-derivation (with gap #8) or memo-based scanning (without gap #8).
 2. Before `payInvoice()` calls: persist state as `CONCLUDING` with both payout invoice IDs populated (note: this happens after `closeInvoice()` (step 6), payout invoice creation (step 7), and the persist itself (step 8) of the `invoice:covered` handler)
-3. Before `cancelInvoice()`: persist state as `TIMED_OUT`
+3. Before `cancelInvoice()`: persist state as `TIMED_OUT`, then persist state as `CANCELLING` (the `invoice:cancelled` event fires synchronously during `cancelInvoice()` and its handler expects the swap to be in `CANCELLING` state)
 
 This ensures that on crash, the SwapStateStore always reflects the intended action, and the idempotent AccountingModule operations can safely resume.
 
