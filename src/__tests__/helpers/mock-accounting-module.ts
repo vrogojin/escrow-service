@@ -154,40 +154,68 @@ export class MockAccountingModule {
   private invoices = new Map<string, MockInvoiceState>();
   private handlers = new Map<string, Set<Function>>();
   private callOrder: string[] = [];
+  // Track concurrent createInvoice calls by canonical terms to detect concurrent duplicate creates
+  private inFlightCreates = new Map<string, Promise<string>>();
 
   /**
    * Creates a new invoice with a deterministic ID based on canonical terms.
+   * Throws INVOICE_ALREADY_EXISTS only if two concurrent createInvoice calls
+   * with identical terms are in flight simultaneously (detected via inFlightCreates set).
    */
-  async createInvoice(request: CreateInvoiceRequest): Promise<CreateInvoiceResult> {
+  async createInvoice(request: CreateInvoiceRequest & { createdAt?: number }): Promise<CreateInvoiceResult> {
     const terms: InvoiceTerms = {
       targets: request.targets,
       dueDate: request.dueDate,
       memo: request.memo,
       deliveryMethods: request.deliveryMethods,
       anonymous: request.anonymous,
+      creator: (request as any).creator, // Optional field from SDK gap #8 shim
     };
+
+    // Add createdAt to terms if provided (SDK gap #8 shim)
+    if ((request as any).createdAt !== undefined) {
+      (terms as any).createdAt = (request as any).createdAt;
+    }
 
     const canonical = (canonicalize as any)(terms);
     const invoiceId = createHash('sha256').update(canonical).digest('hex');
 
-    const state: MockInvoiceState = {
-      terms,
-      state: 'OPEN',
-      transfers: [],
-      senderBalances: [],
-      isClosed: false,
-      isCancelled: false,
-    };
+    // Check if another concurrent createInvoice is in flight with the same terms
+    // Use a synchronous set to track in-flight creates (no promises, just a flag)
+    if (this.inFlightCreates.has(canonical)) {
+      // Another concurrent call is already creating this invoice
+      throw new SphereError(
+        'Invoice with these terms already exists in this process',
+        'INVOICE_ALREADY_EXISTS' as any,
+      );
+    }
 
-    this.invoices.set(invoiceId, state);
-    this.callOrder.push('createInvoice');
+    // Mark this create as in flight (synchronously set a flag)
+    this.inFlightCreates.set(canonical, Promise.resolve(invoiceId));
 
-    return {
-      success: true,
-      invoiceId,
-      token: {} as any, // Mock token object
-      terms,
-    };
+    try {
+      const state: MockInvoiceState = {
+        terms,
+        state: 'OPEN',
+        transfers: [],
+        senderBalances: [],
+        isClosed: false,
+        isCancelled: false,
+      };
+
+      this.invoices.set(invoiceId, state);
+      this.callOrder.push('createInvoice');
+
+      return {
+        success: true,
+        invoiceId,
+        token: {} as any, // Mock token object
+        terms,
+      };
+    } finally {
+      // Clean up the in-flight marker immediately after completion
+      this.inFlightCreates.delete(canonical);
+    }
   }
 
   /**
@@ -426,26 +454,31 @@ export class MockAccountingModule {
     state.transfers.push(transfer);
 
     // Update or create sender balance
-    const effectiveSender = transfer.refundAddress ?? transfer.senderAddress ?? 'unknown';
-    const existingIdx = state.senderBalances.findIndex((sb) => sb.senderAddress === effectiveSender);
-    if (existingIdx === -1) {
-      state.senderBalances.push({
-        senderAddress: effectiveSender,
-        netBalance: transfer.amount,
-        forwardedAmount: transfer.amount,
-        returnedAmount: '0',
-        contacts: [],
-      });
-    } else {
-      // Create a new balance object since senderBalances are immutable
-      const old = state.senderBalances[existingIdx];
-      const newForwarded = String(BigInt(old.forwardedAmount) + BigInt(transfer.amount));
-      const newNet = String(BigInt(newForwarded) - BigInt(old.returnedAmount));
-      state.senderBalances[existingIdx] = {
-        ...old,
-        forwardedAmount: newForwarded,
-        netBalance: newNet,
-      };
+    const effectiveSender = transfer.refundAddress ?? transfer.senderAddress;
+
+    // Only update senderBalance if we have an effective sender
+    // (masked predicate with no refund address means no return route)
+    if (effectiveSender) {
+      const existingIdx = state.senderBalances.findIndex((sb) => sb.senderAddress === effectiveSender);
+      if (existingIdx === -1) {
+        state.senderBalances.push({
+          senderAddress: effectiveSender,
+          netBalance: transfer.amount,
+          forwardedAmount: transfer.amount,
+          returnedAmount: '0',
+          contacts: [],
+        });
+      } else {
+        // Create a new balance object since senderBalances are immutable
+        const old = state.senderBalances[existingIdx];
+        const newForwarded = String(BigInt(old.forwardedAmount) + BigInt(transfer.amount));
+        const newNet = String(BigInt(newForwarded) - BigInt(old.returnedAmount));
+        state.senderBalances[existingIdx] = {
+          ...old,
+          forwardedAmount: newForwarded,
+          netBalance: newNet,
+        };
+      }
     }
 
     // Fire event
@@ -548,5 +581,6 @@ export class MockAccountingModule {
     this.invoices.clear();
     this.handlers.clear();
     this.callOrder = [];
+    this.inFlightCreates.clear();
   }
 }

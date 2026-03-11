@@ -184,11 +184,35 @@ describe('SwapState state machine', () => {
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return [DEPOSIT_COVERED, CONCLUDING, FAILED] for DEPOSIT_COVERED', () => {
+    it('should return [DEPOSIT_COVERED, CONCLUDING, FAILED] for DEPOSIT_COVERED (includes self-transition)', () => {
       const nextStates = getValidNextStates(SwapState.DEPOSIT_COVERED);
       expect(nextStates).toHaveLength(3);
       expect(nextStates).toContain(SwapState.DEPOSIT_COVERED); // self-transition for metadata updates
       expect(nextStates).toContain(SwapState.CONCLUDING);
+      expect(nextStates).toContain(SwapState.FAILED);
+    });
+
+    it('should return [CONCLUDING, COMPLETED, FAILED] for CONCLUDING (includes self-transition)', () => {
+      const nextStates = getValidNextStates(SwapState.CONCLUDING);
+      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toContain(SwapState.CONCLUDING); // self-transition for metadata updates
+      expect(nextStates).toContain(SwapState.COMPLETED);
+      expect(nextStates).toContain(SwapState.FAILED);
+    });
+
+    it('should return [DEPOSIT_COVERED, CANCELLING, FAILED] for TIMED_OUT', () => {
+      const nextStates = getValidNextStates(SwapState.TIMED_OUT);
+      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toContain(SwapState.DEPOSIT_COVERED); // coverage won the race
+      expect(nextStates).toContain(SwapState.CANCELLING);
+      expect(nextStates).toContain(SwapState.FAILED);
+    });
+
+    it('should return [DEPOSIT_COVERED, CANCELLED, FAILED] for CANCELLING', () => {
+      const nextStates = getValidNextStates(SwapState.CANCELLING);
+      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toContain(SwapState.DEPOSIT_COVERED); // coverage won the race
+      expect(nextStates).toContain(SwapState.CANCELLED);
       expect(nextStates).toContain(SwapState.FAILED);
     });
 

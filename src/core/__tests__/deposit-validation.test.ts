@@ -137,7 +137,7 @@ describe('validateDeposit', () => {
     expect(result.reason).toBeUndefined();
   });
 
-  it('should accept deposit with null senderAddress (masked predicate) if currency matches', () => {
+  it('should reject deposit with null senderAddress AND null refundAddress (masked predicate without return route)', () => {
     const transfer = createMockTransferRef({
       transferId: 'tx1',
       senderAddress: null,
@@ -145,8 +145,22 @@ describe('validateDeposit', () => {
       coinId: 'USD',
     });
     const result = validateDeposit(transfer, MANIFEST);
+    expect(result.partySide).toBeNull();
+    expect(result.reason).toBe('MASKED_NO_REFUND');
+  });
+
+  it('should accept deposit with null senderAddress but present refundAddress (masked predicate with return route)', () => {
+    const transfer = createMockTransferRef({
+      transferId: 'tx1',
+      senderAddress: null,
+      refundAddress: 'DIRECT://0xrefund',
+      amount: '1000000',
+      coinId: 'USD',
+    });
+    const result = validateDeposit(transfer, MANIFEST);
     expect(result.partySide).toBe('A');
     expect(result.reason).toBeUndefined();
+    expect(result.effectiveSender).toBe('DIRECT://0xrefund');
   });
 
   it('should populate effectiveSender from refundAddress ?? senderAddress', () => {

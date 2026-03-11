@@ -76,6 +76,47 @@ describe('Message Handler', () => {
 
     // Mock invoice manager
     mockInvoiceManager = {
+      getInvoiceStatus: vi.fn().mockResolvedValue({
+        invoiceId: 'inv_' + 'a'.repeat(60),
+        state: 'OPEN',
+        targets: [
+          {
+            address: ESCROW_ADDRESS,
+            coinAssets: [
+              {
+                coin: ['UCT', '1000'],
+                coveredAmount: '0',
+                returnedAmount: '0',
+                netCoveredAmount: '0',
+                isCovered: false,
+                surplusAmount: '0',
+                confirmed: false,
+                transfers: [],
+                senderBalances: [],
+              },
+              {
+                coin: ['USDU', '1000'],
+                coveredAmount: '0',
+                returnedAmount: '0',
+                netCoveredAmount: '0',
+                isCovered: false,
+                surplusAmount: '0',
+                confirmed: false,
+                transfers: [],
+                senderBalances: [],
+              },
+            ],
+            nftAssets: [],
+            isCovered: false,
+            confirmed: false,
+          },
+        ],
+        irrelevantTransfers: [],
+        totalForward: {},
+        totalBack: {},
+        allConfirmed: false,
+        lastActivityAt: Date.now(),
+      }),
       getDepositInvoiceToken: vi.fn().mockResolvedValue({ token: 'deposit_token' }),
       getPayoutInvoiceToken: vi.fn().mockResolvedValue({ token: 'payout_token' }),
     };
