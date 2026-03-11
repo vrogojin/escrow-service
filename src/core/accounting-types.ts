@@ -31,6 +31,7 @@ export interface InvoiceTarget {
 /** Invoice terms as specified when creating an invoice. */
 export interface InvoiceTerms {
   targets?: InvoiceTarget[];
+  createdAt?: number;
   dueDate?: number;
   memo?: string;
   deliveryMethods?: string[];
@@ -40,6 +41,7 @@ export interface InvoiceTerms {
 /** Parameters for createInvoice(). */
 export interface CreateInvoiceRequest {
   targets: InvoiceTarget[];
+  createdAt?: number;
   dueDate?: number;
   memo?: string;
   deliveryMethods?: string[];
@@ -96,6 +98,16 @@ export interface InvoiceTransferRef {
 }
 
 // =============================================================================
+// Sender balance tracking
+// =============================================================================
+
+/** Per-sender balance summary within an invoice (keyed by effectiveSender). */
+export interface InvoiceSenderBalance {
+  readonly senderAddress: string;
+  readonly netBalance: string;
+}
+
+// =============================================================================
 // Invoice status
 // =============================================================================
 
@@ -109,7 +121,7 @@ export interface InvoiceCoinAssetStatus {
   readonly surplusAmount: string;
   readonly confirmed: boolean;
   readonly transfers: InvoiceTransferRef[];
-  readonly senderBalances: unknown[];
+  readonly senderBalances: InvoiceSenderBalance[];
 }
 
 /** Per-target status within an invoice. */

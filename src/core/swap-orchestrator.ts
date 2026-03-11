@@ -370,17 +370,32 @@ export class SwapOrchestrator {
     }
 
     // State guard: ignore if already covered or concluding.
-    // Do NOT attempt to bounce — the deposit invoice is already closed (or being
-    // closed) by _onInvoiceCovered(), so returnInvoicePayment would fail.
-    // Late payments on a closed invoice are handled by the SDK's auto-return.
+    // These payments arrive after the deposit invoice is closed/being-closed.
+    // Send a bounce notification before returning.
     if (
       swap.state === SwapState.DEPOSIT_COVERED ||
       swap.state === SwapState.CONCLUDING
     ) {
       logger.debug(
         { swap_id: swap.swap_id, state: swap.state, transferId: transfer.transferId },
-        'invoice:payment — deposit already covered/concluding, ignoring (SDK handles auto-return on closed invoice)',
+        'invoice:payment — deposit already covered/concluding, sending bounce_notification with reason ALREADY_COVERED',
       );
+      // Send bounce notification to the effective sender
+      const effectiveSender = getEffectiveSender(transfer);
+      if (effectiveSender) {
+        await this.messageSender.sendToAddress(effectiveSender, {
+          type: 'bounce_notification',
+          swap_id: swap.swap_id,
+          reason: 'ALREADY_COVERED',
+          returned_amount: transfer.amount,
+          returned_currency: transfer.coinId,
+        }).catch((err) => {
+          logger.warn(
+            { err, swap_id: swap.swap_id, transferId: transfer.transferId },
+            'Failed to send ALREADY_COVERED bounce_notification',
+          );
+        });
+      }
       return;
     }
 
@@ -500,11 +515,11 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Re-validate per-currency-slot coverage with amount thresholds:
-    // the SDK's invoice:covered means both asset slots are fully covered.
-    // We verify each slot's cumulative forward amount meets the manifest's
-    // required value. Sender identity is NOT checked — anyone can deposit
-    // on behalf of A or B.
+    // Re-validate per-currency-slot coverage using SDK's isCovered and netCoveredAmount fields.
+    // Per architecture.md §Deposit Validation: verify that both coinAssets are individually
+    // covered at the required amounts. The SDK's invoice:covered means aggregate coverage,
+    // but does not guarantee per-slot satisfaction (e.g., overpayment of one currency
+    // while the other remains uncovered).
     let invoiceStatus;
     try {
       invoiceStatus = await this.invoiceManager.getInvoiceStatus(invoiceId);
@@ -532,34 +547,24 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Validate each slot's cumulative forward amount meets the required value
-    const slotAAmount = assetA.transfers
-      .filter(
-        (t) => t.paymentDirection === 'forward' &&
-               t.coinId === swap.manifest.party_a_currency_to_change,
-      )
-      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
-
-    const slotBAmount = assetB.transfers
-      .filter(
-        (t) => t.paymentDirection === 'forward' &&
-               t.coinId === swap.manifest.party_b_currency_to_change,
-      )
-      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
-
+    // Validate each asset slot's coverage using SDK-provided fields per architecture.md
     const requiredA = BigInt(swap.manifest.party_a_value_to_change);
     const requiredB = BigInt(swap.manifest.party_b_value_to_change);
+    const coveredA = BigInt(assetA.netCoveredAmount);
+    const coveredB = BigInt(assetB.netCoveredAmount);
 
-    if (slotAAmount < requiredA || slotBAmount < requiredB) {
+    if (!assetA.isCovered || coveredA < requiredA || !assetB.isCovered || coveredB < requiredB) {
       logger.warn(
         {
           swap_id: swap.swap_id,
-          slotAAmount: String(slotAAmount),
-          slotBAmount: String(slotBAmount),
+          assetA_covered: assetA.isCovered,
+          assetA_amount: assetA.netCoveredAmount,
           requiredA: String(requiredA),
+          assetB_covered: assetB.isCovered,
+          assetB_amount: assetB.netCoveredAmount,
           requiredB: String(requiredB),
         },
-        'invoice:covered — per-slot amount coverage validation failed, waiting',
+        'invoice:covered — per-currency-slot coverage validation failed, waiting for correct currencies',
       );
       return;
     }
@@ -1086,9 +1091,10 @@ export class SwapOrchestrator {
   /**
    * Returns surplus deposits to their original payers after a successful swap.
    *
-   * After payouts complete, the deposit invoice may hold surplus amounts
-   * (overpayment by any depositor). This method iterates senderBalances for
-   * each coin asset and returns any positive netBalance to the effectiveSender.
+   * Per architecture.md §Surplus routing: iterates the deposit invoice's transfer
+   * list (via coinAsset.transfers), groups by effectiveSender (refundAddress ?? senderAddress),
+   * sums forward amounts, and returns surplus to each sender. Skips transfers where
+   * effectiveSender is null (masked predicates with no refund address).
    *
    * Best-effort: failures are logged but do not block COMPLETED transition.
    */
@@ -1100,40 +1106,49 @@ export class SwapOrchestrator {
       const target = status.targets[0];
       if (!target) return;
 
+      // For each coin asset, iterate transfers, group by effectiveSender, sum forward amounts.
+      // The coinAsset.transfers list contains all transfers for that asset.
       for (const coinAsset of target.coinAssets) {
-        // senderBalances is typed as unknown[] in our duck-typed interface.
-        // The SDK's InvoiceSenderBalance.senderAddress IS the effectiveSender
-        // (refundAddress ?? senderAddress) — see SDK types.ts:155-162.
-        const senderBalances = coinAsset.senderBalances as Array<{
-          senderAddress: string; // effectiveSender per SDK contract
-          netBalance: string;
-        }>;
-        if (!Array.isArray(senderBalances)) continue;
+        // Group transfers by effectiveSender and sum forward amounts
+        const surplusByEffectiveSender = new Map<string, bigint>();
 
-        for (const sb of senderBalances) {
-          const netBalance = BigInt(sb.netBalance || '0');
-          if (netBalance <= 0n) continue;
+        for (const transfer of coinAsset.transfers) {
+          // Only sum forward transfers (not bounces/returns)
+          if (transfer.paymentDirection !== 'forward') continue;
 
-          // There's surplus for this sender — compute how much is surplus
-          // (netBalance = forwarded - returned). After payouts, any remaining
-          // netBalance in the deposit invoice is surplus.
-          // We need to know how much was consumed by payouts vs. what remains.
-          // The SDK's senderBalances.netBalance already accounts for returns.
-          // Any positive netBalance AFTER payouts means unclaimed surplus.
+          const effectiveSender = getEffectiveSender(transfer);
+          if (!effectiveSender) {
+            // Masked predicate with no refund address — cannot route return
+            logger.warn(
+              {
+                swap_id: swap.swap_id,
+                transferId: transfer.transferId,
+              },
+              'Cannot return surplus for transfer: no return address (masked predicate with no refundAddress)',
+            );
+            continue;
+          }
 
+          const amount = BigInt(transfer.amount);
+          const current = surplusByEffectiveSender.get(effectiveSender) ?? 0n;
+          surplusByEffectiveSender.set(effectiveSender, current + amount);
+        }
+
+        // For each effective sender with surplus, return it
+        for (const [effectiveSender, surplusAmount] of surplusByEffectiveSender) {
           try {
             await this.invoiceManager.returnPayment(swap.deposit_invoice_id, {
-              recipient: sb.senderAddress,
-              amount: netBalance.toString(),
+              recipient: effectiveSender,
+              amount: surplusAmount.toString(),
               coinId: coinAsset.coin[0],
               freeText: `Surplus return for swap ${swap.swap_id}`,
             });
             logger.info(
               {
                 swap_id: swap.swap_id,
-                recipient: sb.senderAddress,
+                recipient: effectiveSender,
                 coinId: coinAsset.coin[0],
-                amount: netBalance.toString(),
+                amount: surplusAmount.toString(),
               },
               'Surplus returned to depositor',
             );
@@ -1143,9 +1158,9 @@ export class SwapOrchestrator {
               {
                 err,
                 swap_id: swap.swap_id,
-                recipient: sb.senderAddress,
+                recipient: effectiveSender,
                 coinId: coinAsset.coin[0],
-                amount: netBalance.toString(),
+                amount: surplusAmount.toString(),
               },
               'Failed to return surplus to depositor (best-effort)',
             );

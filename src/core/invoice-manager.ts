@@ -15,6 +15,7 @@ import type {
   ReturnPaymentParams,
 } from './accounting-types.js';
 import type { SwapManifest } from './manifest-validator.js';
+import { normalizeDirectAddress } from './swap-state-store.js';
 
 /** Minimal event emitter interface satisfied by Sphere.on()/off(). */
 export interface EventSource {
@@ -47,7 +48,8 @@ export class InvoiceManager {
 
   constructor(deps: InvoiceManagerDeps) {
     this.accounting = deps.accounting;
-    this.escrowAddress = deps.escrowAddress;
+    // Normalize escrow address for deterministic invoice ID derivation
+    this.escrowAddress = normalizeDirectAddress(deps.escrowAddress);
     // Use explicit eventSource if provided; fall back to accounting (works for mocks with on/off).
     this.eventSource = deps.eventSource ?? (deps.accounting as unknown as EventSource);
   }
@@ -59,9 +61,11 @@ export class InvoiceManager {
    * assets — one per party. Both parties pay into this single invoice.
    *
    * @param manifest - The validated swap manifest.
+   * @param createdAt - (optional) The swap's creation timestamp for deterministic invoice IDs.
    * @returns The invoice creation result, including the invoiceId token.
    */
-  async createDepositInvoice(manifest: SwapManifest): Promise<CreateInvoiceResult> {
+  async createDepositInvoice(manifest: SwapManifest, createdAt?: number): Promise<CreateInvoiceResult> {
+    // TODO (SDK gap #8): pass createdAt to createInvoice() once SDK supports it
     return this.accounting.createInvoice({
       targets: [
         {
@@ -73,7 +77,8 @@ export class InvoiceManager {
         },
       ],
       memo: `Escrow deposit for swap ${manifest.swap_id}`,
-      dueDate: Date.now() + manifest.timeout * 1000,
+      dueDate: (createdAt ?? Date.now()) + manifest.timeout * 1000,
+      // createdAt: createdAt,  // TODO (SDK gap #8): enable for deterministic invoice IDs
     });
   }
 
@@ -88,6 +93,7 @@ export class InvoiceManager {
    * @param coinId - The coin ID the party will receive.
    * @param amount - The amount (smallest units) the party will receive.
    * @param partyLabel - 'A' or 'B' label used in the memo.
+   * @param createdAt - (optional) The swap's creation timestamp for deterministic invoice IDs.
    * @returns The invoice creation result.
    */
   async createPayoutInvoice(
@@ -96,7 +102,9 @@ export class InvoiceManager {
     coinId: string,
     amount: string,
     partyLabel: 'A' | 'B',
+    createdAt?: number,
   ): Promise<CreateInvoiceResult> {
+    // TODO (SDK gap #8): pass createdAt to createInvoice() once SDK supports it
     return this.accounting.createInvoice({
       targets: [
         {
@@ -105,6 +113,7 @@ export class InvoiceManager {
         },
       ],
       memo: `Swap ${swapId} payout to Party ${partyLabel}`,
+      // createdAt: createdAt,  // TODO (SDK gap #8): enable for deterministic invoice IDs
     });
   }
 

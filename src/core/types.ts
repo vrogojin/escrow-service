@@ -58,12 +58,12 @@ export interface SwapStateStore {
  * Party side is determined by coinId (currency type), not sender address.
  */
 export interface DepositValidationResult {
-  partySide: 'A' | 'B' | null; // null = wrong currency (coinId matches neither asset)
+  partySide: 'A' | 'B' | null; // null = invalid/rejected deposit
   effectiveSender: string | null; // refundAddress ?? senderAddress (for return routing)
   coinId: string;
   amount: string;
   transferId: string;
-  reason?: 'WRONG_CURRENCY';
+  reason?: 'WRONG_CURRENCY' | 'MASKED_NO_REFUND';
 }
 
 /**

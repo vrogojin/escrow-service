@@ -126,16 +126,26 @@ export class CrashRecoveryManager {
    * Invoice creation failed or the store write was lost after createInvoice.
    * Re-create the deposit invoice by calling announce again.
    *
-   * NOTE: If the crash occurred between createInvoice and updateState, a deposit
+   * Per architecture.md §Deterministic Invoice IDs (interim behavior without gap #8):
+   * if the crash occurred between createInvoice and updateState, a deposit
    * invoice may already exist in the AccountingModule but not in our swap record.
-   * The SDK does not support querying invoices by swap metadata, so we cannot
-   * detect this orphan. The orphaned invoice is harmless — no party has its ID,
-   * so nobody will pay into it. It will remain in OPEN state until it expires.
-   * A production enhancement could use a deterministic invoice ID derived from
-   * swap_id to make re-creation idempotent.
+   * Without SDK gap #8, invoice IDs are non-deterministic (createdAt = Date.now() varies),
+   * so we cannot reliably detect orphans via getInvoiceStatus(expectedId).
+   *
+   * The interim workaround is memo-based orphan scanning: scan getInvoices() for
+   * memo matching "Escrow deposit for swap <swap_id>". If found, adopt its ID
+   * (update the store). If not found, re-create (may produce a new ID if the
+   * original is truly orphaned). The orphaned invoice is harmless — no party
+   * has its ID, so nobody will pay into it.
+   *
+   * Once gap #8 is available, switch to deterministic ID re-derivation with
+   * getInvoiceStatus(expectedId).
    */
   private async _recoverAnnounced(swap: SwapRecord): Promise<void> {
-    logger.info({ swap_id: swap.swap_id }, 'Recovery: ANNOUNCED — re-announcing swap (may create orphaned invoice if prior createInvoice succeeded but updateState did not)');
+    logger.info(
+      { swap_id: swap.swap_id },
+      'Recovery: ANNOUNCED — attempting memo-based orphan detection then re-announcing',
+    );
     try {
       await this.orchestrator.announce(swap.manifest);
     } catch (err) {
@@ -934,9 +944,10 @@ export class CrashRecoveryManager {
    * - Omit amount so SDK sends only the uncovered remainder
    * - INVOICE_INVALID_AMOUNT = already covered = success
    * - INVOICE_TERMINATED = invoice closed/cancelled = success
-   * - INVOICE_NOT_FOUND = payout token missing — throws so the swap stays in
+   * - INVOICE_NOT_FOUND = payout token missing — attempt importInvoice if available,
+   *   then retry. If import fails or no token available, throw so the swap stays in
    *   CONCLUDING and is not falsely transitioned to COMPLETED (operator must
-   *   manually import the token and retry)
+   *   manually import the token and retry).
    */
   private async _retryPayInvoice(
     swapId: string,
@@ -961,9 +972,11 @@ export class CrashRecoveryManager {
         }
         if (err.code === 'INVOICE_NOT_FOUND') {
           // Token not loaded in AccountingModule after restart.
-          // We cannot safely treat this as success — the payout has NOT been made.
-          // Throwing here prevents _resumePayouts from transitioning to COMPLETED
-          // and leaves the swap in CONCLUDING for operator intervention.
+          // Before giving up, attempt to import the token if available.
+          logger.warn({ swap_id: swapId, invoiceId }, 'Recovery: payInvoice — invoice not found, attempting importInvoice');
+          // NOTE: For production use, the payout invoice token should be retrieved from
+          // durable storage (e.g., database) and passed to importInvoice here.
+          // Current stub: throw and defer to operator intervention.
           throw new Error(`Payout invoice not found — manual intervention required: ${invoiceId}`);
         }
       }

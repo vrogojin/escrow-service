@@ -19,8 +19,11 @@ import type { SwapManifest } from './manifest-validator.js';
 /**
  * Normalizes a DIRECT:// address by lowercasing the hex portion
  * while preserving the DIRECT:// prefix.
+ *
+ * Used internally by the store and exported for use by invoice-manager
+ * to ensure consistent address representation for deterministic invoice IDs.
  */
-function normalizeDirectAddress(addr: string): string {
+export function normalizeDirectAddress(addr: string): string {
   if (addr.startsWith('DIRECT://')) {
     return 'DIRECT://' + addr.slice('DIRECT://'.length).toLowerCase();
   }

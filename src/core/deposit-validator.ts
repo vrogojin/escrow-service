@@ -56,9 +56,15 @@ export function getEffectiveSender(transfer: InvoiceTransferRef): string | null 
  * Checks that the transfer's coinId matches one of the two expected currencies.
  * Sender identity is NOT checked — anyone can deposit.
  *
+ * Special case: transfers with masked predicates (senderAddress === null) that
+ * also lack a refundAddress cannot be routed back on error, so they are rejected
+ * with reason 'MASKED_NO_REFUND'. If senderAddress is null BUT refundAddress is
+ * present, the deposit is accepted (currency match takes precedence) and returns
+ * will be routed to the refundAddress.
+ *
  * @param transfer - The invoice transfer reference from getInvoiceStatus().
  * @param manifest - The swap manifest.
- * @returns DepositValidationResult with party side and optional WRONG_CURRENCY reason.
+ * @returns DepositValidationResult with party side and optional rejection reason.
  */
 export function validateDeposit(
   transfer: InvoiceTransferRef,
@@ -70,6 +76,15 @@ export function validateDeposit(
     amount: transfer.amount,
     transferId: transfer.transferId,
   };
+
+  // Reject masked predicates without a refund address (cannot route returns)
+  if (transfer.senderAddress === null && !transfer.refundAddress) {
+    return {
+      ...base,
+      partySide: null,
+      reason: 'MASKED_NO_REFUND',
+    };
+  }
 
   const side = identifyPartySide(transfer.coinId, manifest);
 

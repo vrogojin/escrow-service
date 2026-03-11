@@ -74,6 +74,15 @@ export type InvoiceToken = unknown;
  */
 export interface InvoiceManager {
   /**
+   * Get the current status of an invoice.
+   *
+   * @param invoiceId - The invoice token ID to query.
+   * @returns The full invoice status including per-target per-asset breakdown.
+   * @throws SphereError with code 'INVOICE_NOT_FOUND' if the invoice token is not loaded.
+   */
+  getInvoiceStatus(invoiceId: string): Promise<import('../core/accounting-types.js').InvoiceStatus>;
+
+  /**
    * Retrieve the serialised invoice token for a deposit invoice.
    * Returns `null` when the invoice is not found in the local store.
    */

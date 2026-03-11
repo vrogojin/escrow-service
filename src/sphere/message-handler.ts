@@ -312,10 +312,14 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       }
     }
 
+    // Per protocol-spec §1.2, announce_result includes state and created_at
+    const announcedSwap = stateStore.findBySwapId(result.swap_id);
     await reply(senderPubkey, {
       type: 'announce_result',
       swap_id: result.swap_id,
+      state: announcedSwap?.state ?? 'DEPOSIT_INVOICE_CREATED',
       deposit_invoice_id: result.deposit_invoice_id,
+      created_at: announcedSwap ? new Date(announcedSwap.created_at).toISOString() : new Date().toISOString(),
       is_new: result.is_new,
     });
 
@@ -366,12 +370,29 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       }
 
       // Build deposit_status by querying the invoice manager.
-      // Per spec §1.2, the status_result includes per-party coverage derived
-      // from getInvoiceStatus() coinAssets[i].transfers using senderAddress.
-      // We delegate the per-party coverage computation to the invoiceManager
-      // here; to avoid tight coupling the handler surfaces only what the
-      // store already knows at this layer (the invoiceManager does the heavy
-      // lifting for transfer-level detail).
+      // Per protocol-spec §1.2, derive deposit_status from getInvoiceStatus()
+      // coinAssets per-currency coverage.
+      let depositStatus: Record<string, unknown> | null = null;
+      if (swap.deposit_invoice_id) {
+        try {
+          const invoiceStatus = await invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
+          const target = invoiceStatus.targets[0];
+          if (target && target.coinAssets.length >= 2) {
+            const assetA = target.coinAssets[0];
+            const assetB = target.coinAssets[1];
+            depositStatus = {
+              state: invoiceStatus.state,
+              party_a_covered: assetA?.isCovered ?? false,
+              party_b_covered: assetB?.isCovered ?? false,
+              party_a_amount: assetA?.netCoveredAmount ?? '0',
+              party_b_amount: assetB?.netCoveredAmount ?? '0',
+            };
+          }
+        } catch (err) {
+          logger.warn({ err, swap_id: swap.swap_id }, 'Failed to fetch deposit invoice status for status_result');
+          // depositStatus remains null on error, per protocol-spec
+        }
+      }
 
       await reply(senderPubkey, {
         type: 'status_result',
@@ -379,6 +400,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
         state: swap.state,
         manifest: swap.manifest,
         deposit_invoice_id: swap.deposit_invoice_id,
+        deposit_status: depositStatus,
         payout_a_invoice_id: swap.payout_a_invoice_id,
         payout_b_invoice_id: swap.payout_b_invoice_id,
         created_at: new Date(swap.created_at).toISOString(),
