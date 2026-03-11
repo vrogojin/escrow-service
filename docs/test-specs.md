@@ -264,7 +264,7 @@ async function createLiveTestContext(): Promise<LiveTestContext>;
 
 ### 2.1 State Machine — `state-machine.test.ts`
 
-**~37 tests** covering the new 10-state machine defined in `docs/architecture.md`.
+**~38 tests** covering the new 10-state machine defined in `docs/architecture.md`.
 
 The new state enum replaces the old one:
 
@@ -284,7 +284,7 @@ enum SwapState {
 }
 ```
 
-#### Valid Transitions (~11 tests)
+#### Valid Transitions (~13 tests)
 
 ```
 should allow ANNOUNCED → DEPOSIT_INVOICE_CREATED
@@ -302,7 +302,7 @@ should allow CANCELLING → CANCELLED
 should allow any non-terminal state → FAILED
 ```
 
-#### Invalid Transitions (~12 tests)
+#### Invalid Transitions (~10 tests)
 
 ```
 should reject ANNOUNCED → PARTIAL_DEPOSIT (must go through DEPOSIT_INVOICE_CREATED)
@@ -652,7 +652,7 @@ should correctly compare netCoveredAmount >= requestedAmount with BigInt arithme
 
 ### 2.9 Crash Recovery — `crash-recovery.test.ts`
 
-**~46 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
+**~41 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
 
 Each test sets up a swap in a specific (swap state, invoice state) pair, then runs the recovery procedure and verifies the resulting action. All re-validation steps check coverage by currency slot (coinId against asset index) — sender identity is not evaluated.
 
@@ -1159,8 +1159,8 @@ The live E2E tests cover the complete trader-creation → topup → escrow → e
 | | swap-state-store.test.ts | ~12 |
 | | manifest-validator.test.ts | ~4 |
 | | deposit-validation.test.ts | ~14 |
-| | crash-recovery.test.ts | ~46 |
-| **Unit subtotal** | | **~222** |
+| | crash-recovery.test.ts | ~41 |
+| **Unit subtotal** | | **~217** |
 | **Integration** | swap-lifecycle.integration.test.ts | ~25 |
 | **Live E2E** | swap-lifecycle.e2e-live.test.ts | ~22 |
-| **Total** | | **~269** |
+| **Total** | | **~264** |
