@@ -42,6 +42,7 @@ const VALID_TRANSITIONS: Record<string, Set<SwapState>> = {
     SwapState.FAILED,
   ]),
   [SwapState.TIMED_OUT]: new Set([
+    SwapState.DEPOSIT_COVERED,
     SwapState.CANCELLING,
     SwapState.FAILED,
   ]),

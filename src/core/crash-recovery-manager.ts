@@ -544,7 +544,19 @@ export class CrashRecoveryManager {
       return;
     }
 
-    const status = await this.invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
+    let status: Awaited<ReturnType<typeof this.invoiceManager.getInvoiceStatus>>;
+    try {
+      status = await this.invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
+    } catch (err) {
+      if (isSphereError(err) && err.code === 'INVOICE_NOT_FOUND') {
+        logger.error({ swap_id: swap.swap_id }, 'Recovery: _resumeConclusion — deposit invoice not found, transitioning to FAILED');
+        this._failSwap(swap, 'Deposit invoice not found when resuming conclusion');
+        return;
+      }
+      logger.error({ err, swap_id: swap.swap_id }, 'Recovery: _resumeConclusion — unexpected error fetching invoice status, will retry next cycle');
+      return;
+    }
+
     const target = status.targets[0];
     if (!target) {
       this._failSwap(swap, 'Cannot resume conclusion: invoice has no targets');
@@ -664,7 +676,17 @@ export class CrashRecoveryManager {
     let payoutAId = swap.payout_a_invoice_id;
     let payoutBId = swap.payout_b_invoice_id;
 
-    // If payout A is missing, create it
+    // Fetch the latest persisted swap record to get the most current version
+    // (the caller may have passed a stale record if they advanced state before calling us).
+    let currentSwap = this.stateStore.findBySwapId(swap.swap_id);
+    if (!currentSwap) {
+      logger.error({ swap_id: swap.swap_id }, 'Recovery: Swap not found when resuming payouts');
+      return;
+    }
+
+    // If payout A is missing, create it and immediately persist its ID.
+    // Persisting before creating payout B ensures that, if we crash between
+    // the two creations, recovery will skip A on the next pass and only create B.
     if (!payoutAId) {
       const result = await this.invoiceManager.createPayoutInvoice(
         manifest.swap_id,
@@ -678,9 +700,23 @@ export class CrashRecoveryManager {
         return;
       }
       payoutAId = result.invoiceId;
+
+      // Persist payout A ID immediately (still in current state) before creating B.
+      // This prevents double-creation of payout A on a subsequent crash.
+      const afterA = this.stateStore.updateState(
+        swap.swap_id,
+        currentSwap.state,
+        { payout_a_invoice_id: payoutAId },
+        currentSwap.version,
+      );
+      if (!afterA) {
+        logger.warn({ swap_id: swap.swap_id }, 'Recovery: Version mismatch persisting payout A invoice ID, aborting');
+        return;
+      }
+      currentSwap = afterA;
     }
 
-    // If payout B is missing, create it
+    // If payout B is missing, create it.
     if (!payoutBId) {
       const result = await this.invoiceManager.createPayoutInvoice(
         manifest.swap_id,
@@ -690,19 +726,13 @@ export class CrashRecoveryManager {
         'B',
       );
       if (!result.success || !result.invoiceId) {
-        this._failSwap(swap, `Recovery: Failed to create payout B invoice: ${result.error ?? 'unknown'}`);
+        this._failSwap(currentSwap, `Recovery: Failed to create payout B invoice: ${result.error ?? 'unknown'}`);
         return;
       }
       payoutBId = result.invoiceId;
     }
 
-    // Persist CONCLUDING with both payout IDs (idempotent if already there)
-    const currentSwap = this.stateStore.findBySwapId(swap.swap_id);
-    if (!currentSwap) {
-      logger.error({ swap_id: swap.swap_id }, 'Recovery: Swap not found when resuming payouts');
-      return;
-    }
-
+    // Persist CONCLUDING with both payout IDs (idempotent if already there).
     if (currentSwap.state !== SwapState.CONCLUDING) {
       const concluding = this.stateStore.updateState(
         swap.swap_id,
@@ -717,8 +747,9 @@ export class CrashRecoveryManager {
         logger.warn({ swap_id: swap.swap_id }, 'Recovery: Version mismatch updating CONCLUDING');
         return;
       }
-    } else if (!currentSwap.payout_a_invoice_id || !currentSwap.payout_b_invoice_id) {
-      // Already CONCLUDING but missing payout IDs — update them
+      currentSwap = concluding;
+    } else if (!currentSwap.payout_b_invoice_id) {
+      // Already CONCLUDING but payout B ID not yet persisted — update it now.
       const updated = this.stateStore.updateState(
         swap.swap_id,
         SwapState.CONCLUDING,
@@ -729,9 +760,10 @@ export class CrashRecoveryManager {
         currentSwap.version,
       );
       if (!updated) {
-        logger.warn({ swap_id: swap.swap_id }, 'Recovery: Version mismatch updating payout IDs');
+        logger.warn({ swap_id: swap.swap_id }, 'Recovery: Version mismatch updating payout B invoice ID');
         return;
       }
+      currentSwap = updated;
     }
 
     logger.info({ swap_id: swap.swap_id, payoutAId, payoutBId }, 'Recovery: Resuming payout payments');
@@ -765,7 +797,9 @@ export class CrashRecoveryManager {
    * - Omit amount so SDK sends only the uncovered remainder
    * - INVOICE_INVALID_AMOUNT = already covered = success
    * - INVOICE_TERMINATED = invoice closed/cancelled = success
-   * - INVOICE_NOT_FOUND = not loaded, import and retry (once)
+   * - INVOICE_NOT_FOUND = payout token missing — throws so the swap stays in
+   *   CONCLUDING and is not falsely transitioned to COMPLETED (operator must
+   *   manually import the token and retry)
    */
   private async _retryPayInvoice(
     swapId: string,
@@ -789,10 +823,11 @@ export class CrashRecoveryManager {
           return;
         }
         if (err.code === 'INVOICE_NOT_FOUND') {
-          // Token not loaded in AccountingModule after restart — note for manual intervention
-          // (importInvoice requires the raw token, which we don't have here)
-          logger.error({ swap_id: swapId, invoiceId }, 'Recovery: payInvoice — invoice token not loaded (INVOICE_NOT_FOUND). Manual token import required.');
-          return;
+          // Token not loaded in AccountingModule after restart.
+          // We cannot safely treat this as success — the payout has NOT been made.
+          // Throwing here prevents _resumePayouts from transitioning to COMPLETED
+          // and leaves the swap in CONCLUDING for operator intervention.
+          throw new Error(`Payout invoice not found — manual intervention required: ${invoiceId}`);
         }
       }
       logger.error({ err, swap_id: swapId, invoiceId }, 'Recovery: payInvoice — unexpected error');
@@ -811,7 +846,19 @@ export class CrashRecoveryManager {
       return;
     }
 
-    const status = await this.invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
+    let status: Awaited<ReturnType<typeof this.invoiceManager.getInvoiceStatus>>;
+    try {
+      status = await this.invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
+    } catch (err) {
+      if (isSphereError(err) && err.code === 'INVOICE_NOT_FOUND') {
+        logger.error({ swap_id: swap.swap_id }, 'Recovery: _revalidateCoverageOrRevert — deposit invoice not found, transitioning to FAILED');
+        this._failSwap(swap, 'Deposit invoice not found when revalidating coverage');
+        return;
+      }
+      logger.error({ err, swap_id: swap.swap_id }, 'Recovery: _revalidateCoverageOrRevert — unexpected error fetching invoice status, will retry next cycle');
+      return;
+    }
+
     const target = status.targets[0];
     if (!target) {
       this._failSwap(swap, 'Cannot revalidate: invoice has no targets');

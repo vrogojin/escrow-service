@@ -41,6 +41,16 @@ export class InMemorySwapStateStore implements SwapStateStore {
    * @returns The newly created SwapRecord (a clone, not the internal reference).
    */
   create(manifest: SwapManifest, resolvedAddresses: ResolvedAddresses): SwapRecord {
+    // Idempotency guard: if a record for this swap_id already exists, return it
+    // without overwriting. Two concurrent announce() calls for the same manifest
+    // both pass the findBySwapId check in the orchestrator (no await between
+    // the read and this write), so we must guard here. Returning the existing
+    // record lets the caller (announce()) detect the duplicate via is_new=false.
+    const existing = this.swaps.get(manifest.swap_id);
+    if (existing !== undefined) {
+      return this.clone(existing);
+    }
+
     const record: SwapRecord = {
       swap_id: manifest.swap_id,
       manifest,

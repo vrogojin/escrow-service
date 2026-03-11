@@ -423,8 +423,16 @@ export class SwapOrchestrator {
       );
 
       if (updated) {
-        // Start the timeout timer
-        this.timeoutManager.schedule(swap.swap_id, swap.manifest.timeout * 1000);
+        // Start the timeout timer — guard against a timer already registered
+        // (e.g., crash recovery called reRegister() before this handler ran).
+        if (this.timeoutManager.hasTimer(swap.swap_id)) {
+          logger.debug(
+            { swap_id: swap.swap_id },
+            'Timeout timer already exists (crash recovery re-registered) — skipping schedule()',
+          );
+        } else {
+          this.timeoutManager.schedule(swap.swap_id, swap.manifest.timeout * 1000);
+        }
         logger.info(
           {
             swap_id: swap.swap_id,
@@ -457,13 +465,14 @@ export class SwapOrchestrator {
    * Per architecture.md §Event-Driven Flow (invoice:covered):
    * 1. Look up swap, state guard
    * 2. Re-validate per-currency-slot coverage (coinId matches asset index)
-   * 3. Transition to DEPOSIT_COVERED, cancel timeout
+   * 3. Transition to DEPOSIT_COVERED (bounded CAS retry; also contests TIMED_OUT)
    * 4. Close deposit invoice (no autoReturn)
-   * 5. Create payout invoices
-   * 6. Persist as CONCLUDING with payout IDs BEFORE paying
-   * 7. Pay both payout invoices
-   * 8. Send payment_confirmation DMs
-   * 9. Transition to COMPLETED
+   * 5. Cancel timeout timer (AFTER close succeeds)
+   * 6. Create payout invoices A and B (via _concludeSwap)
+   * 7. Persist as CONCLUDING with payout IDs BEFORE paying
+   * 8. Pay both payout invoices
+   * 9. Send payment_confirmation DMs
+   * 10. Transition to COMPLETED
    */
   async _onInvoiceCovered(payload: InvoiceCoveredPayload): Promise<void> {
     const { invoiceId } = payload;
@@ -538,43 +547,80 @@ export class SwapOrchestrator {
     );
 
     if (!coveredSwap) {
-      // CAS failed — a concurrent handler modified the swap. Reload and check.
-      const reloaded = this.stateStore.findBySwapId(swap.swap_id);
-      if (!reloaded) return;
+      // CAS failed — a concurrent handler modified the swap.
+      // Retry in a bounded loop (up to 3 attempts total including the first).
+      // Also accept TIMED_OUT as a contestable state: if coverage arrives while
+      // timeout handling is in progress, coverage wins (SDK confirmed it).
+      let timedOutContested = false;
+      const MAX_CAS_ATTEMPTS = 3;
+      let attempt = 1; // first attempt already done above
+      while (attempt < MAX_CAS_ATTEMPTS) {
+        attempt++;
+        const reloaded = this.stateStore.findBySwapId(swap.swap_id);
+        if (!reloaded) return;
 
-      if (
-        reloaded.state === SwapState.DEPOSIT_INVOICE_CREATED ||
-        reloaded.state === SwapState.PARTIAL_DEPOSIT
-      ) {
-        // A payment handler won the race (e.g., advanced to PARTIAL_DEPOSIT).
-        // Retry the DEPOSIT_COVERED CAS with the reloaded version.
-        coveredSwap = this.stateStore.updateState(
-          swap.swap_id,
-          SwapState.DEPOSIT_COVERED,
-          {},
-          reloaded.version,
-        );
-        if (!coveredSwap) {
-          logger.warn(
-            { swap_id: swap.swap_id },
-            'invoice:covered — DEPOSIT_COVERED CAS retry also failed, another handler will handle',
+        if (
+          reloaded.state === SwapState.DEPOSIT_INVOICE_CREATED ||
+          reloaded.state === SwapState.PARTIAL_DEPOSIT
+        ) {
+          // A payment handler won the race (e.g., advanced to PARTIAL_DEPOSIT).
+          // Retry the DEPOSIT_COVERED CAS with the reloaded version.
+          coveredSwap = this.stateStore.updateState(
+            reloaded.swap_id,
+            SwapState.DEPOSIT_COVERED,
+            {},
+            reloaded.version,
+          );
+          if (coveredSwap) break;
+          logger.debug(
+            { swap_id: swap.swap_id, attempt },
+            'invoice:covered — DEPOSIT_COVERED CAS retry failed, re-attempting',
+          );
+        } else if (reloaded.state === SwapState.TIMED_OUT) {
+          // Timeout handler won the state transition race, but coverage arrived
+          // before cancellation completed. Coverage wins — contest TIMED_OUT.
+          coveredSwap = this.stateStore.updateState(
+            reloaded.swap_id,
+            SwapState.DEPOSIT_COVERED,
+            {},
+            reloaded.version,
+          );
+          if (coveredSwap) {
+            timedOutContested = true;
+            break;
+          }
+          logger.debug(
+            { swap_id: swap.swap_id, attempt },
+            'invoice:covered — DEPOSIT_COVERED CAS from TIMED_OUT retry failed, re-attempting',
+          );
+        } else {
+          // Already advanced past any contestable state (DEPOSIT_COVERED, CONCLUDING, COMPLETED, etc.)
+          logger.info(
+            { swap_id: swap.swap_id, state: reloaded.state },
+            'invoice:covered — swap already advanced past accepting state, ignoring',
           );
           return;
         }
-      } else {
-        // Already advanced past accepting state (e.g., DEPOSIT_COVERED, CONCLUDING, COMPLETED)
-        logger.info(
-          { swap_id: swap.swap_id, state: reloaded.state },
-          'invoice:covered — swap already advanced past accepting state, ignoring',
+      }
+
+      if (!coveredSwap) {
+        logger.warn(
+          { swap_id: swap.swap_id, attempts: MAX_CAS_ATTEMPTS },
+          'invoice:covered — DEPOSIT_COVERED CAS exhausted all retries, another handler will handle',
         );
         return;
       }
+
+      if (timedOutContested) {
+        // Cancel the timeout timer since coverage won the contest over timeout.
+        this.timeoutManager.cancel(swap.swap_id);
+      }
     }
 
-    // 4. Cancel timeout timer
-    this.timeoutManager.cancel(swap.swap_id);
-
-    // 5. Close deposit invoice (no autoReturn)
+    // 4. Close deposit invoice (no autoReturn) BEFORE cancelling the timer.
+    // Cancelling the timer first would leave the swap stuck in DEPOSIT_COVERED
+    // forever if closeDepositInvoice throws a transient error — the timer would
+    // be gone and no retry mechanism would fire.
     try {
       await this.invoiceManager.closeDepositInvoice(invoiceId);
     } catch (err) {
@@ -596,6 +642,8 @@ export class SwapOrchestrator {
           // currently in DEPOSIT_COVERED (we transitioned it above). Transition
           // to FAILED for manual reconciliation — crash recovery handles
           // DEPOSIT_COVERED + CANCELLED via _recoverCancelledAfterCoverage.
+          // Timer is still active here; it will fire but the swap is no longer
+          // in PARTIAL_DEPOSIT so _handleTimeout will ignore it.
           logger.error(
             { swap_id: swap.swap_id },
             'Deposit invoice cancelled (timeout won race) while swap is DEPOSIT_COVERED — transitioning to FAILED',
@@ -612,6 +660,11 @@ export class SwapOrchestrator {
         throw err;
       }
     }
+
+    // 5. Cancel timeout timer AFTER closeDepositInvoice succeeds.
+    // If close threw a transient error (and we returned/threw above), the timer
+    // remains active and will eventually fire to handle the swap.
+    this.timeoutManager.cancel(swap.swap_id);
 
     // 6 & 7. Create payout invoices and pay
     await this._concludeSwap(coveredSwap);
@@ -761,17 +814,29 @@ export class SwapOrchestrator {
   /**
    * Executes the conclusion phase for a covered swap.
    *
-   * This method handles steps 6-9 of the invoice:covered handler:
-   * 6. Create payout invoices A and B
-   * 7. Persist as CONCLUDING with payout IDs BEFORE paying
-   * 8. Pay both payout invoices
-   * 9. Send payment_confirmation DMs
-   * 10. Transition to COMPLETED
+   * Step sequence (persist-before-act ordering throughout):
+   * 1. Create payout invoice A
+   *    - If fails → leave in DEPOSIT_COVERED, crash recovery retries
+   * 2. Create payout invoice B
+   *    - If fails → persist payout_a_invoice_id into DEPOSIT_COVERED, leave for crash recovery
+   * 3. Persist CONCLUDING with BOTH payout IDs atomically (crash recovery checkpoint)
+   *    - If CAS fails and already CONCLUDING → another handler won, log orphans, return
+   *    - If CAS fails for any other reason → log orphaned invoice IDs, return
+   * 4. Pay payout A
+   *    - If fails → leave in CONCLUDING, crash recovery retries (do NOT transition to FAILED)
+   * 5. Pay payout B
+   *    - If fails → leave in CONCLUDING, crash recovery retries
+   * 6. Return surplus (best-effort)
+   * 7. Send payment_confirmation DMs
+   * 8. Transition to COMPLETED
    */
   async _concludeSwap(swap: SwapRecord): Promise<void> {
     const manifest = swap.manifest;
 
-    // Create payout invoice A: party A receives party B's currency
+    // Step 1: Create payout invoice A — party A receives party B's currency.
+    // If creation fails, leave in DEPOSIT_COVERED for crash recovery to retry.
+    // Do NOT transition to FAILED: payout A may be partially created in the SDK
+    // and FAILED is terminal, preventing any retry.
     const payoutAResult = await this.invoiceManager.createPayoutInvoice(
       manifest.swap_id,
       swap.resolved_party_a_address,
@@ -782,12 +847,20 @@ export class SwapOrchestrator {
 
     if (!payoutAResult.success || !payoutAResult.invoiceId) {
       const errMsg = payoutAResult.error ?? 'Unknown payout A invoice creation error';
-      logger.error({ swap_id: swap.swap_id, error: errMsg }, 'Failed to create payout A invoice');
-      await this._transitionToFailed(swap, `Payout A invoice creation failed: ${errMsg}`);
+      logger.error(
+        { swap_id: swap.swap_id, error: errMsg },
+        'Failed to create payout A invoice — leaving in DEPOSIT_COVERED for crash recovery',
+      );
+      // Leave swap in DEPOSIT_COVERED (no state transition). Crash recovery retries.
       return;
     }
 
-    // Create payout invoice B: party B receives party A's currency
+    const payoutAId = payoutAResult.invoiceId;
+
+    // Step 2: Create payout invoice B — party B receives party A's currency.
+    // If creation fails after A succeeded, persist payout_a_invoice_id into the
+    // DEPOSIT_COVERED record so crash recovery can find it and avoid creating a
+    // duplicate payout A invoice on retry. Leave in DEPOSIT_COVERED.
     const payoutBResult = await this.invoiceManager.createPayoutInvoice(
       manifest.swap_id,
       swap.resolved_party_b_address,
@@ -798,24 +871,38 @@ export class SwapOrchestrator {
 
     if (!payoutBResult.success || !payoutBResult.invoiceId) {
       const errMsg = payoutBResult.error ?? 'Unknown payout B invoice creation error';
-      logger.error({ swap_id: swap.swap_id, error: errMsg }, 'Failed to create payout B invoice');
-      await this._transitionToFailed(swap, `Payout B invoice creation failed: ${errMsg}`);
+      logger.error(
+        { swap_id: swap.swap_id, error: errMsg, payoutAId },
+        'Failed to create payout B invoice — persisting payout A ID and leaving in DEPOSIT_COVERED for crash recovery',
+      );
+      // Persist payout_a_invoice_id into the current record so crash recovery
+      // knows not to re-create invoice A. Reload to get current version.
+      const currentForA = this.stateStore.findBySwapId(swap.swap_id);
+      if (currentForA) {
+        // Use updateState to write payout_a_invoice_id without changing state.
+        // We keep DEPOSIT_COVERED state but checkpoint the invoice ID.
+        this.stateStore.updateState(
+          swap.swap_id,
+          SwapState.DEPOSIT_COVERED,
+          { payout_a_invoice_id: payoutAId },
+          currentForA.version,
+        );
+      }
       return;
     }
 
-    const payoutAId = payoutAResult.invoiceId;
     const payoutBId = payoutBResult.invoiceId;
 
-    // PERSIST AS CONCLUDING WITH BOTH PAYOUT IDs BEFORE PAYING
+    // Step 3: PERSIST AS CONCLUDING WITH BOTH PAYOUT IDs BEFORE PAYING.
     // This is the crash recovery checkpoint — if we crash between here and
-    // COMPLETED, recovery will find CONCLUDING state and re-pay.
+    // COMPLETED, recovery will find CONCLUDING state with both IDs and re-pay.
     const currentSwap = this.stateStore.findBySwapId(swap.swap_id);
     if (!currentSwap) {
       logger.error({ swap_id: swap.swap_id }, 'Swap not found when transitioning to CONCLUDING');
       return;
     }
 
-    let concluding = this.stateStore.updateState(
+    const concluding = this.stateStore.updateState(
       swap.swap_id,
       SwapState.CONCLUDING,
       {
@@ -836,13 +923,12 @@ export class SwapOrchestrator {
         );
         return;
       } else {
+        // Unexpected state — log the orphaned invoice IDs so an operator can reconcile.
+        // Do NOT transition to FAILED: FAILED is terminal and prevents crash recovery.
         logger.error(
-          { swap_id: swap.swap_id, currentState: recheck?.state },
-          'Version mismatch persisting CONCLUDING — swap in unexpected state, orphaned payout invoices',
+          { swap_id: swap.swap_id, currentState: recheck?.state, orphanedPayoutA: payoutAId, orphanedPayoutB: payoutBId },
+          'Version mismatch persisting CONCLUDING — swap in unexpected state; payout invoices may be orphaned',
         );
-        if (recheck) {
-          await this._transitionToFailed(recheck, `CONCLUDING version mismatch; payout invoices ${payoutAId}, ${payoutBId} may be orphaned`);
-        }
         return;
       }
     }
@@ -852,7 +938,10 @@ export class SwapOrchestrator {
       'Swap concluding — paying payout invoices',
     );
 
-    // Pay payout A: targetIndex 0, assetIndex 0
+    // Step 4: Pay payout A — targetIndex 0, assetIndex 0.
+    // On failure, leave in CONCLUDING (do NOT transition to FAILED). Payout A may
+    // have been partially submitted; FAILED is terminal and crash recovery can no
+    // longer retry. Crash recovery will re-attempt payInvoice(payoutAId).
     try {
       await this.invoiceManager.payInvoice(payoutAId, {
         targetIndex: 0,
@@ -863,17 +952,17 @@ export class SwapOrchestrator {
       if (isSphereError(err) && (err.code === 'INVOICE_TERMINATED' || err.code === 'INVOICE_INVALID_AMOUNT')) {
         logger.info({ swap_id: swap.swap_id, payoutAId }, 'Payout A already covered (idempotent)');
       } else {
-        logger.error({ err, swap_id: swap.swap_id, payoutAId, payoutBId }, 'Failed to pay payout A invoice');
-        const reloadedA = this.stateStore.findBySwapId(swap.swap_id);
-        await this._transitionToFailed(
-          reloadedA ?? concluding,
-          `Payout A payment failed. Payout invoices: A=${payoutAId}, B=${payoutBId}. Error: ${String(err)}`,
+        // Leave in CONCLUDING for crash recovery — do NOT call _transitionToFailed.
+        logger.error(
+          { err, swap_id: swap.swap_id, payoutAId, payoutBId },
+          'Failed to pay payout A invoice — leaving in CONCLUDING for crash recovery',
         );
         return;
       }
     }
 
-    // Pay payout B: targetIndex 0, assetIndex 0
+    // Step 5: Pay payout B — targetIndex 0, assetIndex 0.
+    // Payout A already succeeded (or was idempotent). Leave in CONCLUDING on failure.
     try {
       await this.invoiceManager.payInvoice(payoutBId, {
         targetIndex: 0,

@@ -124,8 +124,8 @@ describe('SwapState state machine', () => {
       expect(isValidTransition(SwapState.FAILED, SwapState.CONCLUDING)).toBe(false);
     });
 
-    it('should not allow TIMED_OUT → DEPOSIT_COVERED', () => {
-      expect(isValidTransition(SwapState.TIMED_OUT, SwapState.DEPOSIT_COVERED)).toBe(false);
+    it('should allow TIMED_OUT → DEPOSIT_COVERED (coverage wins over timeout)', () => {
+      expect(isValidTransition(SwapState.TIMED_OUT, SwapState.DEPOSIT_COVERED)).toBe(true);
     });
 
     it('should not allow CANCELLING → DEPOSIT_COVERED', () => {
