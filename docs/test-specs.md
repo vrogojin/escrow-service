@@ -493,7 +493,7 @@ should report remaining time for a scheduled timeout
 should re-register timeout with remaining time computed as timeout_at - Date.now() (not manifest.timeout from scratch — crash duration must not extend the window)
 should not schedule timeout if swap is already in terminal state
 should not fire if timeout already elapsed and swap progressed to DEPOSIT_COVERED
-should persist TIMED_OUT state BEFORE calling cancelInvoice() — ordered sequence: [updateState(TIMED_OUT), cancelInvoice()] verified via call-order spy (crash between persist and cancel is recoverable; reverse is not)
+should persist TIMED_OUT then CANCELLING BEFORE calling cancelInvoice() — ordered sequence: [updateState(TIMED_OUT), updateState(CANCELLING), cancelInvoice()] verified via call-order spy (invoice:cancelled fires synchronously during cancelInvoice and expects CANCELLING state)
 should throw if scheduling timeout for swap that already has an active timer
 should clear timer reference after firing (prevent memory leak)
 should not extend timeout window when re-registering after crash (if first_deposit_at was 30s ago and timeout is 60s, timer fires in ~30s not 60s)
@@ -714,7 +714,7 @@ should handle (CONCLUDING, COVERED) pair — deposit invoice covered but not yet
 should call cancelInvoice() when swap is TIMED_OUT and invoice is still OPEN (deposits not yet returned)
 should call cancelInvoice() when swap is TIMED_OUT and invoice is PARTIAL (partial deposits to return)
 should call cancelInvoice() when swap is TIMED_OUT and invoice is EXPIRED (dueDate passed — still needs explicit cancel for autoReturn)
-should transition TIMED_OUT → CANCELLING when invoice is already CANCELLED (autoReturn completed during crash)
+should transition TIMED_OUT → CANCELLED when invoice is already CANCELLED (autoReturn completed during crash — skip cancelInvoice(), transition directly)
 should handle INVOICE_ALREADY_CLOSED during TIMED_OUT recovery (coverage won race — reconcile swap to DEPOSIT_COVERED and resume conclusion)
 should handle (TIMED_OUT, COVERED) — coverage arrived but closeInvoice() not yet called; call closeInvoice() first, then reconcile to DEPOSIT_COVERED and resume conclusion (distinct from CLOSED case where closeInvoice() already ran)
 ```
