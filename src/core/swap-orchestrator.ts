@@ -500,11 +500,24 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Re-validate per-currency-slot coverage: the SDK's invoice:covered means
-    // both asset slots are fully covered. We verify coinAssets exist and have
-    // forward payments with matching coinIds. Sender identity is NOT checked —
-    // anyone can deposit on behalf of A or B.
-    const invoiceStatus = await this.invoiceManager.getInvoiceStatus(invoiceId);
+    // Re-validate per-currency-slot coverage with amount thresholds:
+    // the SDK's invoice:covered means both asset slots are fully covered.
+    // We verify each slot's cumulative forward amount meets the manifest's
+    // required value. Sender identity is NOT checked — anyone can deposit
+    // on behalf of A or B.
+    let invoiceStatus;
+    try {
+      invoiceStatus = await this.invoiceManager.getInvoiceStatus(invoiceId);
+    } catch (err) {
+      // C6 fix: if getInvoiceStatus fails, log and return so crash recovery
+      // or a subsequent event can retry. Do NOT consume the covered event
+      // silently — the swap must not become a zombie.
+      logger.error(
+        { err, swap_id: swap.swap_id, invoiceId },
+        'invoice:covered — failed to fetch invoice status, will rely on crash recovery',
+      );
+      return;
+    }
     const target = invoiceStatus.targets[0];
     if (!target) {
       logger.error({ swap_id: swap.swap_id }, 'invoice:covered — no target in invoice status');
@@ -519,26 +532,34 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Validate asset 0 has forward payments with party_a_currency
-    const slotACovered = assetA.transfers.some(
-      (t) => t.paymentDirection === 'forward' &&
-             t.coinId === swap.manifest.party_a_currency_to_change,
-    );
+    // Validate each slot's cumulative forward amount meets the required value
+    const slotAAmount = assetA.transfers
+      .filter(
+        (t) => t.paymentDirection === 'forward' &&
+               t.coinId === swap.manifest.party_a_currency_to_change,
+      )
+      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
 
-    // Validate asset 1 has forward payments with party_b_currency
-    const slotBCovered = assetB.transfers.some(
-      (t) => t.paymentDirection === 'forward' &&
-             t.coinId === swap.manifest.party_b_currency_to_change,
-    );
+    const slotBAmount = assetB.transfers
+      .filter(
+        (t) => t.paymentDirection === 'forward' &&
+               t.coinId === swap.manifest.party_b_currency_to_change,
+      )
+      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
 
-    if (!slotACovered || !slotBCovered) {
+    const requiredA = BigInt(swap.manifest.party_a_value_to_change);
+    const requiredB = BigInt(swap.manifest.party_b_value_to_change);
+
+    if (slotAAmount < requiredA || slotBAmount < requiredB) {
       logger.warn(
         {
           swap_id: swap.swap_id,
-          slotACovered,
-          slotBCovered,
+          slotAAmount: String(slotAAmount),
+          slotBAmount: String(slotBAmount),
+          requiredA: String(requiredA),
+          requiredB: String(requiredB),
         },
-        'invoice:covered — currency-slot coverage validation failed, waiting',
+        'invoice:covered — per-slot amount coverage validation failed, waiting',
       );
       return;
     }
@@ -818,28 +839,60 @@ export class SwapOrchestrator {
    * Executes the conclusion phase for a covered swap.
    *
    * Step sequence (persist-before-act ordering throughout):
-   * 1. Create payout invoice A
-   *    - If fails → leave in DEPOSIT_COVERED, crash recovery retries
-   * 2. Create payout invoice B
-   *    - If fails → persist payout_a_invoice_id into DEPOSIT_COVERED, leave for crash recovery
-   * 3. Persist CONCLUDING with BOTH payout IDs atomically (crash recovery checkpoint)
-   *    - If CAS fails and already CONCLUDING → another handler won, log orphans, return
-   *    - If CAS fails for any other reason → log orphaned invoice IDs, return
-   * 4. Pay payout A
-   *    - If fails → leave in CONCLUDING, crash recovery retries (do NOT transition to FAILED)
-   * 5. Pay payout B
+   * 1. CAS to CONCLUDING FIRST — this gates all payout invoice creation
+   *    on winning the state transition, preventing orphaned payout invoices.
+   * 2. Create payout invoice A
    *    - If fails → leave in CONCLUDING, crash recovery retries
-   * 6. Return surplus (best-effort)
-   * 7. Send payment_confirmation DMs
-   * 8. Transition to COMPLETED
+   * 3. Create payout invoice B
+   *    - If fails → persist payout_a_invoice_id into CONCLUDING, leave for crash recovery
+   * 4. Persist both payout IDs into the CONCLUDING record
+   * 5. Pay payout A (omit amount — SDK computes remaining for idempotency)
+   *    - If fails → leave in CONCLUDING, crash recovery retries
+   * 6. Pay payout B (omit amount)
+   *    - If fails → leave in CONCLUDING, crash recovery retries
+   * 7. Return surplus (best-effort)
+   * 8. Send payment_confirmation DMs
+   * 9. Transition to COMPLETED
    */
   async _concludeSwap(swap: SwapRecord): Promise<void> {
     const manifest = swap.manifest;
 
-    // Step 1: Create payout invoice A — party A receives party B's currency.
-    // If creation fails, leave in DEPOSIT_COVERED for crash recovery to retry.
-    // Do NOT transition to FAILED: payout A may be partially created in the SDK
-    // and FAILED is terminal, preventing any retry.
+    // Step 1: CAS to CONCLUDING FIRST.
+    // Gate all payout invoice creation on winning this CAS. This prevents
+    // orphaned payout invoices: if another handler wins the CAS, we never
+    // create payout invoices at all.
+    const currentSwap = this.stateStore.findBySwapId(swap.swap_id);
+    if (!currentSwap) {
+      logger.error({ swap_id: swap.swap_id }, 'Swap not found when transitioning to CONCLUDING');
+      return;
+    }
+
+    const concluding = this.stateStore.updateState(
+      swap.swap_id,
+      SwapState.CONCLUDING,
+      {},
+      currentSwap.version,
+    );
+
+    if (!concluding) {
+      const recheck = this.stateStore.findBySwapId(swap.swap_id);
+      if (recheck?.state === SwapState.CONCLUDING || isTerminalState(recheck?.state as SwapState)) {
+        logger.info(
+          { swap_id: swap.swap_id, state: recheck?.state },
+          'Another handler already advanced the swap — deferring to winner',
+        );
+      } else {
+        logger.error(
+          { swap_id: swap.swap_id, currentState: recheck?.state },
+          'Version mismatch persisting CONCLUDING — swap in unexpected state',
+        );
+      }
+      return;
+    }
+
+    // Step 2: Create payout invoice A — party A receives party B's currency.
+    // We are now the CONCLUDING owner. If creation fails, leave in CONCLUDING
+    // for crash recovery. Do NOT transition to FAILED.
     const payoutAResult = await this.invoiceManager.createPayoutInvoice(
       manifest.swap_id,
       swap.resolved_party_a_address,
@@ -852,18 +905,27 @@ export class SwapOrchestrator {
       const errMsg = payoutAResult.error ?? 'Unknown payout A invoice creation error';
       logger.error(
         { swap_id: swap.swap_id, error: errMsg },
-        'Failed to create payout A invoice — leaving in DEPOSIT_COVERED for crash recovery',
+        'Failed to create payout A invoice — leaving in CONCLUDING for crash recovery',
       );
-      // Leave swap in DEPOSIT_COVERED (no state transition). Crash recovery retries.
       return;
     }
 
     const payoutAId = payoutAResult.invoiceId;
 
-    // Step 2: Create payout invoice B — party B receives party A's currency.
-    // If creation fails after A succeeded, persist payout_a_invoice_id into the
-    // DEPOSIT_COVERED record so crash recovery can find it and avoid creating a
-    // duplicate payout A invoice on retry. Leave in DEPOSIT_COVERED.
+    // Checkpoint payout A ID immediately so crash recovery knows not to
+    // re-create it if we crash before creating payout B.
+    const afterCheckpointA = this.stateStore.updateState(
+      swap.swap_id,
+      SwapState.CONCLUDING,
+      { payout_a_invoice_id: payoutAId },
+      concluding.version,
+    );
+    if (!afterCheckpointA) {
+      logger.warn({ swap_id: swap.swap_id, payoutAId }, 'Version mismatch checkpointing payout A ID');
+      return;
+    }
+
+    // Step 3: Create payout invoice B — party B receives party A's currency.
     const payoutBResult = await this.invoiceManager.createPayoutInvoice(
       manifest.swap_id,
       swap.resolved_party_b_address,
@@ -876,64 +938,26 @@ export class SwapOrchestrator {
       const errMsg = payoutBResult.error ?? 'Unknown payout B invoice creation error';
       logger.error(
         { swap_id: swap.swap_id, error: errMsg, payoutAId },
-        'Failed to create payout B invoice — persisting payout A ID and leaving in DEPOSIT_COVERED for crash recovery',
+        'Failed to create payout B invoice — leaving in CONCLUDING for crash recovery',
       );
-      // Persist payout_a_invoice_id into the current record so crash recovery
-      // knows not to re-create invoice A. Reload to get current version.
-      const currentForA = this.stateStore.findBySwapId(swap.swap_id);
-      if (currentForA) {
-        // Use updateState to write payout_a_invoice_id without changing state.
-        // We keep DEPOSIT_COVERED state but checkpoint the invoice ID.
-        this.stateStore.updateState(
-          swap.swap_id,
-          SwapState.DEPOSIT_COVERED,
-          { payout_a_invoice_id: payoutAId },
-          currentForA.version,
-        );
-      }
       return;
     }
 
     const payoutBId = payoutBResult.invoiceId;
 
-    // Step 3: PERSIST AS CONCLUDING WITH BOTH PAYOUT IDs BEFORE PAYING.
-    // This is the crash recovery checkpoint — if we crash between here and
-    // COMPLETED, recovery will find CONCLUDING state with both IDs and re-pay.
-    const currentSwap = this.stateStore.findBySwapId(swap.swap_id);
-    if (!currentSwap) {
-      logger.error({ swap_id: swap.swap_id }, 'Swap not found when transitioning to CONCLUDING');
-      return;
-    }
-
-    const concluding = this.stateStore.updateState(
+    // Step 4: Checkpoint both payout IDs.
+    const afterCheckpointB = this.stateStore.updateState(
       swap.swap_id,
       SwapState.CONCLUDING,
       {
         payout_a_invoice_id: payoutAId,
         payout_b_invoice_id: payoutBId,
       },
-      currentSwap.version,
+      afterCheckpointA.version,
     );
-
-    if (!concluding) {
-      const recheck = this.stateStore.findBySwapId(swap.swap_id);
-      if (recheck?.state === SwapState.CONCLUDING) {
-        // Another handler won the race to CONCLUDING. It will handle payouts.
-        // Our locally-created payout invoices are orphaned — log for operator cleanup.
-        logger.warn(
-          { swap_id: swap.swap_id, orphanedPayoutA: payoutAId, orphanedPayoutB: payoutBId },
-          'Another handler already transitioned to CONCLUDING — deferring to winner (local payout invoices orphaned)',
-        );
-        return;
-      } else {
-        // Unexpected state — log the orphaned invoice IDs so an operator can reconcile.
-        // Do NOT transition to FAILED: FAILED is terminal and prevents crash recovery.
-        logger.error(
-          { swap_id: swap.swap_id, currentState: recheck?.state, orphanedPayoutA: payoutAId, orphanedPayoutB: payoutBId },
-          'Version mismatch persisting CONCLUDING — swap in unexpected state; payout invoices may be orphaned',
-        );
-        return;
-      }
+    if (!afterCheckpointB) {
+      logger.warn({ swap_id: swap.swap_id }, 'Version mismatch checkpointing payout B ID');
+      return;
     }
 
     logger.info(
@@ -942,14 +966,16 @@ export class SwapOrchestrator {
     );
 
     // Step 4: Pay payout A — targetIndex 0, assetIndex 0.
-    // On failure, leave in CONCLUDING (do NOT transition to FAILED). Payout A may
-    // have been partially submitted; FAILED is terminal and crash recovery can no
-    // longer retry. Crash recovery will re-attempt payInvoice(payoutAId).
+    // CRITICAL: Omit the `amount` parameter so the SDK computes
+    // remaining = requestedAmount - netCoveredAmount. This makes the call
+    // inherently idempotent: if payout A was already fully covered (e.g.,
+    // crash recovery retry or duplicate event), remaining = 0 and the SDK
+    // returns INVOICE_INVALID_AMOUNT. Passing an explicit amount would
+    // bypass the zero-remaining guard and cause a double-payment.
     try {
       await this.invoiceManager.payInvoice(payoutAId, {
         targetIndex: 0,
         assetIndex: 0,
-        amount: manifest.party_b_value_to_change,
       });
     } catch (err) {
       if (isSphereError(err) && (err.code === 'INVOICE_TERMINATED' || err.code === 'INVOICE_INVALID_AMOUNT')) {
@@ -965,12 +991,11 @@ export class SwapOrchestrator {
     }
 
     // Step 5: Pay payout B — targetIndex 0, assetIndex 0.
-    // Payout A already succeeded (or was idempotent). Leave in CONCLUDING on failure.
+    // Same idempotent pattern: omit amount so SDK computes remaining.
     try {
       await this.invoiceManager.payInvoice(payoutBId, {
         targetIndex: 0,
         assetIndex: 0,
-        amount: manifest.party_a_value_to_change,
       });
     } catch (err) {
       if (isSphereError(err) && (err.code === 'INVOICE_TERMINATED' || err.code === 'INVOICE_INVALID_AMOUNT')) {

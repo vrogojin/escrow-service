@@ -326,7 +326,7 @@ export class MockAccountingModule {
         const assetIndex = params.assetIndex ?? 0;
         const asset = target.assets?.[assetIndex];
         if (asset) {
-          const [coinId, requestedAmount] = asset;
+          const [coinId, requestedAmount] = (asset as any).coin || asset;
           const relevantTransfers = state.transfers.filter(
             (t) =>
               t.paymentDirection === 'forward' &&

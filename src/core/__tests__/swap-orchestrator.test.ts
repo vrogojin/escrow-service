@@ -16,15 +16,15 @@ const ESCROW_ADDRESS = 'DIRECT://0xescrow';
 
 let testCounter = 0;
 function createTestManifest(): SwapManifest {
-  const nonce = String(testCounter++);
+  testCounter++;
   const fields = {
     party_a_address: PARTY_A_ADDRESS,
     party_b_address: PARTY_B_ADDRESS,
     party_a_currency_to_change: 'USD',
-    party_a_value_to_change: String(1000000 + testCounter),
+    party_a_value_to_change: '1000000',
     party_b_currency_to_change: 'EUR',
     party_b_value_to_change: '850000',
-    timeout: 300,
+    timeout: 300 + testCounter, // varies per test to ensure unique swap_id
   };
   const swap_id = computeSwapId(fields);
   return {

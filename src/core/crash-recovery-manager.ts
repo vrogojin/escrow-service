@@ -213,9 +213,11 @@ export class CrashRecoveryManager {
         break;
 
       case 'CANCELLED':
-        // Manual or unexpected cancellation before any deposit
-        logger.info({ swap_id: swap.swap_id }, 'Recovery: DEPOSIT_INVOICE_CREATED + CANCELLED — transitioning to CANCELLED');
-        this._cancelSwap(swap);
+        // Manual or unexpected cancellation before any deposit.
+        // DEPOSIT_INVOICE_CREATED → CANCELLED is NOT a valid direct transition.
+        // Route through TIMED_OUT → CANCELLING → CANCELLED.
+        logger.info({ swap_id: swap.swap_id }, 'Recovery: DEPOSIT_INVOICE_CREATED + CANCELLED — routing through TIMED_OUT → CANCELLING → CANCELLED');
+        this._cancelViaTimeoutPath(swap);
         break;
 
       default:
@@ -275,9 +277,11 @@ export class CrashRecoveryManager {
         break;
 
       case 'CANCELLED':
-        // Timeout fired during crash
-        logger.info({ swap_id: swap.swap_id }, 'Recovery: PARTIAL_DEPOSIT + CANCELLED — transitioning to CANCELLED');
-        this._cancelSwap(swap);
+        // Timeout fired during crash.
+        // PARTIAL_DEPOSIT → CANCELLED is NOT a valid direct transition.
+        // Route through TIMED_OUT → CANCELLING → CANCELLED.
+        logger.info({ swap_id: swap.swap_id }, 'Recovery: PARTIAL_DEPOSIT + CANCELLED — routing through TIMED_OUT → CANCELLING → CANCELLED');
+        this._cancelViaTimeoutPath(swap);
         break;
 
       default:
@@ -678,28 +682,41 @@ export class CrashRecoveryManager {
       return;
     }
 
-    // Currency-slot coverage: check that each asset slot has forward payments with matching coinId
-    const slotACovered = assetA.transfers.some(
-      (t) =>
-        t.paymentDirection === 'forward' &&
-        t.coinId === swap.manifest.party_a_currency_to_change,
-    );
+    // Currency-slot coverage: verify cumulative forward amounts meet required values
+    const slotAAmount = assetA.transfers
+      .filter(
+        (t) =>
+          t.paymentDirection === 'forward' &&
+          t.coinId === swap.manifest.party_a_currency_to_change,
+      )
+      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
 
-    const slotBCovered = assetB.transfers.some(
-      (t) =>
-        t.paymentDirection === 'forward' &&
-        t.coinId === swap.manifest.party_b_currency_to_change,
-    );
+    const slotBAmount = assetB.transfers
+      .filter(
+        (t) =>
+          t.paymentDirection === 'forward' &&
+          t.coinId === swap.manifest.party_b_currency_to_change,
+      )
+      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
 
-    if (!slotACovered || !slotBCovered) {
-      // Coverage doesn't meet per-currency-slot validation.
+    const requiredA = BigInt(swap.manifest.party_a_value_to_change);
+    const requiredB = BigInt(swap.manifest.party_b_value_to_change);
+
+    if (slotAAmount < requiredA || slotBAmount < requiredB) {
+      // Coverage doesn't meet per-currency-slot amount thresholds.
       // DEPOSIT_COVERED can only transition to CONCLUDING or FAILED (not PARTIAL_DEPOSIT).
       // Transition to FAILED — operator must manually verify coverage and intervene.
       logger.error(
-        { swap_id: swap.swap_id, slotACovered, slotBCovered },
-        'Recovery: DEPOSIT_COVERED currency-slot coverage validation failed — transitioning to FAILED (manual intervention required)',
+        {
+          swap_id: swap.swap_id,
+          slotAAmount: String(slotAAmount),
+          slotBAmount: String(slotBAmount),
+          requiredA: String(requiredA),
+          requiredB: String(requiredB),
+        },
+        'Recovery: DEPOSIT_COVERED currency-slot amount coverage validation failed — transitioning to FAILED (manual intervention required)',
       );
-      this._failSwap(swap, `Currency-slot coverage validation failed in DEPOSIT_COVERED recovery (A: ${slotACovered}, B: ${slotBCovered})`);
+      this._failSwap(swap, `Currency-slot amount coverage validation failed in recovery (A: ${String(slotAAmount)}/${String(requiredA)}, B: ${String(slotBAmount)}/${String(requiredB)})`);
       return;
     }
 
@@ -804,7 +821,13 @@ export class CrashRecoveryManager {
         'A',
       );
       if (!result.success || !result.invoiceId) {
-        this._failSwap(currentSwap, `Recovery: Failed to create payout A invoice: ${result.error ?? 'unknown'}`);
+        // Do NOT call _failSwap — FAILED is terminal and would strand funds.
+        // Leave in current state (DEPOSIT_COVERED or CONCLUDING) so the next
+        // recovery cycle retries payout A creation.
+        logger.error(
+          { swap_id: swap.swap_id, error: result.error ?? 'unknown' },
+          'Recovery: Failed to create payout A invoice — leaving in current state for next recovery cycle',
+        );
         return;
       }
       payoutAId = result.invoiceId;
@@ -834,7 +857,13 @@ export class CrashRecoveryManager {
         'B',
       );
       if (!result.success || !result.invoiceId) {
-        this._failSwap(currentSwap, `Recovery: Failed to create payout B invoice: ${result.error ?? 'unknown'}`);
+        // Do NOT call _failSwap — payout A invoice already created and persisted.
+        // FAILED is terminal and would strand payout A funds permanently.
+        // Leave in current state so the next recovery cycle retries payout B creation.
+        logger.error(
+          { swap_id: swap.swap_id, payoutAId, error: result.error ?? 'unknown' },
+          'Recovery: Failed to create payout B invoice — leaving in current state for next recovery cycle',
+        );
         return;
       }
       payoutBId = result.invoiceId;
@@ -1045,8 +1074,45 @@ export class CrashRecoveryManager {
   }
 
   /**
-   * Synchronously transitions a swap to CANCELLED state.
-   * Used during recovery when we know the invoice is already cancelled.
+   * Routes a swap to CANCELLED through the valid transition chain.
+   * Used when the current state only allows reaching CANCELLED via
+   * intermediate states (e.g., DEPOSIT_INVOICE_CREATED → TIMED_OUT → CANCELLING → CANCELLED,
+   * or PARTIAL_DEPOSIT → TIMED_OUT → CANCELLING → CANCELLED).
+   * For states that already allow direct → CANCELLED (e.g., CANCELLING), use _cancelSwap.
+   */
+  private _cancelViaTimeoutPath(swap: SwapRecord): void {
+    // Step 1: Current state → TIMED_OUT
+    const timedOut = this.stateStore.updateState(
+      swap.swap_id,
+      SwapState.TIMED_OUT,
+      {},
+      swap.version,
+    );
+    if (!timedOut) {
+      logger.warn({ swap_id: swap.swap_id }, 'Recovery: _cancelViaTimeoutPath — TIMED_OUT CAS failed');
+      return;
+    }
+
+    // Step 2: TIMED_OUT → CANCELLING
+    const cancelling = this.stateStore.updateState(
+      swap.swap_id,
+      SwapState.CANCELLING,
+      {},
+      timedOut.version,
+    );
+    if (!cancelling) {
+      logger.warn({ swap_id: swap.swap_id }, 'Recovery: _cancelViaTimeoutPath — CANCELLING CAS failed');
+      return;
+    }
+
+    // Step 3: CANCELLING → CANCELLED
+    this._cancelSwap(cancelling);
+  }
+
+  /**
+   * Synchronously transitions a swap from CANCELLING to CANCELLED state.
+   * Used during recovery when we know the invoice is already cancelled and
+   * the swap is in CANCELLING state.
    */
   private _cancelSwap(swap: SwapRecord): void {
     const cancelled = this.stateStore.updateState(
