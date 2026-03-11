@@ -685,7 +685,7 @@ This replaces the former `identifyParty(senderAddress, swap)` function. Sender i
 
 **Resolved addresses are still required** for payout invoice target creation and for DM authorization (associating a Nostr npub with a party role). DIRECT address comparison remains **case-sensitive exact string match** when used for those purposes.
 
-**Migration note:** The existing escrow codebase (`address.ts`) applies `normalizeAddress()` which lowercases the hex portion of DIRECT addresses. This is **incompatible** with the SDK's case-sensitive matching when addresses are used for payout targets or DM authorization. The `normalizeAddress()` function should be deprecated or restricted to display-only contexts.
+**Migration note:** The legacy `normalizeAddress()` in `address.ts` lowercases the hex portion of DIRECT addresses. This function should be deprecated or restricted to display-only contexts — it is **incompatible** with the SDK's case-sensitive matching when addresses are used for payout targets or DM authorization. The separate `normalizeDirectAddress()` in `swap-state-store.ts` performs the same lowercasing but is used specifically for storing resolved party addresses at announcement time. This store-internal normalization is intentional and must be retained — it ensures consistent address representation for deterministic invoice ID derivation (see `architecture.md` §Address normalization).
 
 ## 8. Verification Protocol
 

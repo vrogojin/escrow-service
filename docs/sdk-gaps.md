@@ -466,6 +466,8 @@ The escrow uses the **persist-before-act** pattern: always write the invoice ID 
     - `"Swap <swap_id> payout to Party A"`
     - `"Swap <swap_id> payout to Party B"`
 
+**Important:** Do not rely on catching `INVOICE_ALREADY_EXISTS` for crash recovery. The SDK's in-memory `invoiceTermsCache` is cleared on restart, so this error will not fire after a process restart — it only fires for duplicate calls within the same process lifetime (e.g., concurrent announce race).
+
 This workaround is **functional but fragile**: memo parsing couples crash recovery to free-text conventions, and the O(N) scan becomes expensive as invoice count grows. The `createdAt` passthrough eliminates both issues.
 
 ---

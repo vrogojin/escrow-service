@@ -116,11 +116,15 @@ When gap #8 is available, the escrow passes `createdAt: swap.created_at` (the sw
 - **Payout A invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, memo: "Swap <swap_id> payout to Party A", dueDate: undefined (serializes as null), targets: [{ address: resolvedPartyA, ... }] }))`
 - **Payout B invoice ID** = `SHA-256(canonicalSerialize({ creator: escrowPubkey, createdAt: swap.created_at, memo: "Swap <swap_id> payout to Party B", dueDate: undefined (serializes as null), targets: [{ address: resolvedPartyB, ... }] }))`
 
-**Collision resistance:** Invoice IDs are unique across swaps because the `memo` field embeds the `swap_id` (content-addressed hash of the manifest). Any change to the memo format must preserve this property — the `swap_id` in the memo is load-bearing for collision prevention.
+**Collision resistance:** All three invoice types embed the `swap_id` in their memos: deposit (`"Escrow deposit for swap <swap_id>"`), payout A (`"Swap <swap_id> payout to Party A"`), and payout B (`"Swap <swap_id> payout to Party B"`). Since `swap_id` is a content-addressed hash of the manifest, this ensures unique invoice IDs across swaps. Any change to the memo format must preserve `swap_id` embedding in all three — it is load-bearing for collision prevention.
 
 **Key invariant:** `swap.created_at` is the single source of truth for all invoice IDs derived from a swap. Any code path that creates an invoice without explicitly passing `createdAt: swap.created_at` will break the determinism guarantee. The `escrowChainPubkey` (the `creator` field) must also remain stable for the lifetime of in-flight swaps — key rotation invalidates all pre-computed IDs and is not supported while swaps are active.
 
-**Address normalization:** All `targets[].address` values used in `deriveInvoiceId()` must be in the same case as the addresses stored in SwapStateStore. The store normalizes DIRECT:// addresses to lowercase via `normalizeDirectAddress()`. The SDK's `canonicalSerialize()` is case-sensitive on addresses. Therefore, `deriveInvoiceId()` must always use the stored (lowercased) addresses from `SwapRecord.resolved_party_a_address` / `resolved_party_b_address`, never freshly-resolved addresses that may be mixed-case.
+**Address normalization:** All `targets[].address` values used in `deriveInvoiceId()` must be in the same case as the addresses passed to `createInvoice()`. The store normalizes party DIRECT:// addresses to lowercase via `normalizeDirectAddress()` (in `swap-state-store.ts`). The SDK's `canonicalSerialize()` is case-sensitive on addresses. Therefore:
+- **Party addresses:** `deriveInvoiceId()` must use the stored (lowercased) addresses from `SwapRecord.resolved_party_a_address` / `resolved_party_b_address`, never freshly-resolved addresses that may be mixed-case.
+- **Escrow address:** The escrow's own `escrowDirectAddress` (the deposit invoice target) must also be normalized to lowercase at startup. The `InvoiceManager` should apply `normalizeDirectAddress()` to the escrow identity address in its constructor and use the normalized value in all invoice terms construction.
+
+**Note:** The `normalizeDirectAddress()` function in `swap-state-store.ts` is the correct store-internal normalization function. The legacy `normalizeAddress()` in `address.ts` is deprecated and should not be used — it performs the same lowercasing but its scope is display-only contexts.
 
 The escrow can **pre-compute** expected invoice IDs without calling the SDK, and verify whether an invoice already exists via `getInvoiceStatus(expectedId)`. This eliminates the need for memo-based orphan scanning (see §Crash Recovery).
 
@@ -422,7 +426,7 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 
    **With SDK gap #8 (target):** Re-derive the expected deposit invoice ID using `deriveInvoiceId()` with `createdAt: swap.created_at`. Call `getInvoiceStatus(expectedId)` — if found, adopt the invoice (update `deposit_invoice_id` in the store). If not found (`INVOICE_NOT_FOUND`), re-create — the deterministic `createdAt` ensures the same ID is produced. This eliminates the need for memo-based scanning.
 
-   **Without gap #8 (interim):** Scan `getInvoices()` for invoices whose memo matches `"Escrow deposit for swap <swap_id>"`. If an open match is found, adopt its ID (update the store). If not found, re-create (produces a new ID — the orphan is inert since no party has its token unless DM delivery occurred before the crash).
+   **Without gap #8 (interim):** Scan `getInvoices()` for invoices whose memo matches `"Escrow deposit for swap <swap_id>"`. If exactly one match is found, adopt its ID (update the store). If multiple matches are found (successive crashes each orphaned an invoice), adopt the one with the earliest `terms.createdAt` and log a warning identifying the duplicate(s) for manual cleanup. If not found, re-create (produces a new ID — the orphan is inert since no party has its token unless DM delivery occurred before the crash).
 
    The same pattern applies to payout invoices during `CONCLUDING` recovery: if `payout_a_invoice_id` or `payout_b_invoice_id` is null, use deterministic ID re-derivation (gap #8) or memo scanning (`"Swap <swap_id> payout to Party A"` / `"Swap <swap_id> payout to Party B"`) before creating a new invoice.
 
@@ -458,6 +462,8 @@ The AccountingModule operations are **not** idempotent on terminal invoices. The
 - `cancelInvoice()` throws `INVOICE_ALREADY_CLOSED` → coverage won the race; abort cancellation, reconcile swap to `DEPOSIT_COVERED` and resume conclusion
 
 The recovery logic must always check which terminal state the invoice is actually in after catching a cross-terminal error, and reconcile the swap state accordingly.
+
+**All other SDK errors** (non-terminal codes such as `NOT_INITIALIZED`, `MODULE_DESTROYED`, or aggregator network errors) are unrecoverable. The escrow catches them, logs the error, transitions the swap to `FAILED`, and notifies both parties (see protocol-spec §5 Failure States).
 
 ## Security Considerations
 

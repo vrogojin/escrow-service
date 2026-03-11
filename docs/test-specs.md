@@ -652,7 +652,7 @@ should correctly compare netCoveredAmount >= requestedAmount with BigInt arithme
 
 ### 2.9 Crash Recovery — `crash-recovery.test.ts`
 
-**~45 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
+**~46 tests** covering all recovery pairs from `docs/architecture.md` §Crash Recovery.
 
 Each test sets up a swap in a specific (swap state, invoice state) pair, then runs the recovery procedure and verifies the resulting action. All re-validation steps check coverage by currency slot (coinId against asset index) — sender identity is not evaluated.
 
@@ -726,7 +726,7 @@ should call cancelInvoice() when swap is CANCELLING but invoice is EXPIRED (dueD
 should handle (CANCELLING, COVERED) — coverage arrived after TIMED_OUT was persisted but before cancelInvoice() completed; call closeInvoice() first (coverage won), then resume conclusion via DEPOSIT_COVERED path
 ```
 
-#### Deterministic Invoice ID Recovery (~4 tests)
+#### Deterministic Invoice ID Recovery (~3 tests)
 
 These tests exercise the target behavior (SDK gap #8). The mock supports `createdAt` passthrough as a gap #8 shim.
 
@@ -734,7 +734,18 @@ These tests exercise the target behavior (SDK gap #8). The mock supports `create
 should re-derive expected deposit invoice ID from swap.created_at and adopt existing invoice when deposit_invoice_id is null (ANNOUNCED recovery — requires gap #8)
 should re-derive expected payout invoice IDs from swap.created_at and adopt existing invoices when payout_invoice_id is null (CONCLUDING recovery — requires gap #8)
 should re-create deposit invoice with same deterministic ID when getInvoiceStatus returns INVOICE_NOT_FOUND (invoice was never created — requires gap #8)
-should catch INVOICE_ALREADY_EXISTS on concurrent createInvoice() within same process and treat as success (same-process guard only — does NOT fire after restart)
+```
+
+#### Interim Orphan Recovery (~1 test)
+
+```
+should adopt orphaned deposit invoice via memo scan when deposit_invoice_id is null and gap #8 is unavailable (interim behavior — scan getInvoices by memo pattern)
+```
+
+#### Concurrent Announce Race (~1 test)
+
+```
+should catch INVOICE_ALREADY_EXISTS on concurrent createInvoice() within same process and treat as success (same-process guard only — does NOT fire after restart; see architecture.md §Race Conditions)
 ```
 
 #### Partial Payout Edge Cases (~1 test)
@@ -1087,7 +1098,8 @@ Every (swap state, invoice state) pair from the crash recovery table in `docs/ar
 | ANNOUNCED (deposit_invoice_id=null) | (invoice exists) | crash-recovery.test.ts §Deterministic ID Recovery #1 — adopt via re-derived ID (gap #8) |
 | CONCLUDING (payout_id=null) | (payout exists) | crash-recovery.test.ts §Deterministic ID Recovery #2 — adopt via re-derived ID (gap #8) |
 | ANNOUNCED (deposit_invoice_id=null) | (no invoice) | crash-recovery.test.ts §Deterministic ID Recovery #3 — re-create with same ID (gap #8) |
-| ANNOUNCED (concurrent createInvoice) | INVOICE_ALREADY_EXISTS | crash-recovery.test.ts §Deterministic ID Recovery #4 — same-process guard |
+| ANNOUNCED (deposit_invoice_id=null, no gap #8) | (orphan via memo scan) | crash-recovery.test.ts §Interim Orphan Recovery — adopt via memo match |
+| ANNOUNCED (concurrent createInvoice) | INVOICE_ALREADY_EXISTS | crash-recovery.test.ts §Concurrent Announce Race — same-process guard |
 
 ### 5.3 DM Message Type Coverage
 
@@ -1147,8 +1159,8 @@ The live E2E tests cover the complete trader-creation → topup → escrow → e
 | | swap-state-store.test.ts | ~12 |
 | | manifest-validator.test.ts | ~4 |
 | | deposit-validation.test.ts | ~14 |
-| | crash-recovery.test.ts | ~45 |
-| **Unit subtotal** | | **~221** |
+| | crash-recovery.test.ts | ~46 |
+| **Unit subtotal** | | **~222** |
 | **Integration** | swap-lifecycle.integration.test.ts | ~25 |
 | **Live E2E** | swap-lifecycle.e2e-live.test.ts | ~22 |
-| **Total** | | **~268** |
+| **Total** | | **~269** |
