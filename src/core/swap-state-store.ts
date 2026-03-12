@@ -163,9 +163,22 @@ export class InMemorySwapStateStore implements SwapStateStore {
     record.state = newState;
     record.version++;
 
-    // Apply updates (skip state and version — managed above)
+    // Apply updates — only allow safe mutable fields
+    const ALLOWED_UPDATE_FIELDS = new Set([
+      'deposit_invoice_id',
+      'payout_a_invoice_id',
+      'payout_b_invoice_id',
+      'first_deposit_at',
+      'timeout_at',
+      'completed_at',
+      'error_message',
+    ]);
+
     for (const [key, value] of Object.entries(updates)) {
       if (key !== 'state' && key !== 'version' && value !== undefined) {
+        if (!ALLOWED_UPDATE_FIELDS.has(key)) {
+          throw new Error(`updateState: field '${key}' is not in the allowed update list (swap ${swapId})`);
+        }
         (record as unknown as Record<string, unknown>)[key] = value;
       }
     }

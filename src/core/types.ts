@@ -63,7 +63,7 @@ export interface DepositValidationResult {
   coinId: string;
   amount: string;
   transferId: string;
-  reason?: 'WRONG_CURRENCY' | 'MASKED_NO_REFUND';
+  reason?: 'WRONG_CURRENCY';
 }
 
 /**

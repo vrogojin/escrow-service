@@ -35,6 +35,7 @@ interface TimerEntry {
 export class TimeoutManager {
   private readonly timers = new Map<string, TimerEntry>();
   private readonly onTimeout: (swapId: string) => Promise<void>;
+  private destroyed = false;
 
   constructor(deps: TimeoutManagerDeps) {
     this.onTimeout = deps.onTimeout;
@@ -133,6 +134,7 @@ export class TimeoutManager {
    * the orchestrator has been torn down.
    */
   destroy(): void {
+    this.destroyed = true;
     for (const [swapId, entry] of this.timers) {
       clearTimeout(entry.handle);
       logger.debug({ swap_id: swapId }, 'Timer cleared on destroy');
@@ -151,6 +153,8 @@ export class TimeoutManager {
    */
   private _scheduleInternal(swapId: string, delayMs: number, deadlineMs: number): void {
     const handle = setTimeout(() => {
+      if (this.destroyed) return;
+
       // Clear the timer reference before firing to prevent memory leaks
       // and allow hasTimer() to return false within the callback
       this.timers.delete(swapId);

@@ -547,6 +547,22 @@ export class SwapOrchestrator {
       return;
     }
 
+    // Verify coinId identity — guard against SDK reordering asset slots
+    if (assetA.coin[0] !== swap.manifest.party_a_currency_to_change ||
+        assetB.coin[0] !== swap.manifest.party_b_currency_to_change) {
+      logger.error(
+        {
+          swap_id: swap.swap_id,
+          assetA_coinId: assetA.coin[0],
+          expected_A: swap.manifest.party_a_currency_to_change,
+          assetB_coinId: assetB.coin[0],
+          expected_B: swap.manifest.party_b_currency_to_change,
+        },
+        'invoice:covered — asset slot coinId mismatch (SDK ordering changed?), aborting',
+      );
+      return;
+    }
+
     // Validate each asset slot's coverage using SDK-provided fields per architecture.md
     const requiredA = BigInt(swap.manifest.party_a_value_to_change);
     const requiredB = BigInt(swap.manifest.party_b_value_to_change);
@@ -884,17 +900,11 @@ export class SwapOrchestrator {
     // Gate all payout invoice creation on winning this CAS. This prevents
     // orphaned payout invoices: if another handler wins the CAS, we never
     // create payout invoices at all.
-    const currentSwap = this.stateStore.findBySwapId(swap.swap_id);
-    if (!currentSwap) {
-      logger.error({ swap_id: swap.swap_id }, 'Swap not found when transitioning to CONCLUDING');
-      return;
-    }
-
     const concluding = this.stateStore.updateState(
       swap.swap_id,
       SwapState.CONCLUDING,
       {},
-      currentSwap.version,
+      swap.version,
     );
 
     if (!concluding) {
@@ -988,7 +998,7 @@ export class SwapOrchestrator {
       'Swap concluding — paying payout invoices',
     );
 
-    // Step 4: Pay payout A — targetIndex 0, assetIndex 0.
+    // Step 5: Pay payout A — targetIndex 0, assetIndex 0.
     // CRITICAL: Omit the `amount` parameter so the SDK computes
     // remaining = requestedAmount - netCoveredAmount. This makes the call
     // inherently idempotent: if payout A was already fully covered (e.g.,
@@ -1013,7 +1023,7 @@ export class SwapOrchestrator {
       }
     }
 
-    // Step 5: Pay payout B — targetIndex 0, assetIndex 0.
+    // Step 6: Pay payout B — targetIndex 0, assetIndex 0.
     // Same idempotent pattern: omit amount so SDK computes remaining.
     try {
       await this.invoiceManager.payInvoice(payoutBId, {
@@ -1106,62 +1116,62 @@ export class SwapOrchestrator {
       const target = status.targets[0];
       if (!target) return;
 
-      // For each coin asset, iterate transfers, group by effectiveSender, sum forward amounts.
-      // The coinAsset.transfers list contains all transfers for that asset.
+      const manifest = swap.manifest;
+      const requiredAmounts: Record<string, bigint> = {
+        [manifest.party_a_currency_to_change]: BigInt(manifest.party_a_value_to_change),
+        [manifest.party_b_currency_to_change]: BigInt(manifest.party_b_value_to_change),
+      };
+
       for (const coinAsset of target.coinAssets) {
-        // Group transfers by effectiveSender and sum forward amounts
-        const surplusByEffectiveSender = new Map<string, bigint>();
+        const coinId = coinAsset.coin[0];
+        const required = requiredAmounts[coinId] ?? 0n;
+
+        // Sum all forward deposits per effectiveSender
+        const depositsBySender = new Map<string, bigint>();
+        let totalDeposited = 0n;
 
         for (const transfer of coinAsset.transfers) {
-          // Only sum forward transfers (not bounces/returns)
           if (transfer.paymentDirection !== 'forward') continue;
 
           const effectiveSender = getEffectiveSender(transfer);
           if (!effectiveSender) {
-            // Masked predicate with no refund address — cannot route return
             logger.warn(
-              {
-                swap_id: swap.swap_id,
-                transferId: transfer.transferId,
-              },
+              { swap_id: swap.swap_id, transferId: transfer.transferId },
               'Cannot return surplus for transfer: no return address (masked predicate with no refundAddress)',
             );
             continue;
           }
 
           const amount = BigInt(transfer.amount);
-          const current = surplusByEffectiveSender.get(effectiveSender) ?? 0n;
-          surplusByEffectiveSender.set(effectiveSender, current + amount);
+          totalDeposited += amount;
+          const current = depositsBySender.get(effectiveSender) ?? 0n;
+          depositsBySender.set(effectiveSender, current + amount);
         }
 
-        // For each effective sender with surplus, return it
-        for (const [effectiveSender, surplusAmount] of surplusByEffectiveSender) {
+        const totalSurplus = totalDeposited - required;
+        if (totalSurplus <= 0n) continue;
+
+        // Distribute surplus proportionally per sender
+        for (const [effectiveSender, senderDeposited] of depositsBySender) {
+          // Each sender's share: (senderDeposited / totalDeposited) * totalSurplus
+          // Use integer math: senderSurplus = senderDeposited * totalSurplus / totalDeposited
+          const senderSurplus = (senderDeposited * totalSurplus) / totalDeposited;
+          if (senderSurplus <= 0n) continue;
+
           try {
             await this.invoiceManager.returnPayment(swap.deposit_invoice_id, {
               recipient: effectiveSender,
-              amount: surplusAmount.toString(),
-              coinId: coinAsset.coin[0],
+              amount: senderSurplus.toString(),
+              coinId,
               freeText: `Surplus return for swap ${swap.swap_id}`,
             });
             logger.info(
-              {
-                swap_id: swap.swap_id,
-                recipient: effectiveSender,
-                coinId: coinAsset.coin[0],
-                amount: surplusAmount.toString(),
-              },
+              { swap_id: swap.swap_id, recipient: effectiveSender, coinId, amount: senderSurplus.toString() },
               'Surplus returned to depositor',
             );
           } catch (err) {
-            // Best-effort — log but don't block completion
             logger.warn(
-              {
-                err,
-                swap_id: swap.swap_id,
-                recipient: effectiveSender,
-                coinId: coinAsset.coin[0],
-                amount: surplusAmount.toString(),
-              },
+              { err, swap_id: swap.swap_id, recipient: effectiveSender, coinId, amount: senderSurplus.toString() },
               'Failed to return surplus to depositor (best-effort)',
             );
           }

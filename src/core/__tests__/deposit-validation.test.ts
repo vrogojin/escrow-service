@@ -137,7 +137,7 @@ describe('validateDeposit', () => {
     expect(result.reason).toBeUndefined();
   });
 
-  it('should reject deposit with null senderAddress AND null refundAddress (masked predicate without return route)', () => {
+  it('should accept deposit with null senderAddress AND null refundAddress (masked predicate — currency match takes precedence)', () => {
     const transfer = createMockTransferRef({
       transferId: 'tx1',
       senderAddress: null,
@@ -145,8 +145,11 @@ describe('validateDeposit', () => {
       coinId: 'USD',
     });
     const result = validateDeposit(transfer, MANIFEST);
-    expect(result.partySide).toBeNull();
-    expect(result.reason).toBe('MASKED_NO_REFUND');
+    // Masked deposits are accepted per architecture spec — currency match takes precedence.
+    // Surplus return for masked deposits with no refundAddress may require manual intervention.
+    expect(result.partySide).toBe('A');
+    expect(result.reason).toBeUndefined();
+    expect(result.effectiveSender).toBeNull();
   });
 
   it('should accept deposit with null senderAddress but present refundAddress (masked predicate with return route)', () => {

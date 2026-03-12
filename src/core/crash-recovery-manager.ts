@@ -605,6 +605,16 @@ export class CrashRecoveryManager {
           );
           if (coveredSwap) {
             await this._resumePayouts(coveredSwap);
+          } else {
+            // CAS failed — another handler may have advanced the state.
+            // Reload and check: if already in DEPOSIT_COVERED or later, it's handled.
+            const reloaded = this.stateStore.findBySwapId(swap.swap_id);
+            if (reloaded && !isTerminalState(reloaded.state)) {
+              logger.warn(
+                { swap_id: swap.swap_id, state: reloaded.state },
+                'Recovery: CANCELLING INVOICE_ALREADY_CLOSED CAS failed, reloaded state — will be handled by next recovery cycle',
+              );
+            }
           }
         } else {
           throw err;
@@ -692,41 +702,30 @@ export class CrashRecoveryManager {
       return;
     }
 
-    // Currency-slot coverage: verify cumulative forward amounts meet required values
-    const slotAAmount = assetA.transfers
-      .filter(
-        (t) =>
-          t.paymentDirection === 'forward' &&
-          t.coinId === swap.manifest.party_a_currency_to_change,
-      )
-      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
-
-    const slotBAmount = assetB.transfers
-      .filter(
-        (t) =>
-          t.paymentDirection === 'forward' &&
-          t.coinId === swap.manifest.party_b_currency_to_change,
-      )
-      .reduce((sum, t) => sum + BigInt(t.amount), 0n);
-
+    // Currency-slot coverage: use SDK-provided isCovered and netCoveredAmount
+    // (consistent with the live event handler in swap-orchestrator.ts)
     const requiredA = BigInt(swap.manifest.party_a_value_to_change);
     const requiredB = BigInt(swap.manifest.party_b_value_to_change);
+    const coveredA = BigInt(assetA.netCoveredAmount);
+    const coveredB = BigInt(assetB.netCoveredAmount);
 
-    if (slotAAmount < requiredA || slotBAmount < requiredB) {
+    if (!assetA.isCovered || coveredA < requiredA || !assetB.isCovered || coveredB < requiredB) {
       // Coverage doesn't meet per-currency-slot amount thresholds.
       // DEPOSIT_COVERED can only transition to CONCLUDING or FAILED (not PARTIAL_DEPOSIT).
       // Transition to FAILED — operator must manually verify coverage and intervene.
       logger.error(
         {
           swap_id: swap.swap_id,
-          slotAAmount: String(slotAAmount),
-          slotBAmount: String(slotBAmount),
+          assetA_covered: assetA.isCovered,
+          coveredA: String(coveredA),
+          assetB_covered: assetB.isCovered,
+          coveredB: String(coveredB),
           requiredA: String(requiredA),
           requiredB: String(requiredB),
         },
         'Recovery: DEPOSIT_COVERED currency-slot amount coverage validation failed — transitioning to FAILED (manual intervention required)',
       );
-      this._failSwap(swap, `Currency-slot amount coverage validation failed in recovery (A: ${String(slotAAmount)}/${String(requiredA)}, B: ${String(slotBAmount)}/${String(requiredB)})`);
+      this._failSwap(swap, `Currency-slot amount coverage validation failed in recovery (A: ${String(coveredA)}/${String(requiredA)}, B: ${String(coveredB)}/${String(requiredB)})`);
       return;
     }
 
@@ -877,6 +876,20 @@ export class CrashRecoveryManager {
         return;
       }
       payoutBId = result.invoiceId;
+
+      // Persist payout B ID immediately (still in current state) before CONCLUDING CAS.
+      // Mirrors the payout A checkpoint pattern — prevents orphaned payout B invoices.
+      const afterB = this.stateStore.updateState(
+        swap.swap_id,
+        currentSwap.state,
+        { payout_b_invoice_id: payoutBId },
+        currentSwap.version,
+      );
+      if (!afterB) {
+        logger.warn({ swap_id: swap.swap_id }, 'Recovery: Version mismatch persisting payout B invoice ID, aborting');
+        return;
+      }
+      currentSwap = afterB;
     }
 
     // Persist CONCLUDING with both payout IDs (idempotent if already there).

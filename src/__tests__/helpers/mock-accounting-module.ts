@@ -244,7 +244,7 @@ export class MockAccountingModule {
           '0',
         );
         return {
-          coin: asset,
+          coin: (asset.coin || asset) as [string, string],
           coveredAmount,
           returnedAmount: '0',
           netCoveredAmount: coveredAmount,
