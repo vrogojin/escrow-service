@@ -400,12 +400,12 @@ On first valid deposit:
 
 When both parties have fully paid, the AccountingModule fires `invoice:covered`. The escrow:
 
-1. **State guard:** only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT`
+1. **State guard:** Only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT`. For `TIMED_OUT` or `CANCELLING`, contest via CAS to `DEPOSIT_COVERED` per architecture.md §Timeout Handling race condition. Ignore all other states (including `DEPOSIT_COVERED`, `CONCLUDING`, and terminal states).
 2. **Re-validate per-currency coverage:** call `getInvoiceStatus()` and verify that `coinAssets[0]` (`party_a_currency_to_change`) and `coinAssets[1]` (`party_b_currency_to_change`) are each individually covered at the required amounts (`isCovered === true` and `netCoveredAmount >= requestedAmount`). The `invoice:covered` event only means aggregate amounts are met — it does not guarantee that the two distinct currency slots are both individually satisfied. If either slot is not individually covered, bounce the excess wrong-currency payment and wait.
 3. **No sender identity check:** Coverage is valid regardless of who paid each side. The escrow does not verify that party A specifically sent `party_a_currency` — any payer contributing the correct currency to the correct asset slot is accepted.
 4. Transitions: `PARTIAL_DEPOSIT → DEPOSIT_COVERED` (or `DEPOSIT_INVOICE_CREATED → DEPOSIT_COVERED`). This transition is **persisted to SwapStateStore** before proceeding. In normal operation, `DEPOSIT_COVERED` is short-lived — the handler immediately proceeds to closing and payout creation. However, a crash between this persist and the `CONCLUDING` persist (step 8) will leave the swap in `DEPOSIT_COVERED`, which crash recovery handles (see architecture.md §Crash Recovery).
-5. Cancels the timeout timer (if running)
-6. Closes the deposit invoice: `closeInvoice(depositInvoiceId)` — do **not** pass `{autoReturn: true}` (see architecture.md §Event-Driven Flow)
+5. Closes the deposit invoice: `closeInvoice(depositInvoiceId)` — do **not** pass `{autoReturn: true}` (see architecture.md §Event-Driven Flow). **Note:** Close the deposit invoice first. If close fails (transient error), the timeout timer remains active as a safety net.
+6. Cancels the timeout timer (if running)
 7. Creates two payout invoices (see §2.2)
 8. **Persists state as `CONCLUDING`** with both payout invoice IDs to SwapStateStore **before** paying — this is the persist-before-act checkpoint for crash recovery (see architecture.md §Crash Recovery)
 
