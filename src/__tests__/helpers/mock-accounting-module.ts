@@ -583,4 +583,19 @@ export class MockAccountingModule {
     this.callOrder = [];
     this.inFlightCreates.clear();
   }
+
+  /**
+   * Removes an invoice from the mock store (simulating INVOICE_NOT_FOUND on restart).
+   */
+  _removeInvoice(invoiceId: string): void {
+    this.invoices.delete(invoiceId);
+  }
+
+  /**
+   * Disables deterministic invoice ID generation (test for interim memo-based recovery).
+   */
+  _disableDeterministicId(): void {
+    // Store a flag to use non-deterministic IDs on next createInvoice
+    (this as any)._nondeterministic = true;
+  }
 }
