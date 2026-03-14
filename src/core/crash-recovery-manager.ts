@@ -40,11 +40,49 @@ export class CrashRecoveryManager {
   private readonly timeoutManager: TimeoutManager;
   private readonly orchestrator: SwapOrchestrator;
 
+  /**
+   * Tracks consecutive INVOICE_NOT_TARGET failures per swap_id.
+   * After MAX_INVOICE_NOT_TARGET_ATTEMPTS failures the swap is transitioned to FAILED.
+   * Reset on successful recovery.
+   */
+  private readonly recoveryAttempts: Map<string, number> = new Map();
+
+  private static readonly MAX_INVOICE_NOT_TARGET_ATTEMPTS = 5;
+
   constructor(deps: CrashRecoveryDeps) {
     this.invoiceManager = deps.invoiceManager;
     this.stateStore = deps.stateStore;
     this.timeoutManager = deps.timeoutManager;
     this.orchestrator = deps.orchestrator;
+  }
+
+  /**
+   * Resets the INVOICE_NOT_TARGET attempt counter for a swap.
+   * Call this after any successful recovery path completes.
+   */
+  private resetRecoveryAttempts(swapId: string): void {
+    this.recoveryAttempts.delete(swapId);
+  }
+
+  /**
+   * Increments the INVOICE_NOT_TARGET attempt counter.
+   * Returns true if max attempts exceeded — caller should transition to FAILED.
+   */
+  private _recordInvoiceNotTarget(swapId: string, context: string): boolean {
+    const count = (this.recoveryAttempts.get(swapId) ?? 0) + 1;
+    this.recoveryAttempts.set(swapId, count);
+    if (count >= CrashRecoveryManager.MAX_INVOICE_NOT_TARGET_ATTEMPTS) {
+      logger.error(
+        { swap_id: swapId, attempts: count, context },
+        `Recovery stuck: INVOICE_NOT_TARGET after ${count} attempts — transitioning to FAILED`,
+      );
+      return true;
+    }
+    logger.warn(
+      { swap_id: swapId, attempts: count, context },
+      'Recovery: INVOICE_NOT_TARGET (transient), will retry on next recovery cycle',
+    );
+    return false;
   }
 
   /**
@@ -280,11 +318,43 @@ export class CrashRecoveryManager {
         await this._resumeConclusion(swap);
         break;
 
-      case 'CLOSED':
-        // Deposit closed with only partial coverage — unexpected
-        logger.error({ swap_id: swap.swap_id }, 'Recovery: PARTIAL_DEPOSIT + CLOSED — unexpected, transitioning to FAILED');
-        this._failSwap(swap, 'Deposit invoice closed unexpectedly with partial deposits');
+      case 'CLOSED': {
+        // The invoice is CLOSED — this can happen legitimately if both deposits
+        // arrived and closeDepositInvoice succeeded but the crash occurred before
+        // updateState(DEPOSIT_COVERED) was persisted.  Check per-slot coverage
+        // before deciding whether to fail or resume conclusion.
+        logger.info({ swap_id: swap.swap_id }, 'Recovery: PARTIAL_DEPOSIT + CLOSED — checking per-slot coverage before deciding action');
+        // We need the full invoice status object (with targets[0].coinAssets[].isCovered)
+        // to determine per-slot coverage. The `depositInvoiceState` string from the caller
+        // only tells us the state, not the coverage details.
+        let closedStatus: Awaited<ReturnType<typeof this.invoiceManager.getInvoiceStatus>>;
+        try {
+          closedStatus = await this.invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
+        } catch (statusErr) {
+          logger.error({ err: statusErr, swap_id: swap.swap_id }, 'Recovery: PARTIAL_DEPOSIT + CLOSED — failed to fetch invoice status, transitioning to FAILED');
+          this._failSwap(swap, 'PARTIAL_DEPOSIT + CLOSED — could not fetch invoice status for coverage check');
+          break;
+        }
+        const closedTarget = closedStatus.targets[0];
+        const closedAssetA = closedTarget?.coinAssets[0];
+        const closedAssetB = closedTarget?.coinAssets[1];
+        if (closedAssetA?.isCovered && closedAssetB?.isCovered) {
+          // Coverage was legitimately achieved — resume conclusion instead of failing.
+          logger.info({ swap_id: swap.swap_id }, 'Recovery: PARTIAL_DEPOSIT + CLOSED — both slots covered, transitioning to DEPOSIT_COVERED and resuming payouts');
+          const coveredSwap = this.stateStore.updateState(swap.swap_id, SwapState.DEPOSIT_COVERED, {}, swap.version);
+          if (coveredSwap) {
+            this.resetRecoveryAttempts(swap.swap_id);
+            await this._resumePayouts(coveredSwap);
+          } else {
+            logger.warn({ swap_id: swap.swap_id }, 'Recovery: PARTIAL_DEPOSIT + CLOSED — version mismatch on DEPOSIT_COVERED transition');
+          }
+        } else {
+          // Not fully covered — genuinely unexpected closed invoice with partial deposits.
+          logger.error({ swap_id: swap.swap_id }, 'Recovery: PARTIAL_DEPOSIT + CLOSED — coverage NOT achieved, transitioning to FAILED');
+          this._failSwap(swap, 'Deposit invoice closed unexpectedly with partial deposits and coverage not achieved');
+        }
         break;
+      }
 
       case 'CANCELLED':
         // Timeout fired during crash.
@@ -385,6 +455,7 @@ export class CrashRecoveryManager {
     switch (depositInvoiceState) {
       case 'CLOSED':
         // Normal: deposit closed, now need to check/resume payouts
+        this.resetRecoveryAttempts(swap.swap_id);
         await this._resumePayouts(swap);
         break;
 
@@ -403,7 +474,9 @@ export class CrashRecoveryManager {
             // Transient SDK condition (addresses not loaded) — do NOT proceed
             // to _resumePayouts with deposit unclosed. Leave in CONCLUDING
             // for next recovery cycle to retry.
-            logger.warn({ swap_id: swap.swap_id }, 'Recovery: CONCLUDING — closeDepositInvoice got INVOICE_NOT_TARGET (transient), will retry on next cycle');
+            if (this._recordInvoiceNotTarget(swap.swap_id, 'CONCLUDING closeDepositInvoice')) {
+              this._failSwap(swap, 'Recovery stuck: INVOICE_NOT_TARGET after max attempts (CONCLUDING closeDepositInvoice)');
+            }
             return;
           } else if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CANCELLED') {
             logger.error({ swap_id: swap.swap_id }, 'Recovery: CONCLUDING — deposit was cancelled, transitioning to FAILED');
@@ -413,6 +486,7 @@ export class CrashRecoveryManager {
             throw err;
           }
         }
+        this.resetRecoveryAttempts(swap.swap_id);
         await this._resumePayouts(swap);
         break;
 
@@ -467,8 +541,16 @@ export class CrashRecoveryManager {
         try {
           await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
         } catch (err) {
-          if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
-            // Already closed or transient SDK condition — proceed
+          if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
+            // Already closed — proceed
+          } else if (isSphereError(err) && err.code === 'INVOICE_NOT_TARGET') {
+            // Transient SDK condition — deposit is still OPEN, do NOT proceed to
+            // _resumePayouts with an unclosed deposit invoice.  Leave in TIMED_OUT
+            // so the next recovery cycle retries.
+            if (this._recordInvoiceNotTarget(swap.swap_id, 'TIMED_OUT+COVERED closeDepositInvoice')) {
+              this._failSwap(swap, 'Recovery stuck: INVOICE_NOT_TARGET after max attempts (TIMED_OUT+COVERED closeDepositInvoice)');
+            }
+            return;
           } else {
             throw err;
           }
@@ -482,6 +564,7 @@ export class CrashRecoveryManager {
         swap.version,
       );
       if (coveredSwap) {
+        this.resetRecoveryAttempts(swap.swap_id);
         await this._resumePayouts(coveredSwap);
       } else {
         logger.warn({ swap_id: swap.swap_id }, 'Recovery: TIMED_OUT — version mismatch contesting to DEPOSIT_COVERED');
@@ -565,8 +648,16 @@ export class CrashRecoveryManager {
         try {
           await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
         } catch (err) {
-          if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
-            // Already closed or transient SDK condition — proceed
+          if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
+            // Already closed — proceed
+          } else if (isSphereError(err) && err.code === 'INVOICE_NOT_TARGET') {
+            // Transient SDK condition — deposit is still OPEN, do NOT proceed to
+            // _resumePayouts with an unclosed deposit invoice.  Leave in CANCELLING
+            // so the next recovery cycle retries.
+            if (this._recordInvoiceNotTarget(swap.swap_id, 'CANCELLING+COVERED closeDepositInvoice')) {
+              this._failSwap(swap, 'Recovery stuck: INVOICE_NOT_TARGET after max attempts (CANCELLING+COVERED closeDepositInvoice)');
+            }
+            return;
           } else {
             throw err;
           }
@@ -582,6 +673,7 @@ export class CrashRecoveryManager {
         swap.version,
       );
       if (coveredSwap) {
+        this.resetRecoveryAttempts(swap.swap_id);
         await this._resumePayouts(coveredSwap);
       } else {
         logger.warn({ swap_id: swap.swap_id }, 'Recovery: CANCELLING — version mismatch contesting to DEPOSIT_COVERED');
@@ -702,30 +794,34 @@ export class CrashRecoveryManager {
       return;
     }
 
-    // Currency-slot coverage: use SDK-provided isCovered and netCoveredAmount
-    // (consistent with the live event handler in swap-orchestrator.ts)
-    const requiredA = BigInt(swap.manifest.party_a_value_to_change);
-    const requiredB = BigInt(swap.manifest.party_b_value_to_change);
-    const coveredA = BigInt(assetA.netCoveredAmount);
-    const coveredB = BigInt(assetB.netCoveredAmount);
+    // Verify coinId identity — guard against SDK reordering asset slots.
+    // Consistent with the live event handler in swap-orchestrator.ts.
+    if (assetA.coin[0] !== swap.manifest.party_a_currency_to_change ||
+        assetB.coin[0] !== swap.manifest.party_b_currency_to_change) {
+      this._failSwap(
+        swap,
+        `Recovery: asset slot coinId mismatch (expected ${swap.manifest.party_a_currency_to_change}/${swap.manifest.party_b_currency_to_change}, ` +
+        `got ${assetA.coin[0]}/${assetB.coin[0]})`,
+      );
+      return;
+    }
 
-    if (!assetA.isCovered || coveredA < requiredA || !assetB.isCovered || coveredB < requiredB) {
-      // Coverage doesn't meet per-currency-slot amount thresholds.
+    // Currency-slot coverage: use SDK-provided isCovered
+    if (!assetA.isCovered || !assetB.isCovered) {
+      // Coverage doesn't meet per-currency-slot thresholds.
       // DEPOSIT_COVERED can only transition to CONCLUDING or FAILED (not PARTIAL_DEPOSIT).
       // Transition to FAILED — operator must manually verify coverage and intervene.
       logger.error(
         {
           swap_id: swap.swap_id,
           assetA_covered: assetA.isCovered,
-          coveredA: String(coveredA),
+          assetA_amount: assetA.netCoveredAmount,
           assetB_covered: assetB.isCovered,
-          coveredB: String(coveredB),
-          requiredA: String(requiredA),
-          requiredB: String(requiredB),
+          assetB_amount: assetB.netCoveredAmount,
         },
-        'Recovery: DEPOSIT_COVERED currency-slot amount coverage validation failed — transitioning to FAILED (manual intervention required)',
+        'Recovery: DEPOSIT_COVERED currency-slot coverage validation failed — transitioning to FAILED (manual intervention required)',
       );
-      this._failSwap(swap, `Currency-slot amount coverage validation failed in recovery (A: ${String(coveredA)}/${String(requiredA)}, B: ${String(coveredB)}/${String(requiredB)})`);
+      this._failSwap(swap, `Currency-slot coverage validation failed in recovery (A: ${assetA.isCovered}, B: ${assetB.isCovered})`);
       return;
     }
 
@@ -920,10 +1016,31 @@ export class CrashRecoveryManager {
         currentSwap.version,
       );
       if (!updated) {
-        logger.warn({ swap_id: swap.swap_id }, 'Recovery: Version mismatch updating payout B invoice ID');
-        return;
+        // CAS failed — another handler may have won the race and already persisted
+        // payout_b_invoice_id.  Reload and inspect before giving up.
+        const reloadedAfterCas = this.stateStore.findBySwapId(swap.swap_id);
+        if (reloadedAfterCas?.payout_b_invoice_id) {
+          // Another handler persisted the ID — adopt it and continue.
+          // Our newly-created invoice (payoutBId) is now orphaned; log at warn
+          // so operators can reconcile the orphaned invoice if needed.
+          logger.warn(
+            { swap_id: swap.swap_id, adopted_id: reloadedAfterCas.payout_b_invoice_id, orphaned_id: payoutBId },
+            'Recovery: CONCLUDING CAS failed — adopting competitor payout B ID; our newly-created invoice is orphaned',
+          );
+          payoutBId = reloadedAfterCas.payout_b_invoice_id;
+          currentSwap = reloadedAfterCas;
+        } else {
+          // No other handler persisted the ID — the newly created payout B invoice
+          // is now orphaned.  Log at error level so the operator can reconcile.
+          logger.error(
+            { swap_id: swap.swap_id, orphaned_payout_b_invoice_id: payoutBId },
+            'Recovery: CONCLUDING self-transition CAS failed and payout B ID not present in store — orphaned invoice, operator intervention required',
+          );
+          return;
+        }
+      } else {
+        currentSwap = updated;
       }
-      currentSwap = updated;
     }
 
     logger.info({ swap_id: swap.swap_id, payoutAId, payoutBId }, 'Recovery: Resuming payout payments');
@@ -1036,22 +1153,32 @@ export class CrashRecoveryManager {
       return;
     }
 
-    // Check if each currency slot's net contribution still meets the threshold
-    const slotAAmount = assetA.transfers
-      .filter(
-        (t) =>
-          t.paymentDirection === 'forward' &&
-          t.coinId === swap.manifest.party_a_currency_to_change,
-      )
-      .reduce((sum, t) => BigInt(sum) + BigInt(t.amount), 0n);
+    // Check if each currency slot's net contribution still meets the threshold.
+    // parseBigIntOrThrow throws on invalid/null amounts — catch here and fail
+    // the swap rather than proceeding with corrupted coverage arithmetic.
+    let slotAAmount: bigint;
+    let slotBAmount: bigint;
+    try {
+      slotAAmount = assetA.transfers
+        .filter(
+          (t) =>
+            t.paymentDirection === 'forward' &&
+            t.coinId === swap.manifest.party_a_currency_to_change,
+        )
+        .reduce((sum: bigint, t) => sum + this.parseBigIntOrThrow(t.amount, swap.swap_id), 0n);
 
-    const slotBAmount = assetB.transfers
-      .filter(
-        (t) =>
-          t.paymentDirection === 'forward' &&
-          t.coinId === swap.manifest.party_b_currency_to_change,
-      )
-      .reduce((sum, t) => BigInt(sum) + BigInt(t.amount), 0n);
+      slotBAmount = assetB.transfers
+        .filter(
+          (t) =>
+            t.paymentDirection === 'forward' &&
+            t.coinId === swap.manifest.party_b_currency_to_change,
+        )
+        .reduce((sum: bigint, t) => sum + this.parseBigIntOrThrow(t.amount, swap.swap_id), 0n);
+    } catch (parseErr) {
+      logger.error({ err: parseErr, swap_id: swap.swap_id }, 'Recovery: corrupt transfer amount data — cannot verify coverage');
+      this._failSwap(swap, `Corrupt transfer amount data: ${(parseErr as Error).message}`);
+      return;
+    }
 
     const requiredA = BigInt(swap.manifest.party_a_value_to_change);
     const requiredB = BigInt(swap.manifest.party_b_value_to_change);
@@ -1079,6 +1206,25 @@ export class CrashRecoveryManager {
         'Recovery: DEPOSIT_COVERED coverage regressed — transitioning to FAILED (manual intervention required)',
       );
       this._failSwap(swap, `Coverage regressed in DEPOSIT_COVERED recovery (A: ${String(slotAAmount)}/${String(requiredA)}, B: ${String(slotBAmount)}/${String(requiredB)})`);
+    }
+  }
+
+  /**
+   * Parses an SDK transfer amount string to bigint.
+   * Throws on null/empty/invalid input — caller should catch and fail the swap
+   * rather than proceeding with corrupted arithmetic.
+   *
+   * @param value - The raw amount string from an SDK InvoiceTransferRef.
+   * @param context - Short description for error context (e.g. swap_id).
+   */
+  private parseBigIntOrThrow(value: string | null | undefined, context: string): bigint {
+    if (value == null || value === '') {
+      throw new Error(`Recovery: invalid transfer amount (null/empty) for ${context}`);
+    }
+    try {
+      return BigInt(value);
+    } catch {
+      throw new Error(`Recovery: invalid transfer amount "${value}" for ${context}`);
     }
   }
 
@@ -1154,6 +1300,7 @@ export class CrashRecoveryManager {
 
   /**
    * Synchronously transitions a swap to FAILED state.
+   * Also prunes the recoveryAttempts counter — no further retries will occur.
    */
   private _failSwap(swap: SwapRecord, errorMessage: string): void {
     const failed = this.stateStore.updateState(
@@ -1163,6 +1310,7 @@ export class CrashRecoveryManager {
       swap.version,
     );
     if (failed) {
+      this.recoveryAttempts.delete(swap.swap_id);
       logger.error({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: Swap transitioned to FAILED');
     }
   }

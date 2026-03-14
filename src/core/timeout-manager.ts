@@ -49,6 +49,9 @@ export class TimeoutManager {
    * @throws Error if a timer already exists for this swap (caller must cancel first).
    */
   schedule(swapId: string, timeoutMs: number): void {
+    if (this.destroyed) {
+      throw new Error(`TimeoutManager: schedule() called after destroy() for swap ${swapId}`);
+    }
     if (this.timers.has(swapId)) {
       throw new Error(`Timer already exists for swap ${swapId}. Cancel before rescheduling.`);
     }
@@ -105,6 +108,9 @@ export class TimeoutManager {
    * @param remainingMs - Milliseconds remaining until timeout (from persisted timeout_at).
    */
   reRegister(swapId: string, remainingMs: number): void {
+    if (this.destroyed) {
+      throw new Error(`TimeoutManager: reRegister() called after destroy() for swap ${swapId}`);
+    }
     // Cancel any existing timer to avoid duplicates
     this.cancel(swapId);
 

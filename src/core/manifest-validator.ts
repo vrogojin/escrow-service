@@ -1,5 +1,5 @@
 import { computeSwapId, isValidSwapId, type ManifestFields } from '../utils/hash.js';
-import { isValidAddress } from '../utils/address.js';
+import { isValidAddress, normalizeAddress } from '../utils/address.js';
 
 export interface SwapManifest {
   swap_id: string;
@@ -65,11 +65,11 @@ export function validateManifest(
     errors.push({ field: 'party_b_address', message: 'Must be a valid Sphere address (DIRECT://, PROXY://, or @nametag)' });
   }
 
-  // addresses must differ
+  // addresses must differ (normalize before comparing to catch case-variation self-swaps)
   if (
     typeof m.party_a_address === 'string' &&
     typeof m.party_b_address === 'string' &&
-    m.party_a_address === m.party_b_address
+    normalizeAddress(m.party_a_address) === normalizeAddress(m.party_b_address)
   ) {
     errors.push({ field: 'party_b_address', message: 'Must differ from party_a_address' });
   }

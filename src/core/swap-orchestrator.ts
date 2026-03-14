@@ -29,6 +29,7 @@ import type { InvoiceTransferRef } from './accounting-types.js';
 import { isSphereError } from './accounting-types.js';
 import { ManifestValidationError } from '../sphere/orchestrator-interfaces.js';
 import { CrashRecoveryManager } from './crash-recovery-manager.js';
+import { normalizeDirectAddress } from './swap-state-store.js';
 
 // =============================================================================
 // Dependency interfaces
@@ -120,7 +121,11 @@ export class SwapOrchestrator {
   private readonly bounceCounters = new Map<string, { count: number; windowStart: number }>();
   private static readonly MAX_BOUNCES_PER_MINUTE = 10;
 
+  /** Tracks in-flight async handler promises so stop() can drain them before destroying state. */
+  private readonly inFlight = new Set<Promise<void>>();
+
   private started = false;
+  private stopping = false;
 
   constructor(deps: SwapOrchestratorDeps) {
     this.invoiceManager = deps.invoiceManager;
@@ -138,19 +143,28 @@ export class SwapOrchestrator {
 
     // Bind handlers so the same reference can be passed to on() and off()
     this.handlePayment = (payload) => {
-      this._onInvoicePayment(payload).catch((err) => {
+      if (this.stopping) return;
+      const p = this._onInvoicePayment(payload).catch((err) => {
         logger.error({ err, invoiceId: payload.invoiceId }, 'Error handling invoice:payment');
       });
+      this.inFlight.add(p);
+      p.finally(() => this.inFlight.delete(p));
     };
     this.handleCovered = (payload) => {
-      this._onInvoiceCovered(payload).catch((err) => {
+      if (this.stopping) return;
+      const p = this._onInvoiceCovered(payload).catch((err) => {
         logger.error({ err, invoiceId: payload.invoiceId }, 'Error handling invoice:covered');
       });
+      this.inFlight.add(p);
+      p.finally(() => this.inFlight.delete(p));
     };
     this.handleCancelled = (payload) => {
-      this._onInvoiceCancelled(payload).catch((err) => {
+      if (this.stopping) return;
+      const p = this._onInvoiceCancelled(payload).catch((err) => {
         logger.error({ err, invoiceId: payload.invoiceId }, 'Error handling invoice:cancelled');
       });
+      this.inFlight.add(p);
+      p.finally(() => this.inFlight.delete(p));
     };
   }
 
@@ -180,12 +194,22 @@ export class SwapOrchestrator {
    * Should be called on graceful shutdown.
    */
   async stop(): Promise<void> {
+    this.stopping = true;
+
     this.invoiceManager.off('invoice:payment', this.handlePayment);
     this.invoiceManager.off('invoice:covered', this.handleCovered);
     this.invoiceManager.off('invoice:cancelled', this.handleCancelled);
 
+    // Drain loop: keep awaiting until no more in-flight handlers.
+    // After unsubscribing, no NEW events arrive, but handlers already
+    // queued via the event loop may still be starting.
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
+
     this.timeoutManager.destroy();
     this.started = false;
+    this.stopping = false;
 
     logger.info('SwapOrchestrator stopped');
   }
@@ -563,22 +587,15 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Validate each asset slot's coverage using SDK-provided fields per architecture.md
-    const requiredA = BigInt(swap.manifest.party_a_value_to_change);
-    const requiredB = BigInt(swap.manifest.party_b_value_to_change);
-    const coveredA = BigInt(assetA.netCoveredAmount);
-    const coveredB = BigInt(assetB.netCoveredAmount);
-
-    if (!assetA.isCovered || coveredA < requiredA || !assetB.isCovered || coveredB < requiredB) {
+    // Validate each asset slot's coverage using SDK-provided isCovered field
+    if (!assetA.isCovered || !assetB.isCovered) {
       logger.warn(
         {
           swap_id: swap.swap_id,
           assetA_covered: assetA.isCovered,
           assetA_amount: assetA.netCoveredAmount,
-          requiredA: String(requiredA),
           assetB_covered: assetB.isCovered,
           assetB_amount: assetB.netCoveredAmount,
-          requiredB: String(requiredB),
         },
         'invoice:covered — per-currency-slot coverage validation failed, waiting for correct currencies',
       );
@@ -595,10 +612,12 @@ export class SwapOrchestrator {
 
     if (!coveredSwap) {
       // CAS failed — a concurrent handler modified the swap.
-      // Retry in a bounded loop (up to 3 attempts total including the first).
+      // Retry in a bounded loop (up to 5 attempts total including the first).
+      // 5 covers the two-hop race: PARTIAL_DEPOSIT → TIMED_OUT → CANCELLING,
+      // where each hop may produce an independent CAS failure.
       // Also accept TIMED_OUT as a contestable state: if coverage arrives while
       // timeout handling is in progress, coverage wins (SDK confirmed it).
-      const MAX_CAS_ATTEMPTS = 3;
+      const MAX_CAS_ATTEMPTS = 5;
       let attempt = 1; // first attempt already done above
       while (attempt < MAX_CAS_ATTEMPTS) {
         attempt++;
@@ -769,11 +788,13 @@ export class SwapOrchestrator {
       return;
     }
 
-    // Only proceed if the swap is still in PARTIAL_DEPOSIT.
-    // The timeout timer is only scheduled on first deposit (→ PARTIAL_DEPOSIT),
-    // so DEPOSIT_INVOICE_CREATED should never reach here via the timer. If it
-    // does (e.g., stale re-registration), ignore it — there are no deposits to refund.
-    if (swap.state !== SwapState.PARTIAL_DEPOSIT) {
+    // Only proceed if the swap is in PARTIAL_DEPOSIT or DEPOSIT_INVOICE_CREATED.
+    // PARTIAL_DEPOSIT is the normal case: timer was registered on first deposit.
+    // DEPOSIT_INVOICE_CREATED can appear here during crash recovery: if
+    // _advanceToPartialDeposit's CAS fails but _reRegisterTimeout already
+    // re-registered the timer, the timer fires against DEPOSIT_INVOICE_CREATED.
+    // In that case there may be a partial deposit to refund, so we must proceed.
+    if (swap.state !== SwapState.PARTIAL_DEPOSIT && swap.state !== SwapState.DEPOSIT_INVOICE_CREATED) {
       logger.info(
         { swap_id: swapId, state: swap.state },
         'Timeout fired but swap already advanced, ignoring',
@@ -923,6 +944,76 @@ export class SwapOrchestrator {
       return;
     }
 
+    // Step 1b: Re-verify nametag addresses haven't been reassigned (nametag squatting defence).
+    // DIRECT:// addresses are static by construction; only nametag / PROXY addresses can change.
+    // Re-resolution is performed after winning the CONCLUDING CAS so that only one handler
+    // pays the resolution cost and any race-loser short-circuits above.
+    if (!manifest.party_a_address.startsWith('DIRECT://')) {
+      const rawResolvedA = await this.addressResolver.resolve(manifest.party_a_address);
+      if (rawResolvedA === null) {
+        logger.warn(
+          { swap_id: swap.swap_id, address: manifest.party_a_address },
+          'Address resolver unavailable during conclusion — skipping re-verification for party A',
+        );
+      } else {
+        const reResolved = normalizeDirectAddress(rawResolvedA);
+        if (reResolved !== swap.resolved_party_a_address) {
+          logger.error(
+            {
+              swap_id: swap.swap_id,
+              original: swap.resolved_party_a_address,
+              reResolved,
+              nametag: manifest.party_a_address,
+            },
+            'Nametag address changed between announcement and payout — halting conclusion',
+          );
+          const failed = this.stateStore.updateState(
+            swap.swap_id,
+            SwapState.FAILED,
+            {
+              error_message: `Nametag address changed: party A address resolved to ${reResolved} but was ${swap.resolved_party_a_address} at announcement`,
+            },
+            concluding.version,
+          );
+          if (failed) this._cleanupSwapResources(failed);
+          return;
+        }
+      }
+    }
+
+    if (!manifest.party_b_address.startsWith('DIRECT://')) {
+      const rawResolvedB = await this.addressResolver.resolve(manifest.party_b_address);
+      if (rawResolvedB === null) {
+        logger.warn(
+          { swap_id: swap.swap_id, address: manifest.party_b_address },
+          'Address resolver unavailable during conclusion — skipping re-verification for party B',
+        );
+      } else {
+        const reResolved = normalizeDirectAddress(rawResolvedB);
+        if (reResolved !== swap.resolved_party_b_address) {
+          logger.error(
+            {
+              swap_id: swap.swap_id,
+              original: swap.resolved_party_b_address,
+              reResolved,
+              nametag: manifest.party_b_address,
+            },
+            'Nametag address changed between announcement and payout — halting conclusion',
+          );
+          const failed = this.stateStore.updateState(
+            swap.swap_id,
+            SwapState.FAILED,
+            {
+              error_message: `Nametag address changed: party B address resolved to ${reResolved} but was ${swap.resolved_party_b_address} at announcement`,
+            },
+            concluding.version,
+          );
+          if (failed) this._cleanupSwapResources(failed);
+          return;
+        }
+      }
+    }
+
     // Step 2: Create payout invoice A — party A receives party B's currency.
     // We are now the CONCLUDING owner. If creation fails, leave in CONCLUDING
     // for crash recovery. Do NOT transition to FAILED.
@@ -1044,8 +1135,7 @@ export class SwapOrchestrator {
       }
     }
 
-    // Best-effort surplus return to original depositors
-    await this._returnSurplus(swap);
+    // Surplus returns handled by SDK autoReturn in closeDepositInvoice().
 
     // Send payment_confirmation DMs to both parties
     await this._sendPaymentConfirmations(swap.swap_id, manifest, payoutAId, payoutBId);
@@ -1098,92 +1188,11 @@ export class SwapOrchestrator {
     return true;
   }
 
-  /**
-   * Returns surplus deposits to their original payers after a successful swap.
-   *
-   * Per architecture.md §Surplus routing: iterates the deposit invoice's transfer
-   * list (via coinAsset.transfers), groups by effectiveSender (refundAddress ?? senderAddress),
-   * sums forward amounts, and returns surplus to each sender. Skips transfers where
-   * effectiveSender is null (masked predicates with no refund address).
-   *
-   * Best-effort: failures are logged but do not block COMPLETED transition.
-   */
-  private async _returnSurplus(swap: SwapRecord): Promise<void> {
-    if (!swap.deposit_invoice_id) return;
-
-    try {
-      const status = await this.invoiceManager.getInvoiceStatus(swap.deposit_invoice_id);
-      const target = status.targets[0];
-      if (!target) return;
-
-      const manifest = swap.manifest;
-      const requiredAmounts: Record<string, bigint> = {
-        [manifest.party_a_currency_to_change]: BigInt(manifest.party_a_value_to_change),
-        [manifest.party_b_currency_to_change]: BigInt(manifest.party_b_value_to_change),
-      };
-
-      for (const coinAsset of target.coinAssets) {
-        const coinId = coinAsset.coin[0];
-        const required = requiredAmounts[coinId] ?? 0n;
-
-        // Sum all forward deposits per effectiveSender
-        const depositsBySender = new Map<string, bigint>();
-        let totalDeposited = 0n;
-
-        for (const transfer of coinAsset.transfers) {
-          if (transfer.paymentDirection !== 'forward') continue;
-
-          const effectiveSender = getEffectiveSender(transfer);
-          if (!effectiveSender) {
-            logger.warn(
-              { swap_id: swap.swap_id, transferId: transfer.transferId },
-              'Cannot return surplus for transfer: no return address (masked predicate with no refundAddress)',
-            );
-            continue;
-          }
-
-          const amount = BigInt(transfer.amount);
-          totalDeposited += amount;
-          const current = depositsBySender.get(effectiveSender) ?? 0n;
-          depositsBySender.set(effectiveSender, current + amount);
-        }
-
-        const totalSurplus = totalDeposited - required;
-        if (totalSurplus <= 0n) continue;
-
-        // Distribute surplus proportionally per sender
-        for (const [effectiveSender, senderDeposited] of depositsBySender) {
-          // Each sender's share: (senderDeposited / totalDeposited) * totalSurplus
-          // Use integer math: senderSurplus = senderDeposited * totalSurplus / totalDeposited
-          const senderSurplus = (senderDeposited * totalSurplus) / totalDeposited;
-          if (senderSurplus <= 0n) continue;
-
-          try {
-            await this.invoiceManager.returnPayment(swap.deposit_invoice_id, {
-              recipient: effectiveSender,
-              amount: senderSurplus.toString(),
-              coinId,
-              freeText: `Surplus return for swap ${swap.swap_id}`,
-            });
-            logger.info(
-              { swap_id: swap.swap_id, recipient: effectiveSender, coinId, amount: senderSurplus.toString() },
-              'Surplus returned to depositor',
-            );
-          } catch (err) {
-            logger.warn(
-              { err, swap_id: swap.swap_id, recipient: effectiveSender, coinId, amount: senderSurplus.toString() },
-              'Failed to return surplus to depositor (best-effort)',
-            );
-          }
-        }
-      }
-    } catch (err) {
-      logger.warn(
-        { err, swap_id: swap.swap_id },
-        'Failed to query deposit invoice status for surplus return (best-effort)',
-      );
-    }
-  }
+  // Surplus returns are fully delegated to the SDK's autoReturn mechanism
+  // in closeDepositInvoice({ autoReturn: true }). The SDK computes surplus
+  // per coin asset, distributes to senders via freezeBalances() (latest-sender
+  // priority, capped at net contribution), and executes returns via
+  // _executeTerminationReturns() with crash-safe dedup via autoReturnManager.
 
   /**
    * Bounces an unauthorized or incorrect payment back to its sender.
