@@ -742,9 +742,9 @@ export class CrashRecoveryManager {
         if (status.lastActivityAt) {
           firstDepositAt = status.lastActivityAt;
         }
-      } catch {
+      } catch (err) {
         // Fall back to now if status retrieval fails
-        logger.warn({ swap_id: swap.swap_id }, 'Recovery: could not retrieve invoice status for deposit timestamp, using now');
+        logger.warn({ err, swap_id: swap.swap_id }, 'Recovery: could not retrieve invoice status for deposit timestamp, using now');
       }
     }
     const timeoutAt = firstDepositAt + swap.manifest.timeout * 1000;
@@ -1297,6 +1297,7 @@ export class CrashRecoveryManager {
           if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
             logger.info({ swap_id: swap.swap_id }, 'Recovery: Deposit invoice already closed or transient NOT_TARGET');
           } else {
+            // Unexpected error — let the outer recover() loop catch and retry next cycle
             throw err;
           }
         }
@@ -1413,12 +1414,12 @@ export class CrashRecoveryManager {
       { error_message: errorMessage },
       swap.version,
     );
+    // Always clean counters regardless of CAS outcome. If CAS failed, the swap
+    // was advanced by another handler — stale counters must not carry over to
+    // the next recovery cycle where they could cause a false-positive _failSwap.
+    this.recoveryAttempts.delete(swap.swap_id);
+    this.resolverFailures.delete(swap.swap_id);
     if (failed) {
-      // Only prune counters when we successfully transitioned to FAILED.
-      // If CAS failed, the swap was advanced by another handler and our counters
-      // are irrelevant — that handler owns the swap's lifecycle now.
-      this.recoveryAttempts.delete(swap.swap_id);
-      this.resolverFailures.delete(swap.swap_id);
       logger.error({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: Swap transitioned to FAILED');
     } else {
       logger.warn({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: _failSwap CAS failed — version mismatch — state may have been advanced or updated by another path');

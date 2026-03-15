@@ -205,10 +205,15 @@ export class SwapOrchestrator {
     if (this.stopPromise) return this.stopPromise; // concurrent callers await same promise
     this.stopping = true;
     this.stopPromise = this._doStop().catch((err) => {
-      // Reset so a failed shutdown can be retried
+      // Reset so a failed shutdown can be retried.
+      // Note: _doStop() unsubscribes event listeners first (synchronous, always succeeds),
+      // so if we reach here, listeners are already off. We set started=false so start()
+      // will re-subscribe them. The stopping=false reset is safe because the drain loop
+      // completed before the failing step (timeoutManager.destroy()), and the stopping
+      // guard prevented any new handler entries during the drain.
       this.stopPromise = null;
       this.stopping = false;
-      this.started = false; // allow start() to re-subscribe after failed shutdown
+      this.started = false;
       throw err;
     });
     return this.stopPromise;

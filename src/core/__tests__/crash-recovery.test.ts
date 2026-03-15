@@ -16,12 +16,12 @@ const ESCROW_ADDRESS = 'DIRECT://escrow';
 
 let testCounter = 0;
 function createTestManifest(): SwapManifest {
-  const nonce = String(testCounter++);
+  const counter = testCounter++;
   const fields = {
     party_a_address: PARTY_A_ADDRESS,
     party_b_address: PARTY_B_ADDRESS,
     party_a_currency_to_change: 'UCT',
-    party_a_value_to_change: '1000',
+    party_a_value_to_change: String(1000 + counter),
     party_b_currency_to_change: 'USDU',
     party_b_value_to_change: '500',
     timeout: 600,
@@ -1875,12 +1875,12 @@ describe('CrashRecoveryManager', () => {
     const RESOLVED_B = 'DIRECT://0xbbbbbb';
 
     function createNametagManifest(): SwapManifest {
-      const nonce = String(testCounter++);
+      const counter = testCounter++;
       const fields = {
         party_a_address: NAMETAG_A,
         party_b_address: NAMETAG_B,
         party_a_currency_to_change: 'UCT',
-        party_a_value_to_change: '1000',
+        party_a_value_to_change: String(1000 + counter),
         party_b_currency_to_change: 'USDU',
         party_b_value_to_change: '500',
         timeout: 600,
@@ -1889,8 +1889,19 @@ describe('CrashRecoveryManager', () => {
       return { swap_id, ...fields };
     }
 
-    it('should pass verification when resolver returns matching DIRECT:// addresses', async () => {
-      const { orchestrator, recoveryManager, stateStore, mockAccounting, addressResolver } = await setupOrchestrator();
+    /**
+     * Sets up a swap in CONCLUDING state with nametag addresses by directly
+     * manipulating the state store. This avoids timing dependencies from the
+     * async event-driven flow and guarantees the test always exercises
+     * _reVerifyNametags in _resumePayouts.
+     */
+    async function setupConcludingNametagSwap(opts: {
+      orchestrator: any;
+      stateStore: any;
+      mockAccounting: any;
+      addressResolver: any;
+    }) {
+      const { orchestrator, stateStore, mockAccounting, addressResolver } = opts;
 
       // Configure resolver to map nametags to DIRECT:// addresses
       addressResolver.resolve.mockImplementation(async (addr: string) => {
@@ -1904,13 +1915,13 @@ describe('CrashRecoveryManager', () => {
 
       // Simulate deposits and coverage
       const transfer1 = createMockTransferRef({
-        transferId: 'tx-nametag-1',
+        transferId: `tx-nametag-${manifest.swap_id.slice(0, 8)}-1`,
         senderAddress: RESOLVED_A,
         amount: manifest.party_a_value_to_change,
         coinId: 'UCT',
       });
       const transfer2 = createMockTransferRef({
-        transferId: 'tx-nametag-2',
+        transferId: `tx-nametag-${manifest.swap_id.slice(0, 8)}-2`,
         senderAddress: RESOLVED_B,
         amount: manifest.party_b_value_to_change,
         coinId: 'USDU',
@@ -1921,170 +1932,81 @@ describe('CrashRecoveryManager', () => {
       mockAccounting._simulateCoverage(announced.deposit_invoice_id);
       await new Promise((r) => setTimeout(r, 30));
 
+      // Force swap into CONCLUDING state regardless of where the async flow ended
       let swap = stateStore.findBySwapId(manifest.swap_id)!;
-      if (swap.state === SwapState.COMPLETED) {
-        // Move back to CONCLUDING for recovery test
+      while (swap.state !== SwapState.CONCLUDING) {
         swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
       }
-      if (swap.state === SwapState.CONCLUDING) {
-        await recoveryManager.recoverSwap(swap);
-        const recovered = stateStore.findBySwapId(manifest.swap_id)!;
-        // Should proceed past verification — not FAILED
-        expect(recovered.state).not.toBe(SwapState.FAILED);
-      }
+
+      return { manifest, swap };
+    }
+
+    it('should pass verification when resolver returns matching DIRECT:// addresses', async () => {
+      const setup = await setupOrchestrator();
+      const { swap, manifest } = await setupConcludingNametagSwap(setup);
+
+      await setup.recoveryManager.recoverSwap(swap);
+      const recovered = setup.stateStore.findBySwapId(manifest.swap_id)!;
+      // Should proceed past verification — not FAILED
+      expect(recovered.state).not.toBe(SwapState.FAILED);
     });
 
     it('should increment resolver failure counter when resolver returns non-DIRECT address', async () => {
-      const { orchestrator, recoveryManager, stateStore, mockAccounting, addressResolver } = await setupOrchestrator();
+      const setup = await setupOrchestrator();
+      const { swap, manifest } = await setupConcludingNametagSwap(setup);
 
-      addressResolver.resolve.mockImplementation(async (addr: string) => {
-        if (addr === NAMETAG_A) return RESOLVED_A;
-        if (addr === NAMETAG_B) return RESOLVED_B;
-        return addr;
+      // Now make resolver return a non-DIRECT address (resolver bug)
+      setup.addressResolver.resolve.mockImplementation(async (addr: string) => {
+        if (addr === NAMETAG_A) return 'PROXY://0xaaaaaa'; // wrong prefix
+        return RESOLVED_B;
       });
 
-      const manifest = createNametagManifest();
-      const announced = await orchestrator.announce(manifest);
-
-      const transfer1 = createMockTransferRef({
-        transferId: 'tx-nametag-3',
-        senderAddress: RESOLVED_A,
-        amount: manifest.party_a_value_to_change,
-        coinId: 'UCT',
-      });
-      const transfer2 = createMockTransferRef({
-        transferId: 'tx-nametag-4',
-        senderAddress: RESOLVED_B,
-        amount: manifest.party_b_value_to_change,
-        coinId: 'USDU',
-      });
-
-      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer1);
-      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer2);
-      mockAccounting._simulateCoverage(announced.deposit_invoice_id);
-      await new Promise((r) => setTimeout(r, 30));
-
-      let swap = stateStore.findBySwapId(manifest.swap_id)!;
-      if (swap.state === SwapState.COMPLETED) {
-        swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
-      }
-
-      if (swap.state === SwapState.CONCLUDING) {
-        // Now make resolver return a non-DIRECT address (resolver bug)
-        addressResolver.resolve.mockImplementation(async (addr: string) => {
-          if (addr === NAMETAG_A) return 'PROXY://0xaaaaaa'; // wrong prefix
-          return RESOLVED_B;
-        });
-
-        await recoveryManager.recoverSwap(swap);
-        const afterFirstAttempt = stateStore.findBySwapId(manifest.swap_id)!;
-        // Should NOT be FAILED yet (only 1 failure, threshold is 5)
-        expect(afterFirstAttempt.state).toBe(SwapState.CONCLUDING);
-      }
+      await setup.recoveryManager.recoverSwap(swap);
+      const afterFirstAttempt = setup.stateStore.findBySwapId(manifest.swap_id)!;
+      // Should NOT be FAILED yet (only 1 failure, threshold is 5)
+      expect(afterFirstAttempt.state).toBe(SwapState.CONCLUDING);
     });
 
     it('should transition to FAILED after MAX_RESOLVER_FAILURES consecutive resolver failures', async () => {
-      const { orchestrator, recoveryManager, stateStore, mockAccounting, addressResolver } = await setupOrchestrator();
+      const setup = await setupOrchestrator();
+      const { manifest } = await setupConcludingNametagSwap(setup);
 
-      addressResolver.resolve.mockImplementation(async (addr: string) => {
-        if (addr === NAMETAG_A) return RESOLVED_A;
-        if (addr === NAMETAG_B) return RESOLVED_B;
-        return addr;
+      // Make resolver throw on every attempt
+      setup.addressResolver.resolve.mockImplementation(async () => {
+        throw new Error('resolver unavailable');
       });
 
-      const manifest = createNametagManifest();
-      const announced = await orchestrator.announce(manifest);
-
-      const transfer1 = createMockTransferRef({
-        transferId: 'tx-nametag-5',
-        senderAddress: RESOLVED_A,
-        amount: manifest.party_a_value_to_change,
-        coinId: 'UCT',
-      });
-      const transfer2 = createMockTransferRef({
-        transferId: 'tx-nametag-6',
-        senderAddress: RESOLVED_B,
-        amount: manifest.party_b_value_to_change,
-        coinId: 'USDU',
-      });
-
-      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer1);
-      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer2);
-      mockAccounting._simulateCoverage(announced.deposit_invoice_id);
-      await new Promise((r) => setTimeout(r, 30));
-
-      let swap = stateStore.findBySwapId(manifest.swap_id)!;
-      if (swap.state === SwapState.COMPLETED) {
-        swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
-      }
-
-      if (swap.state === SwapState.CONCLUDING) {
-        // Make resolver throw on every attempt
-        addressResolver.resolve.mockImplementation(async () => {
-          throw new Error('resolver unavailable');
-        });
-
-        // Attempt recovery 5 times (MAX_RESOLVER_FAILURES)
-        for (let i = 0; i < 5; i++) {
-          swap = stateStore.findBySwapId(manifest.swap_id)!;
-          if (swap.state === SwapState.FAILED) break;
-          await recoveryManager.recoverSwap(swap);
+      // Attempt recovery 5 times (MAX_RESOLVER_FAILURES)
+      for (let i = 0; i < 5; i++) {
+        const swap = setup.stateStore.findBySwapId(manifest.swap_id)!;
+        if (swap.state === SwapState.FAILED) break;
+        // Verify intermediate states stay in CONCLUDING (iterations 1-4)
+        if (i > 0) {
+          expect(swap.state).toBe(SwapState.CONCLUDING);
         }
-
-        const finalSwap = stateStore.findBySwapId(manifest.swap_id)!;
-        expect(finalSwap.state).toBe(SwapState.FAILED);
-        expect(finalSwap.error_message).toContain('Address resolver failed');
+        await setup.recoveryManager.recoverSwap(swap);
       }
+
+      const finalSwap = setup.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(finalSwap.state).toBe(SwapState.FAILED);
+      expect(finalSwap.error_message).toContain('Address resolver failed');
     });
 
     it('should detect nametag squatting and fail the swap immediately', async () => {
-      const { orchestrator, recoveryManager, stateStore, mockAccounting, addressResolver } = await setupOrchestrator();
+      const setup = await setupOrchestrator();
+      const { swap, manifest } = await setupConcludingNametagSwap(setup);
 
-      addressResolver.resolve.mockImplementation(async (addr: string) => {
-        if (addr === NAMETAG_A) return RESOLVED_A;
+      // Nametag squatting: @alice now resolves to a different address
+      setup.addressResolver.resolve.mockImplementation(async (addr: string) => {
+        if (addr === NAMETAG_A) return 'DIRECT://0xEVIL1';
         if (addr === NAMETAG_B) return RESOLVED_B;
         return addr;
       });
 
-      const manifest = createNametagManifest();
-      const announced = await orchestrator.announce(manifest);
-
-      const transfer1 = createMockTransferRef({
-        transferId: 'tx-nametag-7',
-        senderAddress: RESOLVED_A,
-        amount: manifest.party_a_value_to_change,
-        coinId: 'UCT',
-      });
-      const transfer2 = createMockTransferRef({
-        transferId: 'tx-nametag-8',
-        senderAddress: RESOLVED_B,
-        amount: manifest.party_b_value_to_change,
-        coinId: 'USDU',
-      });
-
-      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer1);
-      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer2);
-      mockAccounting._simulateCoverage(announced.deposit_invoice_id);
-      await new Promise((r) => setTimeout(r, 30));
-
-      let swap = stateStore.findBySwapId(manifest.swap_id)!;
-      if (swap.state === SwapState.COMPLETED) {
-        swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
-      }
-
-      if (swap.state === SwapState.CONCLUDING) {
-        // Nametag squatting: @alice now resolves to a different address
-        addressResolver.resolve.mockImplementation(async (addr: string) => {
-          if (addr === NAMETAG_A) return 'DIRECT://0xEVIL1';
-          if (addr === NAMETAG_B) return RESOLVED_B;
-          return addr;
-        });
-
-        await recoveryManager.recoverSwap(swap);
-        const failed = stateStore.findBySwapId(manifest.swap_id)!;
-        expect(failed.state).toBe(SwapState.FAILED);
-        expect(failed.error_message).toContain('Nametag squatting detected');
-      }
+      await setup.recoveryManager.recoverSwap(swap);
+      const failed = setup.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(failed.state).toBe(SwapState.FAILED);
+      expect(failed.error_message).toContain('Nametag squatting detected');
     });
   });
 
