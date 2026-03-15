@@ -128,6 +128,8 @@ export class SwapOrchestrator {
   private stopping = false;
   /** Permanently true after stop() completes. Prevents restart on a destroyed instance. */
   private stopped = false;
+  /** Shared stop promise so concurrent callers await the same shutdown. */
+  private stopPromise: Promise<void> | null = null;
 
   constructor(deps: SwapOrchestratorDeps) {
     this.invoiceManager = deps.invoiceManager;
@@ -141,6 +143,7 @@ export class SwapOrchestrator {
       stateStore: this.stateStore,
       timeoutManager: this.timeoutManager,
       orchestrator: this,
+      addressResolver: this.addressResolver,
     });
 
     // Bind handlers so the same reference can be passed to on() and off()
@@ -199,9 +202,13 @@ export class SwapOrchestrator {
    * Should be called on graceful shutdown.
    */
   async stop(): Promise<void> {
-    if (this.stopping) return; // re-entrant guard: concurrent stop() awaits nothing
+    if (this.stopPromise) return this.stopPromise; // concurrent callers await same promise
     this.stopping = true;
+    this.stopPromise = this._doStop();
+    return this.stopPromise;
+  }
 
+  private async _doStop(): Promise<void> {
     this.invoiceManager.off('invoice:payment', this.handlePayment);
     this.invoiceManager.off('invoice:covered', this.handleCovered);
     this.invoiceManager.off('invoice:cancelled', this.handleCancelled);
@@ -307,6 +314,9 @@ export class SwapOrchestrator {
    * per architecture.md §Crash Recovery table.
    */
   async recoverSwaps(): Promise<void> {
+    if (this.stopped) {
+      throw new Error('SwapOrchestrator has been stopped and cannot be restarted. Create a new instance.');
+    }
     if (this.stopping) {
       logger.warn('recoverSwaps() called while stopping — skipping');
       return;

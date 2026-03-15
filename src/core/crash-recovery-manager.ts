@@ -20,8 +20,9 @@ import { isSphereError } from './accounting-types.js';
 import type { InvoiceManager } from './invoice-manager.js';
 import type { TimeoutManager } from './timeout-manager.js';
 import type { SwapStateStore, SwapRecord } from './types.js';
-import type { SwapOrchestrator } from './swap-orchestrator.js';
+import type { SwapOrchestrator, AddressResolver } from './swap-orchestrator.js';
 import type { InvoiceState } from './accounting-types.js';
+import { normalizeDirectAddress } from './swap-state-store.js';
 
 export interface CrashRecoveryDeps {
   invoiceManager: InvoiceManager;
@@ -29,6 +30,7 @@ export interface CrashRecoveryDeps {
   timeoutManager: TimeoutManager;
   /** Orchestrator reference — used to resume conclusion and re-subscribe to events. */
   orchestrator: SwapOrchestrator;
+  addressResolver: AddressResolver;
 }
 
 /**
@@ -39,6 +41,7 @@ export class CrashRecoveryManager {
   private readonly stateStore: SwapStateStore;
   private readonly timeoutManager: TimeoutManager;
   private readonly orchestrator: SwapOrchestrator;
+  private readonly addressResolver: AddressResolver;
 
   /**
    * Tracks consecutive INVOICE_NOT_TARGET failures per swap_id.
@@ -46,14 +49,18 @@ export class CrashRecoveryManager {
    * Reset on successful recovery.
    */
   private readonly recoveryAttempts: Map<string, number> = new Map();
+  /** Tracks consecutive resolver failures per swap_id for nametag re-verification. */
+  private readonly resolverFailures: Map<string, number> = new Map();
 
   private static readonly MAX_INVOICE_NOT_TARGET_ATTEMPTS = 5;
+  private static readonly MAX_RESOLVER_FAILURES = 5;
 
   constructor(deps: CrashRecoveryDeps) {
     this.invoiceManager = deps.invoiceManager;
     this.stateStore = deps.stateStore;
     this.timeoutManager = deps.timeoutManager;
     this.orchestrator = deps.orchestrator;
+    this.addressResolver = deps.addressResolver;
   }
 
   /**
@@ -898,8 +905,88 @@ export class CrashRecoveryManager {
    * - Catch INVOICE_TERMINATED (already closed/cancelled, success)
    * - Catch INVOICE_NOT_FOUND (import token, retry)
    */
+  /**
+   * Re-verifies nametag/PROXY addresses haven't been reassigned since announcement.
+   * Returns true if verification passes (or addresses are DIRECT://), false if
+   * a mismatch or resolver failure is detected.
+   *
+   * On failure, transitions the swap to FAILED. On resolver unavailability,
+   * returns false WITHOUT failing the swap — leaves it in current state for
+   * the next recovery cycle to retry.
+   */
+  private async _reVerifyNametags(swap: SwapRecord): Promise<boolean> {
+    const manifest = swap.manifest;
+
+    for (const party of ['A', 'B'] as const) {
+      const address = party === 'A' ? manifest.party_a_address : manifest.party_b_address;
+      const storedResolved = party === 'A' ? swap.resolved_party_a_address : swap.resolved_party_b_address;
+
+      if (address.startsWith('DIRECT://')) continue;
+
+      let rawResolved: string | null;
+      try {
+        rawResolved = await this.addressResolver.resolve(address);
+      } catch (resolveErr) {
+        const count = (this.resolverFailures.get(swap.swap_id) ?? 0) + 1;
+        this.resolverFailures.set(swap.swap_id, count);
+        if (count >= CrashRecoveryManager.MAX_RESOLVER_FAILURES) {
+          logger.error(
+            { err: resolveErr, swap_id: swap.swap_id, address, party, attempts: count, security_event: true },
+            'Recovery: address resolver consistently failing — transitioning to FAILED after max attempts',
+          );
+          this._failSwap(swap, `Address resolver failed ${count} times for party ${party} (${address})`);
+        } else {
+          logger.error(
+            { err: resolveErr, swap_id: swap.swap_id, address, party, attempts: count, security_event: true },
+            'Recovery: address resolver threw during nametag re-verification — leaving for next recovery cycle',
+          );
+        }
+        return false;
+      }
+
+      if (rawResolved === null) {
+        const count = (this.resolverFailures.get(swap.swap_id) ?? 0) + 1;
+        this.resolverFailures.set(swap.swap_id, count);
+        if (count >= CrashRecoveryManager.MAX_RESOLVER_FAILURES) {
+          logger.error(
+            { swap_id: swap.swap_id, address, party, attempts: count, security_event: true },
+            'Recovery: address resolver consistently returning null — transitioning to FAILED after max attempts',
+          );
+          this._failSwap(swap, `Address resolver returned null ${count} times for party ${party} (${address})`);
+        } else {
+          logger.error(
+            { swap_id: swap.swap_id, address, party, attempts: count, security_event: true },
+            'Recovery: address resolver returned null during nametag re-verification — leaving for next recovery cycle',
+          );
+        }
+        return false;
+      }
+
+      const reResolved = normalizeDirectAddress(rawResolved);
+      if (reResolved !== storedResolved) {
+        logger.error(
+          { swap_id: swap.swap_id, party, original: storedResolved, reResolved, address, security_event: true },
+          'Recovery: nametag address changed since announcement — halting payout (nametag squatting detected)',
+        );
+        this._failSwap(swap, `Nametag squatting detected: party ${party} address ${address} resolved to ${reResolved} but was ${storedResolved} at announcement`);
+        return false;
+      }
+    }
+
+    // All addresses verified — reset failure counter
+    this.resolverFailures.delete(swap.swap_id);
+    return true;
+  }
+
   private async _resumePayouts(swap: SwapRecord): Promise<void> {
     const manifest = swap.manifest;
+
+    // Re-verify nametag addresses before paying out — defence against nametag squatting.
+    // This covers ALL recovery paths into _resumePayouts. On failure, leaves swap in
+    // current state (resolver unavailable) or transitions to FAILED (address mismatch).
+    if (!(await this._reVerifyNametags(swap))) {
+      return;
+    }
 
     // Fetch the latest persisted swap record to get the most current version
     // and payout invoice IDs (the caller may have passed a stale record).
@@ -1311,6 +1398,7 @@ export class CrashRecoveryManager {
     );
     if (failed) {
       this.recoveryAttempts.delete(swap.swap_id);
+      this.resolverFailures.delete(swap.swap_id);
       logger.error({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: Swap transitioned to FAILED');
     }
   }
