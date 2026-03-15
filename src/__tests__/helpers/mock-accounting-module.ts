@@ -388,7 +388,7 @@ export class MockAccountingModule {
     this.callOrder.push('returnInvoicePayment');
     const state = this.invoices.get(invoiceId);
     if (!state) {
-      throw new SphereError(`Invoice not found: ${invoiceId}`, 'INVALID_IDENTITY' as any) as any;
+      throw new SphereError(`Invoice not found: ${invoiceId}`, 'INVOICE_NOT_FOUND' as any) as any;
     }
 
     return {

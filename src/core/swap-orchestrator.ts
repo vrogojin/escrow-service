@@ -543,7 +543,7 @@ export class SwapOrchestrator {
    * 1. Look up swap, state guard
    * 2. Re-validate per-currency-slot coverage (coinId matches asset index)
    * 3. Transition to DEPOSIT_COVERED (bounded CAS retry; also contests TIMED_OUT)
-   * 4. Close deposit invoice (no autoReturn)
+   * 4. Close deposit invoice (autoReturn: true — surplus delegated to SDK)
    * 5. Cancel timeout timer (AFTER close succeeds)
    * 6. Create payout invoices A and B (via _concludeSwap)
    * 7. Persist as CONCLUDING with payout IDs BEFORE paying
@@ -716,7 +716,7 @@ export class SwapOrchestrator {
 
     }
 
-    // 4. Close deposit invoice (no autoReturn) BEFORE cancelling the timer.
+    // 4. Close deposit invoice (autoReturn: true — surplus delegated to SDK) BEFORE cancelling the timer.
     // Cancelling the timer first would leave the swap stuck in DEPOSIT_COVERED
     // forever if closeDepositInvoice throws a transient error — the timer would
     // be gone and no retry mechanism would fire.
@@ -1212,6 +1212,24 @@ export class SwapOrchestrator {
 
     // Surplus returns handled by SDK autoReturn in closeDepositInvoice().
 
+    // Per protocol-spec §3 Step 9: send invoice_delivery DMs to both parties
+    // before payment_confirmation so each party receives their payout invoice
+    // token first and can verify the terms independently.
+    await Promise.allSettled([
+      this.messageSender.sendToParty(swap.swap_id, 'A', {
+        type: 'invoice_delivery',
+        swap_id: manifest.swap_id,
+        invoice_type: 'payout',
+        invoice_id: payoutAId,
+      }),
+      this.messageSender.sendToParty(swap.swap_id, 'B', {
+        type: 'invoice_delivery',
+        swap_id: manifest.swap_id,
+        invoice_type: 'payout',
+        invoice_id: payoutBId,
+      }),
+    ]);
+
     // Send payment_confirmation DMs to both parties
     await this._sendPaymentConfirmations(swap.swap_id, manifest, payoutAId, payoutBId);
 
@@ -1412,6 +1430,19 @@ export class SwapOrchestrator {
   /**
    * Transitions a swap to FAILED state and notifies both parties.
    */
+  /**
+   * Public delegation point for crash recovery — allows CrashRecoveryManager to
+   * release per-swap in-memory resources (bounce counters, timers) after the
+   * recovery path transitions a swap to a terminal state such as COMPLETED.
+   *
+   * The orchestrator's normal conclusion path calls `_cleanupSwapResources`
+   * directly; this wrapper gives external callers the same behaviour without
+   * exposing the private method.
+   */
+  cleanupSwapResources(swap: SwapRecord): void {
+    this._cleanupSwapResources(swap);
+  }
+
   /**
    * Clean up per-swap in-memory resources (bounce counters, timers) when
    * a swap reaches a terminal state to prevent unbounded memory growth.

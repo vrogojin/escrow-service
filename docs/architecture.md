@@ -95,10 +95,14 @@ Persists swap case metadata and state. The schema shrinks significantly because 
 - `deposit_invoice_id` — the deposit invoice token ID
 - `payout_a_invoice_id` — payout invoice for party A (nullable)
 - `payout_b_invoice_id` — payout invoice for party B (nullable)
+- `resolved_party_a_address` — cached DIRECT:// address for party A, resolved and normalized at announcement time
+- `resolved_party_b_address` — cached DIRECT:// address for party B, resolved and normalized at announcement time
 - `first_deposit_at` — timestamp for timeout calculation
 - `timeout_at` — computed deadline
 - `created_at`, `completed_at`, `error_message`
 - `version` — optimistic concurrency
+
+**Note on resolved addresses:** `resolved_party_a_address` and `resolved_party_b_address` store the DIRECT:// addresses obtained by resolving manifest party addresses (which may be nametags or PROXY addresses) at announcement time. They are normalized to lowercase via `normalizeDirectAddress()` and used as the `targets[].address` fields in payout invoice terms. Caching at announcement time prevents nametag reassignment during an in-flight swap from causing party misidentification (see §Security Considerations — Nametag-to-DIRECT Resolution).
 
 **Eliminated fields:** `party_a_deposited`, `party_b_deposited`, `party_a_coin_id`, `party_b_coin_id` — all derivable from `getInvoiceStatus()`.
 
@@ -278,7 +282,9 @@ COMPLETED
 | `DEPOSIT_INVOICE_CREATED` | `TIMED_OUT` | Manual cancellation via admin API (the normal timeout timer only starts on first deposit, so this transition requires explicit operator intervention) |
 | `PARTIAL_DEPOSIT` | `DEPOSIT_COVERED` | `invoice:covered` event |
 | `PARTIAL_DEPOSIT` | `TIMED_OUT` | TimeoutManager fires |
+| `DEPOSIT_COVERED` | `DEPOSIT_COVERED` | Metadata-only field update via CAS (e.g., checkpoint persisted without state change) |
 | `DEPOSIT_COVERED` | `CONCLUDING` | Orchestrator starts conclusion |
+| `CONCLUDING` | `CONCLUDING` | Metadata-only field update via CAS (e.g., payout invoice ID checkpointed without state change) |
 | `CONCLUDING` | `COMPLETED` | Both payout invoices paid |
 | `TIMED_OUT` | `CANCELLING` | `cancelInvoice()` called |
 | `TIMED_OUT` | `DEPOSIT_COVERED` | Cross-terminal race: coverage confirmed after timeout — `cancelInvoice()` throws `INVOICE_ALREADY_CLOSED` (SDK closed on coverage), abort cancellation and resume conclusion |
@@ -307,11 +313,14 @@ Fired when all requested assets in the deposit invoice reach their targets. The 
 1. Verifies the invoice ID maps to an active swap
 2. **State guard:** Only proceed if swap is in `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT`. For `TIMED_OUT` or `CANCELLING`, contest via CAS to `DEPOSIT_COVERED` per §Timeout Handling race condition. Ignore all other states (including `DEPOSIT_COVERED`, `CONCLUDING`, and terminal states).
 3. **Re-validate per-currency coverage:** call `getInvoiceStatus()` and verify that `coinAssets[0]` (party A's currency) and `coinAssets[1]` (party B's currency) are each individually covered at the required amounts. The `invoice:covered` event only means the aggregate amounts are met — it does not guarantee that the two distinct currency slots are both individually satisfied (e.g., someone could have overpaid one currency while the other remains uncovered). If either slot is not individually covered at the correct threshold, do NOT proceed — bounce the wrong-currency payment and remain in `PARTIAL_DEPOSIT` (or `DEPOSIT_INVOICE_CREATED`). The `invoice:covered` event fires on every payment event where all targets meet their coverage thresholds, so it will fire again naturally once the correct currencies restore full coverage.
-4. Transitions to `DEPOSIT_COVERED` (persist to SwapStateStore before proceeding — crash between this persist and the `CONCLUDING` persist at step 8 is handled by crash recovery)
+4. Transitions to `DEPOSIT_COVERED` (persist to SwapStateStore before proceeding — crash between this persist and the `CONCLUDING` persist at step 7 is handled by crash recovery)
 5. Closes the deposit invoice: `closeInvoice(depositInvoiceId, { autoReturn: true })` — surplus computation and return is fully delegated to the SDK. The SDK computes surplus per currency slot (`totalDeposited - requiredAmount`), distributes to senders via `freezeBalances()` using latest-sender priority (capped at net contribution), and executes returns via `_executeTerminationReturns()` with crash-safe dedup via the `autoReturnManager`. The SDK's `SpendQueue` serializes all `send()` calls (surplus returns and subsequent payout `payInvoice()` calls), preventing token selection races. **Note:** Close the deposit invoice first. If close fails (transient error), the timeout timer remains active as a safety net.
 6. Cancels the timeout timer (if running)
-7. Creates two payout invoices
-8. **Persist state to SwapStateStore** as `CONCLUDING` with both payout invoice IDs **before** paying — this ensures crash recovery can resume payout even if the process dies mid-payment
+7. **Transitions to `CONCLUDING` (persisted to SwapStateStore before any payout invoice is created).** The `CONCLUDING` state acts as a mutex/CAS guard: persisting it before any payout work ensures only one code path ever proceeds to payouts — even under crash-recovery re-entry
+8. Creates two payout invoices, checkpointing each ID incrementally:
+   - After payout A invoice is created: persist `payout_a_invoice_id` (self-transition `CONCLUDING → CONCLUDING`)
+   - After payout B invoice is created: persist `payout_b_invoice_id` (self-transition `CONCLUDING → CONCLUDING`)
+   This incremental checkpointing is more crash-safe than a single persist of both IDs at once — a crash after the first checkpoint allows recovery to skip re-creating payout A and proceed directly to payout B.
 9. Pays into both: `payInvoice(payoutAId, ...)` and `payInvoice(payoutBId, ...)`
 10. Delivers payout invoice tokens to parties via DM
 11. Transitions to `COMPLETED`
@@ -433,12 +442,12 @@ The SwapStateStore must persist swap state and invoice IDs at each transition. O
 | `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT` | `PARTIAL` | Re-register timeout timer with remaining time, re-subscribe to events |
 | `PARTIAL_DEPOSIT` | `EXPIRED` | `dueDate` passed with partial deposits. Treat as equivalent to `PARTIAL` — re-register timeout timer. Note: if the invoice becomes fully covered, the SDK state will be `COVERED` (which takes priority over `EXPIRED` in the state computation). |
 | `DEPOSIT_INVOICE_CREATED` or `PARTIAL_DEPOSIT` | `COVERED` | Coverage achieved during crash — re-validate per-currency coverage (both `coinAssets[0]` and `coinAssets[1]` individually covered at their required amounts), then resume conclusion (step 5 of `invoice:covered` handler). The `COVERED` state is dynamically computed and may change if auto-returns execute between crash and recovery. |
-| `PARTIAL_DEPOSIT` | `CLOSED` | Deposit closed unexpectedly with only partial coverage — investigate and transition to `FAILED` |
+| `PARTIAL_DEPOSIT` | `CLOSED` | Deposit closed while swap state still shows partial coverage. Check per-slot coverage via `getInvoiceStatus()`: if both currency slots are individually covered (`coinAssets[0].isCovered && coinAssets[1].isCovered`), transition swap to `DEPOSIT_COVERED` and resume the conclusion path. If not both covered, transition to `FAILED` for manual intervention. |
 | `PARTIAL_DEPOSIT` | `CANCELLED` | Timeout fired during crash — transition to `CANCELLED` |
 | `DEPOSIT_INVOICE_CREATED` | `CANCELLED` | Manual or unexpected cancellation before any deposit — transition to `CANCELLED` |
 | `DEPOSIT_INVOICE_CREATED` | `CLOSED` | Deposit closed without the escrow tracking it — investigate and transition to `FAILED` |
 | `DEPOSIT_COVERED` | `OPEN` or `PARTIAL` or `EXPIRED` | Coverage regressed during crash window — auto-returns or late return-direction transfers reduced `netCoveredAmount` below threshold. Re-validate per-currency coverage (check each `coinAssets[i]` individually). If both currency slots are still individually covered at the required amounts, proceed with conclusion. If not, revert swap to `PARTIAL_DEPOSIT`, re-subscribe to events, and re-register timeout with remaining time. |
-| `DEPOSIT_COVERED` | `CANCELLED` | Deposit cancelled after coverage (e.g., admin action during crash window) — check if deposits were auto-returned (inspect auto-return dedup ledger). If all returned, transition to `CANCELLED`. If partially returned or no returns, transition to `FAILED` for manual intervention. |
+| `DEPOSIT_COVERED` | `CANCELLED` | Deposit cancelled after coverage (e.g., admin action during crash window) — check if deposits were auto-returned (inspect auto-return dedup ledger). If all returned, transition to `CANCELLED`. If partially returned or no returns, transition to `FAILED` for manual intervention. **Note:** The auto-return ledger check described here is not yet implemented (stub). Current behavior: always transitions to `FAILED` for manual intervention regardless of auto-return state. |
 | `DEPOSIT_COVERED` | `CLOSED` | Deposit closed before payouts created — create payout invoices if missing, persist as `CONCLUDING`, then proceed with payouts |
 | `CONCLUDING` | `OPEN`, `PARTIAL`, `COVERED`, or `EXPIRED` | Deposit invoice not yet closed (crash between `DEPOSIT_COVERED` persist and `closeInvoice()`) — call `closeInvoice(depositInvoiceId)` first, then proceed with payout creation as in the `CLOSED` path |
 | `CONCLUDING` | `CLOSED` | Payouts may be partially complete — check each payout invoice individually (see below) |

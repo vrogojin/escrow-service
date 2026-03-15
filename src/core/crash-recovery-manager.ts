@@ -1167,6 +1167,12 @@ export class CrashRecoveryManager {
     );
 
     if (completed) {
+      // Mirror the orchestrator's _concludeSwap behaviour: release per-swap
+      // in-memory resources (bounce counters, timeout timers) now that the swap
+      // has reached a terminal state.  Omitting this would leave the timeout
+      // timer registered and the bounce counter entry alive until the next
+      // graceful shutdown.
+      this.orchestrator.cleanupSwapResources(completed);
       logger.info({ swap_id: swap.swap_id }, 'Recovery: Swap completed after payout retry');
     }
   }
@@ -1304,13 +1310,24 @@ export class CrashRecoveryManager {
       }
       await this._concludeFromClosed(swap);
     } else {
-      // Coverage regressed — DEPOSIT_COVERED can only go to CONCLUDING or FAILED.
-      // Transition to FAILED — operator must manually verify and intervene.
-      logger.error(
-        { swap_id: swap.swap_id, slotAAmount: String(slotAAmount), slotBAmount: String(slotBAmount) },
-        'Recovery: DEPOSIT_COVERED coverage regressed — transitioning to FAILED (manual intervention required)',
-      );
-      this._failSwap(swap, `Coverage regressed in DEPOSIT_COVERED recovery (A: ${String(slotAAmount)}/${String(requiredA)}, B: ${String(slotBAmount)}/${String(requiredB)})`);
+      // Coverage regressed (auto-returns or late return-direction transfers reduced net coverage
+      // below per-currency thresholds during the crash window).
+      // Per architecture.md §Crash Recovery (DEPOSIT_COVERED + OPEN/PARTIAL/EXPIRED row):
+      // revert swap to PARTIAL_DEPOSIT, re-subscribe to events, and re-register timeout
+      // with remaining time so the swap can naturally recover via invoice events.
+      const reverted = this.stateStore.updateState(swap.swap_id, SwapState.PARTIAL_DEPOSIT, {}, swap.version);
+      if (reverted) {
+        logger.warn(
+          { swap_id: swap.swap_id, slotAAmount: String(slotAAmount), slotBAmount: String(slotBAmount) },
+          'Recovery: DEPOSIT_COVERED coverage regressed — reverting to PARTIAL_DEPOSIT and re-registering timeout',
+        );
+        this._reRegisterTimeout(reverted);
+      } else {
+        logger.warn(
+          { swap_id: swap.swap_id },
+          'Recovery: DEPOSIT_COVERED coverage regressed — CAS version mismatch reverting to PARTIAL_DEPOSIT, will retry next cycle',
+        );
+      }
     }
   }
 

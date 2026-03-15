@@ -4,23 +4,13 @@
  * by SwapOrchestrator, InvoiceManager, and related classes.
  */
 
-import type { SwapRecord } from '../core/types.js';
+import type { SwapRecord, AnnounceResult } from '../core/types.js';
 
 // ---------------------------------------------------------------------------
 // SwapOrchestrator
 // ---------------------------------------------------------------------------
 
-/**
- * Result returned when a manifest is announced to the orchestrator.
- */
-export interface AnnounceResult {
-  /** Content-addressed swap identifier (64 hex chars). */
-  swap_id: string;
-  /** Invoice token ID for the deposit invoice (64 hex chars). */
-  deposit_invoice_id: string;
-  /** True when the swap case was newly created; false when it already existed. */
-  is_new: boolean;
-}
+export type { AnnounceResult } from '../core/types.js';
 
 /**
  * Central coordinator that drives the swap lifecycle from announcement through

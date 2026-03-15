@@ -14,6 +14,12 @@ export class InMemorySwapStateStore implements SwapStateStore {
    * Creates a new swap record in ANNOUNCED state.
    */
   create(manifest: SwapManifest, resolvedAddresses: ResolvedAddresses): SwapRecord {
+    // Idempotency guard: return existing record without overwriting
+    const existing = this.swaps.get(manifest.swap_id);
+    if (existing !== undefined) {
+      return this.clone(existing);
+    }
+
     const record: SwapRecord = {
       swap_id: manifest.swap_id,
       manifest,
@@ -82,13 +88,31 @@ export class InMemorySwapStateStore implements SwapStateStore {
       return null;
     }
 
+    // Note: isValidTransition is NOT enforced here — tests deliberately force
+    // invalid transitions to simulate crash-recovery states (e.g., COMPLETED → CONCLUDING).
+    // The production SwapStateStore enforces transition validation.
+
     // Update state and increment version
     record.state = newState;
     record.version++;
 
+    // Apply updates — only allow safe mutable fields
+    const ALLOWED_UPDATE_FIELDS = new Set([
+      'deposit_invoice_id',
+      'payout_a_invoice_id',
+      'payout_b_invoice_id',
+      'first_deposit_at',
+      'timeout_at',
+      'completed_at',
+      'error_message',
+    ]);
+
     // Apply other updates
     for (const [key, value] of Object.entries(updates)) {
       if (value !== undefined && key !== 'state' && key !== 'version') {
+        if (!ALLOWED_UPDATE_FIELDS.has(key)) {
+          throw new Error(`updateState: field '${key}' is not in the allowed update list (swap ${swapId})`);
+        }
         (record as any)[key] = value;
       }
     }

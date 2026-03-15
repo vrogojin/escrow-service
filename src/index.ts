@@ -77,19 +77,31 @@ async function main(): Promise<void> {
   // 5. Crash recovery: reconcile non-terminal swaps
   await orchestrator.recoverSwaps();
 
-  // 6. Start DM message handler
-  // TODO: Wire up NpubRoleMap for full DM protocol support
-  const noopNpubRoleMap: NpubRoleMap = {
-    register: (_npub: string, _swapId: string, _party: 'A' | 'B'): void => {},
-    getRole: (_npub: string, _swapId: string): 'A' | 'B' | null => null,
-    getSwapIds: (_npub: string): string[] => [],
+  // 6. Start DM message handler with in-memory NpubRoleMap
+  const roleEntries = new Map<string, { swapId: string; party: 'A' | 'B' }[]>();
+  const npubRoleMap: NpubRoleMap = {
+    register(npub: string, swapId: string, party: 'A' | 'B'): void {
+      const entries = roleEntries.get(npub) ?? [];
+      if (!entries.some((e) => e.swapId === swapId && e.party === party)) {
+        entries.push({ swapId, party });
+        roleEntries.set(npub, entries);
+      }
+    },
+    getRole(npub: string, swapId: string): 'A' | 'B' | null {
+      const entries = roleEntries.get(npub);
+      const entry = entries?.find((e) => e.swapId === swapId);
+      return entry?.party ?? null;
+    },
+    getSwapIds(npub: string): string[] {
+      return (roleEntries.get(npub) ?? []).map((e) => e.swapId);
+    },
   };
   const messageHandler = createMessageHandler({
     sphere,
     orchestrator: orchestrator as ISwapOrchestrator,
     stateStore,
     invoiceManager,
-    npubRoleMap: noopNpubRoleMap,
+    npubRoleMap,
   });
   messageHandler.start();
 

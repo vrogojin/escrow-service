@@ -553,7 +553,7 @@ describe('CrashRecoveryManager', () => {
   });
 
   describe('DEPOSIT_COVERED Recovery', () => {
-    it('should transition to FAILED if coverage regressed (OPEN/PARTIAL/EXPIRED)', async () => {
+    it('should revert to PARTIAL_DEPOSIT if coverage regressed (OPEN/PARTIAL/EXPIRED)', async () => {
       const { orchestrator, recoveryManager, stateStore, mockAccounting } = await setupOrchestrator();
       const manifest = createTestManifest();
 
@@ -590,12 +590,14 @@ describe('CrashRecoveryManager', () => {
         transfers: [transfer1, transfer2],
       });
 
-      // Manually create a swap in DEPOSIT_COVERED state
+      // Manually create a swap in DEPOSIT_COVERED state with timeout_at set
+      // (needed for timeout re-registration on revert to PARTIAL_DEPOSIT)
+      const now = Date.now();
       let swap = stateStore.findBySwapId(manifest.swap_id)!;
       swap = stateStore.updateState(
         swap.swap_id,
         SwapState.DEPOSIT_COVERED,
-        { first_deposit_at: Date.now() },
+        { first_deposit_at: now, timeout_at: now + manifest.timeout * 1000 },
         swap.version
       )!;
 
@@ -619,8 +621,9 @@ describe('CrashRecoveryManager', () => {
       await recoveryManager.recoverSwap(swap);
 
       const recovered = stateStore.findBySwapId(manifest.swap_id)!;
-      // Coverage regressed, so should transition to FAILED for manual intervention
-      expect(recovered.state).toBe(SwapState.FAILED);
+      // Coverage regressed — revert to PARTIAL_DEPOSIT and re-register timeout
+      // so the swap can naturally recover via invoice events
+      expect(recovered.state).toBe(SwapState.PARTIAL_DEPOSIT);
     });
 
     it('should proceed with conclusion if coverage still valid despite aggregate regression', async () => {
