@@ -126,6 +126,8 @@ export class SwapOrchestrator {
 
   private started = false;
   private stopping = false;
+  /** Permanently true after stop() completes. Prevents restart on a destroyed instance. */
+  private stopped = false;
 
   constructor(deps: SwapOrchestratorDeps) {
     this.invoiceManager = deps.invoiceManager;
@@ -178,6 +180,9 @@ export class SwapOrchestrator {
    * Safe to call multiple times — subsequent calls are no-ops.
    */
   start(): void {
+    if (this.stopped) {
+      throw new Error('SwapOrchestrator has been stopped and cannot be restarted. Create a new instance.');
+    }
     if (this.started) return;
     this.started = true;
 
@@ -194,6 +199,7 @@ export class SwapOrchestrator {
    * Should be called on graceful shutdown.
    */
   async stop(): Promise<void> {
+    if (this.stopping) return; // re-entrant guard: concurrent stop() awaits nothing
     this.stopping = true;
 
     this.invoiceManager.off('invoice:payment', this.handlePayment);
@@ -203,13 +209,16 @@ export class SwapOrchestrator {
     // Drain loop: keep awaiting until no more in-flight handlers.
     // After unsubscribing, no NEW events arrive, but handlers already
     // queued via the event loop may still be starting.
+    // The stopping guard prevents new entries; loop is guaranteed to terminate.
     while (this.inFlight.size > 0) {
       await Promise.allSettled([...this.inFlight]);
     }
 
     this.timeoutManager.destroy();
     this.started = false;
-    this.stopping = false;
+    // stopping stays true permanently — prevents any further handler entry.
+    // stopped marks the instance as permanently unusable.
+    this.stopped = true;
 
     logger.info('SwapOrchestrator stopped');
   }
@@ -239,6 +248,10 @@ export class SwapOrchestrator {
    * @throws Error if manifest is invalid, address resolution fails, or invoice creation fails.
    */
   async announce(manifest: SwapManifest, _announcerNpub?: string): Promise<AnnounceResult> {
+    if (this.stopping || !this.started) {
+      throw new Error('SwapOrchestrator is not running');
+    }
+
     // 1. Validate manifest
     const validation = validateManifest(manifest);
     if (!validation.valid) {
@@ -294,6 +307,10 @@ export class SwapOrchestrator {
    * per architecture.md §Crash Recovery table.
    */
   async recoverSwaps(): Promise<void> {
+    if (this.stopping) {
+      logger.warn('recoverSwaps() called while stopping — skipping');
+      return;
+    }
     await this.crashRecovery.recover();
   }
 
@@ -782,6 +799,21 @@ export class SwapOrchestrator {
    * calling cancelInvoice.
    */
   async _handleTimeout(swapId: string): Promise<void> {
+    if (this.stopping) {
+      logger.info({ swap_id: swapId }, 'Timeout fired during shutdown — ignoring');
+      return;
+    }
+
+    // Track in inFlight so stop() drain loop awaits timeout handler completion.
+    // The outer promise (from the caller) resolves independently; this inner
+    // tracking ensures stop() does not call destroy() while we're mid-execution.
+    const innerPromise = this._handleTimeoutInner(swapId);
+    this.inFlight.add(innerPromise);
+    innerPromise.finally(() => this.inFlight.delete(innerPromise));
+    return innerPromise;
+  }
+
+  private async _handleTimeoutInner(swapId: string): Promise<void> {
     const swap = this.stateStore.findBySwapId(swapId);
     if (!swap) {
       logger.warn({ swap_id: swapId }, 'Timeout fired for unknown swap');
@@ -949,68 +981,90 @@ export class SwapOrchestrator {
     // Re-resolution is performed after winning the CONCLUDING CAS so that only one handler
     // pays the resolution cost and any race-loser short-circuits above.
     if (!manifest.party_a_address.startsWith('DIRECT://')) {
-      const rawResolvedA = await this.addressResolver.resolve(manifest.party_a_address);
-      if (rawResolvedA === null) {
-        logger.warn(
-          { swap_id: swap.swap_id, address: manifest.party_a_address },
-          'Address resolver unavailable during conclusion — skipping re-verification for party A',
+      let rawResolvedA: string | null;
+      try {
+        rawResolvedA = await this.addressResolver.resolve(manifest.party_a_address);
+      } catch (resolveErr) {
+        logger.error(
+          { err: resolveErr, swap_id: swap.swap_id, address: manifest.party_a_address },
+          'Address resolver threw during conclusion — leaving in CONCLUDING for crash recovery retry',
         );
-      } else {
-        const reResolved = normalizeDirectAddress(rawResolvedA);
-        if (reResolved !== swap.resolved_party_a_address) {
-          logger.error(
-            {
-              swap_id: swap.swap_id,
-              original: swap.resolved_party_a_address,
-              reResolved,
-              nametag: manifest.party_a_address,
-            },
-            'Nametag address changed between announcement and payout — halting conclusion',
-          );
-          const failed = this.stateStore.updateState(
-            swap.swap_id,
-            SwapState.FAILED,
-            {
-              error_message: `Nametag address changed: party A address resolved to ${reResolved} but was ${swap.resolved_party_a_address} at announcement`,
-            },
-            concluding.version,
-          );
-          if (failed) this._cleanupSwapResources(failed);
-          return;
-        }
+        return;
+      }
+      if (rawResolvedA === null) {
+        // Fail-closed: resolver unavailability must NOT bypass the nametag-squatting check.
+        // Leave in CONCLUDING so crash recovery retries when the resolver recovers.
+        logger.error(
+          { swap_id: swap.swap_id, address: manifest.party_a_address, security_event: true },
+          'Address resolver returned null during conclusion — leaving in CONCLUDING for crash recovery retry (fail-closed)',
+        );
+        return;
+      }
+      const reResolvedA = normalizeDirectAddress(rawResolvedA);
+      if (reResolvedA !== swap.resolved_party_a_address) {
+        logger.error(
+          {
+            swap_id: swap.swap_id,
+            original: swap.resolved_party_a_address,
+            reResolved: reResolvedA,
+            nametag: manifest.party_a_address,
+            security_event: true,
+          },
+          'Nametag address changed between announcement and payout — halting conclusion',
+        );
+        const failed = this.stateStore.updateState(
+          swap.swap_id,
+          SwapState.FAILED,
+          {
+            error_message: `Nametag address changed: party A address resolved to ${reResolvedA} but was ${swap.resolved_party_a_address} at announcement`,
+          },
+          concluding.version,
+        );
+        if (failed) this._cleanupSwapResources(failed);
+        return;
       }
     }
 
     if (!manifest.party_b_address.startsWith('DIRECT://')) {
-      const rawResolvedB = await this.addressResolver.resolve(manifest.party_b_address);
-      if (rawResolvedB === null) {
-        logger.warn(
-          { swap_id: swap.swap_id, address: manifest.party_b_address },
-          'Address resolver unavailable during conclusion — skipping re-verification for party B',
+      let rawResolvedB: string | null;
+      try {
+        rawResolvedB = await this.addressResolver.resolve(manifest.party_b_address);
+      } catch (resolveErr) {
+        logger.error(
+          { err: resolveErr, swap_id: swap.swap_id, address: manifest.party_b_address },
+          'Address resolver threw during conclusion — leaving in CONCLUDING for crash recovery retry',
         );
-      } else {
-        const reResolved = normalizeDirectAddress(rawResolvedB);
-        if (reResolved !== swap.resolved_party_b_address) {
-          logger.error(
-            {
-              swap_id: swap.swap_id,
-              original: swap.resolved_party_b_address,
-              reResolved,
-              nametag: manifest.party_b_address,
-            },
-            'Nametag address changed between announcement and payout — halting conclusion',
-          );
-          const failed = this.stateStore.updateState(
-            swap.swap_id,
-            SwapState.FAILED,
-            {
-              error_message: `Nametag address changed: party B address resolved to ${reResolved} but was ${swap.resolved_party_b_address} at announcement`,
-            },
-            concluding.version,
-          );
-          if (failed) this._cleanupSwapResources(failed);
-          return;
-        }
+        return;
+      }
+      if (rawResolvedB === null) {
+        logger.error(
+          { swap_id: swap.swap_id, address: manifest.party_b_address, security_event: true },
+          'Address resolver returned null during conclusion — leaving in CONCLUDING for crash recovery retry (fail-closed)',
+        );
+        return;
+      }
+      const reResolvedB = normalizeDirectAddress(rawResolvedB);
+      if (reResolvedB !== swap.resolved_party_b_address) {
+        logger.error(
+          {
+            swap_id: swap.swap_id,
+            original: swap.resolved_party_b_address,
+            reResolved: reResolvedB,
+            nametag: manifest.party_b_address,
+            security_event: true,
+          },
+          'Nametag address changed between announcement and payout — halting conclusion',
+        );
+        const failed = this.stateStore.updateState(
+          swap.swap_id,
+          SwapState.FAILED,
+          {
+            error_message: `Nametag address changed: party B address resolved to ${reResolvedB} but was ${swap.resolved_party_b_address} at announcement`,
+          },
+          concluding.version,
+        );
+        if (failed) this._cleanupSwapResources(failed);
+        return;
       }
     }
 
