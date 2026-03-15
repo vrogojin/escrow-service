@@ -1413,15 +1413,15 @@ export class CrashRecoveryManager {
       { error_message: errorMessage },
       swap.version,
     );
-    // Always clean counters regardless of CAS outcome. If CAS failed, the swap
-    // was advanced by another handler — counters are stale and must not carry
-    // over to the next recovery cycle where a fresh record will be used.
-    this.recoveryAttempts.delete(swap.swap_id);
-    this.resolverFailures.delete(swap.swap_id);
     if (failed) {
+      // Only prune counters when we successfully transitioned to FAILED.
+      // If CAS failed, the swap was advanced by another handler and our counters
+      // are irrelevant — that handler owns the swap's lifecycle now.
+      this.recoveryAttempts.delete(swap.swap_id);
+      this.resolverFailures.delete(swap.swap_id);
       logger.error({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: Swap transitioned to FAILED');
     } else {
-      logger.warn({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: _failSwap CAS failed — state already advanced by another path');
+      logger.warn({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: _failSwap CAS failed — version mismatch — state may have been advanced or updated by another path');
     }
   }
 }

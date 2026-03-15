@@ -208,6 +208,7 @@ export class SwapOrchestrator {
       // Reset so a failed shutdown can be retried
       this.stopPromise = null;
       this.stopping = false;
+      this.started = false; // allow start() to re-subscribe after failed shutdown
       throw err;
     });
     return this.stopPromise;

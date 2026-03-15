@@ -1868,6 +1868,226 @@ describe('CrashRecoveryManager', () => {
     });
   });
 
+  describe('Nametag Re-Verification (_reVerifyNametags)', () => {
+    const NAMETAG_A = '@alice';
+    const NAMETAG_B = '@bob';
+    const RESOLVED_A = 'DIRECT://0xaaaaaa';
+    const RESOLVED_B = 'DIRECT://0xbbbbbb';
+
+    function createNametagManifest(): SwapManifest {
+      const nonce = String(testCounter++);
+      const fields = {
+        party_a_address: NAMETAG_A,
+        party_b_address: NAMETAG_B,
+        party_a_currency_to_change: 'UCT',
+        party_a_value_to_change: '1000',
+        party_b_currency_to_change: 'USDU',
+        party_b_value_to_change: '500',
+        timeout: 600,
+      };
+      const swap_id = computeSwapId(fields);
+      return { swap_id, ...fields };
+    }
+
+    it('should pass verification when resolver returns matching DIRECT:// addresses', async () => {
+      const { orchestrator, recoveryManager, stateStore, mockAccounting, addressResolver } = await setupOrchestrator();
+
+      // Configure resolver to map nametags to DIRECT:// addresses
+      addressResolver.resolve.mockImplementation(async (addr: string) => {
+        if (addr === NAMETAG_A) return RESOLVED_A;
+        if (addr === NAMETAG_B) return RESOLVED_B;
+        return addr;
+      });
+
+      const manifest = createNametagManifest();
+      const announced = await orchestrator.announce(manifest);
+
+      // Simulate deposits and coverage
+      const transfer1 = createMockTransferRef({
+        transferId: 'tx-nametag-1',
+        senderAddress: RESOLVED_A,
+        amount: manifest.party_a_value_to_change,
+        coinId: 'UCT',
+      });
+      const transfer2 = createMockTransferRef({
+        transferId: 'tx-nametag-2',
+        senderAddress: RESOLVED_B,
+        amount: manifest.party_b_value_to_change,
+        coinId: 'USDU',
+      });
+
+      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer1);
+      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer2);
+      mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 30));
+
+      let swap = stateStore.findBySwapId(manifest.swap_id)!;
+      if (swap.state === SwapState.COMPLETED) {
+        // Move back to CONCLUDING for recovery test
+        swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
+      }
+      if (swap.state === SwapState.CONCLUDING) {
+        await recoveryManager.recoverSwap(swap);
+        const recovered = stateStore.findBySwapId(manifest.swap_id)!;
+        // Should proceed past verification — not FAILED
+        expect(recovered.state).not.toBe(SwapState.FAILED);
+      }
+    });
+
+    it('should increment resolver failure counter when resolver returns non-DIRECT address', async () => {
+      const { orchestrator, recoveryManager, stateStore, mockAccounting, addressResolver } = await setupOrchestrator();
+
+      addressResolver.resolve.mockImplementation(async (addr: string) => {
+        if (addr === NAMETAG_A) return RESOLVED_A;
+        if (addr === NAMETAG_B) return RESOLVED_B;
+        return addr;
+      });
+
+      const manifest = createNametagManifest();
+      const announced = await orchestrator.announce(manifest);
+
+      const transfer1 = createMockTransferRef({
+        transferId: 'tx-nametag-3',
+        senderAddress: RESOLVED_A,
+        amount: manifest.party_a_value_to_change,
+        coinId: 'UCT',
+      });
+      const transfer2 = createMockTransferRef({
+        transferId: 'tx-nametag-4',
+        senderAddress: RESOLVED_B,
+        amount: manifest.party_b_value_to_change,
+        coinId: 'USDU',
+      });
+
+      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer1);
+      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer2);
+      mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 30));
+
+      let swap = stateStore.findBySwapId(manifest.swap_id)!;
+      if (swap.state === SwapState.COMPLETED) {
+        swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
+      }
+
+      if (swap.state === SwapState.CONCLUDING) {
+        // Now make resolver return a non-DIRECT address (resolver bug)
+        addressResolver.resolve.mockImplementation(async (addr: string) => {
+          if (addr === NAMETAG_A) return 'PROXY://0xaaaaaa'; // wrong prefix
+          return RESOLVED_B;
+        });
+
+        await recoveryManager.recoverSwap(swap);
+        const afterFirstAttempt = stateStore.findBySwapId(manifest.swap_id)!;
+        // Should NOT be FAILED yet (only 1 failure, threshold is 5)
+        expect(afterFirstAttempt.state).toBe(SwapState.CONCLUDING);
+      }
+    });
+
+    it('should transition to FAILED after MAX_RESOLVER_FAILURES consecutive resolver failures', async () => {
+      const { orchestrator, recoveryManager, stateStore, mockAccounting, addressResolver } = await setupOrchestrator();
+
+      addressResolver.resolve.mockImplementation(async (addr: string) => {
+        if (addr === NAMETAG_A) return RESOLVED_A;
+        if (addr === NAMETAG_B) return RESOLVED_B;
+        return addr;
+      });
+
+      const manifest = createNametagManifest();
+      const announced = await orchestrator.announce(manifest);
+
+      const transfer1 = createMockTransferRef({
+        transferId: 'tx-nametag-5',
+        senderAddress: RESOLVED_A,
+        amount: manifest.party_a_value_to_change,
+        coinId: 'UCT',
+      });
+      const transfer2 = createMockTransferRef({
+        transferId: 'tx-nametag-6',
+        senderAddress: RESOLVED_B,
+        amount: manifest.party_b_value_to_change,
+        coinId: 'USDU',
+      });
+
+      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer1);
+      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer2);
+      mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 30));
+
+      let swap = stateStore.findBySwapId(manifest.swap_id)!;
+      if (swap.state === SwapState.COMPLETED) {
+        swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
+      }
+
+      if (swap.state === SwapState.CONCLUDING) {
+        // Make resolver throw on every attempt
+        addressResolver.resolve.mockImplementation(async () => {
+          throw new Error('resolver unavailable');
+        });
+
+        // Attempt recovery 5 times (MAX_RESOLVER_FAILURES)
+        for (let i = 0; i < 5; i++) {
+          swap = stateStore.findBySwapId(manifest.swap_id)!;
+          if (swap.state === SwapState.FAILED) break;
+          await recoveryManager.recoverSwap(swap);
+        }
+
+        const finalSwap = stateStore.findBySwapId(manifest.swap_id)!;
+        expect(finalSwap.state).toBe(SwapState.FAILED);
+        expect(finalSwap.error_message).toContain('Address resolver failed');
+      }
+    });
+
+    it('should detect nametag squatting and fail the swap immediately', async () => {
+      const { orchestrator, recoveryManager, stateStore, mockAccounting, addressResolver } = await setupOrchestrator();
+
+      addressResolver.resolve.mockImplementation(async (addr: string) => {
+        if (addr === NAMETAG_A) return RESOLVED_A;
+        if (addr === NAMETAG_B) return RESOLVED_B;
+        return addr;
+      });
+
+      const manifest = createNametagManifest();
+      const announced = await orchestrator.announce(manifest);
+
+      const transfer1 = createMockTransferRef({
+        transferId: 'tx-nametag-7',
+        senderAddress: RESOLVED_A,
+        amount: manifest.party_a_value_to_change,
+        coinId: 'UCT',
+      });
+      const transfer2 = createMockTransferRef({
+        transferId: 'tx-nametag-8',
+        senderAddress: RESOLVED_B,
+        amount: manifest.party_b_value_to_change,
+        coinId: 'USDU',
+      });
+
+      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer1);
+      mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer2);
+      mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 30));
+
+      let swap = stateStore.findBySwapId(manifest.swap_id)!;
+      if (swap.state === SwapState.COMPLETED) {
+        swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
+      }
+
+      if (swap.state === SwapState.CONCLUDING) {
+        // Nametag squatting: @alice now resolves to a different address
+        addressResolver.resolve.mockImplementation(async (addr: string) => {
+          if (addr === NAMETAG_A) return 'DIRECT://0xEVIL1';
+          if (addr === NAMETAG_B) return RESOLVED_B;
+          return addr;
+        });
+
+        await recoveryManager.recoverSwap(swap);
+        const failed = stateStore.findBySwapId(manifest.swap_id)!;
+        expect(failed.state).toBe(SwapState.FAILED);
+        expect(failed.error_message).toContain('Nametag squatting detected');
+      }
+    });
+  });
+
   describe('Partial Payout Edge Cases', () => {
     it('should catch INVOICE_NOT_FOUND on payout retry and re-import via importInvoice before retrying', async () => {
       const { orchestrator, recoveryManager, stateStore, mockAccounting } = await setupOrchestrator();
