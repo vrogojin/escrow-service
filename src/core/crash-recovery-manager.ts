@@ -962,6 +962,22 @@ export class CrashRecoveryManager {
         return false;
       }
 
+      // Defensive assertion: resolver must return DIRECT:// addresses.
+      // If it returns a different prefix (resolver bug), treat as resolver error
+      // to avoid false-positive mismatch that would strand funds via _failSwap.
+      if (!rawResolved.startsWith('DIRECT://')) {
+        const count = (this.resolverFailures.get(swap.swap_id) ?? 0) + 1;
+        this.resolverFailures.set(swap.swap_id, count);
+        logger.error(
+          { swap_id: swap.swap_id, address, party, rawResolved, attempts: count },
+          'Recovery: address resolver returned non-DIRECT address — treating as resolver error',
+        );
+        if (count >= CrashRecoveryManager.MAX_RESOLVER_FAILURES) {
+          this._failSwap(swap, `Address resolver returned non-DIRECT address "${rawResolved}" for party ${party} (${address})`);
+        }
+        return false;
+      }
+
       const reResolved = normalizeDirectAddress(rawResolved);
       if (reResolved !== storedResolved) {
         logger.error(
@@ -981,18 +997,19 @@ export class CrashRecoveryManager {
   private async _resumePayouts(swap: SwapRecord): Promise<void> {
     const manifest = swap.manifest;
 
-    // Re-verify nametag addresses before paying out — defence against nametag squatting.
-    // This covers ALL recovery paths into _resumePayouts. On failure, leaves swap in
-    // current state (resolver unavailable) or transitions to FAILED (address mismatch).
-    if (!(await this._reVerifyNametags(swap))) {
-      return;
-    }
-
-    // Fetch the latest persisted swap record to get the most current version
-    // and payout invoice IDs (the caller may have passed a stale record).
+    // Fetch the latest persisted swap record FIRST to get current version.
+    // _reVerifyNametags may call _failSwap which needs a current version for CAS.
     let currentSwap = this.stateStore.findBySwapId(swap.swap_id);
     if (!currentSwap) {
       logger.error({ swap_id: swap.swap_id }, 'Recovery: Swap not found when resuming payouts');
+      return;
+    }
+
+    // Re-verify nametag addresses before paying out — defence against nametag squatting.
+    // This covers ALL recovery paths into _resumePayouts. On failure, leaves swap in
+    // current state (resolver unavailable) or transitions to FAILED (address mismatch).
+    // Uses currentSwap (fresh version) so _failSwap CAS uses the correct version.
+    if (!(await this._reVerifyNametags(currentSwap))) {
       return;
     }
 
@@ -1396,10 +1413,15 @@ export class CrashRecoveryManager {
       { error_message: errorMessage },
       swap.version,
     );
+    // Always clean counters regardless of CAS outcome. If CAS failed, the swap
+    // was advanced by another handler — counters are stale and must not carry
+    // over to the next recovery cycle where a fresh record will be used.
+    this.recoveryAttempts.delete(swap.swap_id);
+    this.resolverFailures.delete(swap.swap_id);
     if (failed) {
-      this.recoveryAttempts.delete(swap.swap_id);
-      this.resolverFailures.delete(swap.swap_id);
       logger.error({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: Swap transitioned to FAILED');
+    } else {
+      logger.warn({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: _failSwap CAS failed — state already advanced by another path');
     }
   }
 }

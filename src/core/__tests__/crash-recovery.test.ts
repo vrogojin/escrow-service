@@ -69,6 +69,7 @@ async function setupOrchestrator() {
     stateStore,
     timeoutManager,
     orchestrator,
+    addressResolver,
   });
 
   return { orchestrator, recoveryManager, mockAccounting, stateStore, invoiceManager, messageSender, addressResolver, timeoutManager };

@@ -204,7 +204,12 @@ export class SwapOrchestrator {
   async stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise; // concurrent callers await same promise
     this.stopping = true;
-    this.stopPromise = this._doStop();
+    this.stopPromise = this._doStop().catch((err) => {
+      // Reset so a failed shutdown can be retried
+      this.stopPromise = null;
+      this.stopping = false;
+      throw err;
+    });
     return this.stopPromise;
   }
 
@@ -315,7 +320,7 @@ export class SwapOrchestrator {
    */
   async recoverSwaps(): Promise<void> {
     if (this.stopped) {
-      throw new Error('SwapOrchestrator has been stopped and cannot be restarted. Create a new instance.');
+      throw new Error('SwapOrchestrator has been stopped; crash recovery cannot run on a destroyed instance.');
     }
     if (this.stopping) {
       logger.warn('recoverSwaps() called while stopping — skipping');
