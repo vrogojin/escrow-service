@@ -1932,10 +1932,14 @@ describe('CrashRecoveryManager', () => {
       mockAccounting._simulateCoverage(announced.deposit_invoice_id);
       await new Promise((r) => setTimeout(r, 30));
 
-      // Force swap into CONCLUDING state regardless of where the async flow ended
+      // Force swap into CONCLUDING state regardless of where the async flow ended.
+      // InMemorySwapStateStore does not enforce transition validity, so this works
+      // even from terminal states like COMPLETED.
       let swap = stateStore.findBySwapId(manifest.swap_id)!;
-      while (swap.state !== SwapState.CONCLUDING) {
-        swap = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version)!;
+      if (swap.state !== SwapState.CONCLUDING) {
+        const updated = stateStore.updateState(swap.swap_id, SwapState.CONCLUDING, {}, swap.version);
+        if (!updated) throw new Error('setupConcludingNametagSwap: updateState returned null (version mismatch)');
+        swap = updated;
       }
 
       return { manifest, swap };
@@ -1947,8 +1951,10 @@ describe('CrashRecoveryManager', () => {
 
       await setup.recoveryManager.recoverSwap(swap);
       const recovered = setup.stateStore.findBySwapId(manifest.swap_id)!;
-      // Should proceed past verification — not FAILED
+      // Should proceed past verification — not FAILED, and resolver was called for both parties
       expect(recovered.state).not.toBe(SwapState.FAILED);
+      expect(setup.addressResolver.resolve).toHaveBeenCalledWith(NAMETAG_A);
+      expect(setup.addressResolver.resolve).toHaveBeenCalledWith(NAMETAG_B);
     });
 
     it('should increment resolver failure counter when resolver returns non-DIRECT address', async () => {
@@ -1980,10 +1986,8 @@ describe('CrashRecoveryManager', () => {
       for (let i = 0; i < 5; i++) {
         const swap = setup.stateStore.findBySwapId(manifest.swap_id)!;
         if (swap.state === SwapState.FAILED) break;
-        // Verify intermediate states stay in CONCLUDING (iterations 1-4)
-        if (i > 0) {
-          expect(swap.state).toBe(SwapState.CONCLUDING);
-        }
+        // Every iteration before the final one should still be CONCLUDING
+        expect(swap.state).toBe(SwapState.CONCLUDING);
         await setup.recoveryManager.recoverSwap(swap);
       }
 
@@ -1998,7 +2002,7 @@ describe('CrashRecoveryManager', () => {
 
       // Nametag squatting: @alice now resolves to a different address
       setup.addressResolver.resolve.mockImplementation(async (addr: string) => {
-        if (addr === NAMETAG_A) return 'DIRECT://0xEVIL1';
+        if (addr === NAMETAG_A) return 'DIRECT://0xevil1';
         if (addr === NAMETAG_B) return RESOLVED_B;
         return addr;
       });
