@@ -36,6 +36,21 @@ export interface MessageHandler {
 export type { NpubRoleMap } from './orchestrator-interfaces.js';
 
 // ---------------------------------------------------------------------------
+// Address utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Converts a Nostr hex pubkey (npub) to a DIRECT:// address.
+ *
+ * Protocol invariant: Nostr secp256k1 hex pubkeys map 1:1 to Unicity
+ * DIRECT:// addresses. Both use the same 32-byte compressed public key
+ * hex encoding. See protocol-spec.md §Identity.
+ */
+export function npubToDirectAddress(npub: string): string {
+  return `DIRECT://${npub.toLowerCase()}`;
+}
+
+// ---------------------------------------------------------------------------
 // Manifest field allow-list
 // ---------------------------------------------------------------------------
 
@@ -170,7 +185,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     // DIRECT:// by the orchestrator at announce time).
     //
     // Case-sensitive exact string match — see protocol-spec §7.
-    const senderDirectAddress = `DIRECT://${npub.toLowerCase()}`;
+    const senderDirectAddress = npubToDirectAddress(npub);
 
     if (roleFromMap === 'A') {
       if (senderDirectAddress === swap.resolved_party_a_address) return 'A';
@@ -292,7 +307,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     const swap = stateStore.findBySwapId(result.swap_id);
     let party: 'A' | 'B' | null = null;
     if (swap) {
-      const senderDirectAddress = `DIRECT://${senderPubkey.toLowerCase()}`;
+      const senderDirectAddress = npubToDirectAddress(senderPubkey);
       if (senderDirectAddress === swap.resolved_party_a_address) {
         party = 'A';
       } else if (senderDirectAddress === swap.resolved_party_b_address) {

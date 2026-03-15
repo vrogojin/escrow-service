@@ -401,7 +401,7 @@ describe('SwapOrchestrator', () => {
       expect(timeoutManager.hasTimer(manifest.swap_id)).toBe(false);
     });
 
-    it('should call closeDepositInvoice() without autoReturn', async () => {
+    it('should call closeDepositInvoice() with autoReturn (surplus delegated to SDK)', async () => {
       const { orchestrator, mockAccounting } = await setupOrchestrator();
       const manifest = createTestManifest();
 
@@ -1238,7 +1238,7 @@ describe('SwapOrchestrator', () => {
       // (both deposits were accepted individually, but coverage check failed)
     });
 
-    it('should call closeInvoice() without autoReturn option', async () => {
+    it('should call closeInvoice() with autoReturn option (surplus delegated to SDK)', async () => {
       const { orchestrator, mockAccounting } = await setupOrchestrator();
       const manifest = createTestManifest();
 
@@ -1261,13 +1261,16 @@ describe('SwapOrchestrator', () => {
       mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer1);
       mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer2);
 
-      // Spy on closeInvoice to verify options argument
+      // Spy on closeInvoice to verify autoReturn is passed
       const closeInvoiceSpy = vi.spyOn(mockAccounting, 'closeInvoice' as any);
 
       await orchestrator._onInvoiceCovered({ invoiceId: announced.deposit_invoice_id, confirmed: true });
 
-      // closeInvoice should be called without autoReturn (or with undefined/empty options)
-      expect(closeInvoiceSpy).toHaveBeenCalled();
+      // closeInvoice should be called with autoReturn: true (surplus delegated to SDK)
+      expect(closeInvoiceSpy).toHaveBeenCalledWith(
+        announced.deposit_invoice_id,
+        expect.objectContaining({ autoReturn: true }),
+      );
     });
 
     it('should deliver payout invoice tokens to both parties via DM after successful payouts', async () => {

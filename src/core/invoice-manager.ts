@@ -118,16 +118,28 @@ export class InvoiceManager {
   }
 
   /**
-   * Closes the deposit invoice WITHOUT autoReturn.
+   * Closes the deposit invoice WITH autoReturn: true.
    *
-   * Per architecture.md §Event-Driven Flow: do NOT pass autoReturn here.
-   * Surplus handling is done after payouts complete; concurrent autoReturn
-   * and payInvoice calls create a race for the escrow's token balance.
+   * Surplus computation and distribution is fully delegated to the SDK.
+   * The SDK uses latest-sender-priority surplus distribution via
+   * `freezeBalances()` + `_executeTerminationReturns()` with crash-safe
+   * dedup via the `autoReturnManager`.
+   *
+   * The SDK's SpendQueue serializes all `send()` calls (surplus returns
+   * and subsequent payout `payInvoice()` calls), preventing token
+   * selection races.
+   *
+   * **Note:** The SDK's `_executeTerminationReturns()` currently lacks
+   * per-send timeouts (BUG-001 Fix 3). A hung transport send will block
+   * the `closeInvoice()` call until the transport layer times out.
+   * This is acceptable because the escrow calls `closeDepositInvoice()`
+   * BEFORE payouts — if it hangs, the timeout timer remains active as
+   * a safety net, and crash recovery will resume from DEPOSIT_COVERED.
    *
    * @param invoiceId - The deposit invoice ID to close.
    */
   async closeDepositInvoice(invoiceId: string): Promise<void> {
-    await this.accounting.closeInvoice(invoiceId);
+    await this.accounting.closeInvoice(invoiceId, { autoReturn: true });
   }
 
   /**
