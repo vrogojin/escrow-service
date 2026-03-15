@@ -35,6 +35,7 @@ const VALID_TRANSITIONS: Record<string, Set<SwapState>> = {
   ]),
   [SwapState.DEPOSIT_COVERED]: new Set([
     SwapState.DEPOSIT_COVERED, // self-transition for metadata-only updates (e.g., payout invoice ID checkpoint)
+    SwapState.PARTIAL_DEPOSIT, // coverage regression during crash — revert to await new deposits
     SwapState.CONCLUDING,
     SwapState.FAILED,
   ]),

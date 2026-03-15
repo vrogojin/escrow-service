@@ -99,7 +99,22 @@ export class CrashRecoveryManager {
    * (swap state, invoice state) pair. Errors in individual swap recovery
    * are caught and logged — one bad swap does not block recovery of others.
    */
+  private isRecovering = false;
+
   async recover(): Promise<void> {
+    if (this.isRecovering) {
+      logger.warn('Recovery already in progress — skipping concurrent call');
+      return;
+    }
+    this.isRecovering = true;
+    try {
+      await this._doRecover();
+    } finally {
+      this.isRecovering = false;
+    }
+  }
+
+  private async _doRecover(): Promise<void> {
     const swaps = this.stateStore.findNonTerminal();
     logger.info({ count: swaps.length }, 'Starting crash recovery for non-terminal swaps');
 
@@ -850,8 +865,16 @@ export class CrashRecoveryManager {
       try {
         await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
       } catch (err) {
-        if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
-          // Already closed or transient SDK condition — proceed
+        if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
+          // Already closed — proceed to payouts
+        } else if (isSphereError(err) && err.code === 'INVOICE_NOT_TARGET') {
+          // Transient SDK condition (addresses not loaded) — do NOT proceed
+          // to _resumePayouts with deposit unclosed. Leave in current state
+          // for next recovery cycle to retry.
+          if (this._recordInvoiceNotTarget(swap.swap_id, '_resumeConclusion closeDepositInvoice')) {
+            this._failSwap(coveredSwap, 'Recovery stuck: INVOICE_NOT_TARGET after max attempts (_resumeConclusion closeDepositInvoice)');
+          }
+          return;
         } else if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CANCELLED') {
           logger.error({ swap_id: swap.swap_id }, 'Recovery: Invoice was cancelled, failing swap');
           this._failSwap(coveredSwap, 'Invoice was cancelled when attempting to close during recovery');
@@ -1212,7 +1235,17 @@ export class CrashRecoveryManager {
         }
         if (err.code === 'INVOICE_NOT_FOUND') {
           // Token not loaded in AccountingModule after restart.
-          // Before giving up, attempt to import the token if available.
+          // Annotate the swap record so the condition is visible in the store
+          // without log mining — operators can query for swaps with error_message set.
+          const current = this.stateStore.findBySwapId(swapId);
+          if (current && current.state === SwapState.CONCLUDING) {
+            this.stateStore.updateState(
+              swapId,
+              SwapState.CONCLUDING, // self-transition to persist error_message
+              { error_message: `Payout invoice not found — manual intervention required: ${invoiceId}` },
+              current.version,
+            );
+          }
           logger.warn({ swap_id: swapId, invoiceId }, 'Recovery: payInvoice — invoice not found, attempting importInvoice');
           // NOTE: For production use, the payout invoice token should be retrieved from
           // durable storage (e.g., database) and passed to importInvoice here.
@@ -1416,6 +1449,7 @@ export class CrashRecoveryManager {
       swap.version,
     );
     if (cancelled) {
+      this.orchestrator.cleanupSwapResources(cancelled);
       logger.info({ swap_id: swap.swap_id }, 'Recovery: Swap transitioned to CANCELLED');
     }
   }
@@ -1431,14 +1465,16 @@ export class CrashRecoveryManager {
       { error_message: errorMessage },
       swap.version,
     );
-    // Always clean counters regardless of CAS outcome. If CAS failed, the swap
-    // was advanced by another handler — stale counters must not carry over to
-    // the next recovery cycle where they could cause a false-positive _failSwap.
-    this.recoveryAttempts.delete(swap.swap_id);
-    this.resolverFailures.delete(swap.swap_id);
     if (failed) {
+      // CAS succeeded — clean counters and release in-memory resources
+      this.recoveryAttempts.delete(swap.swap_id);
+      this.resolverFailures.delete(swap.swap_id);
+      this.orchestrator.cleanupSwapResources(failed);
       logger.error({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: Swap transitioned to FAILED');
     } else {
+      // CAS failed — another handler advanced the state. Do NOT delete counters:
+      // the swap may still be non-terminal under the new state and the counters
+      // should accumulate across recovery cycles until the swap is resolved.
       logger.warn({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: _failSwap CAS failed — version mismatch — state may have been advanced or updated by another path');
     }
   }

@@ -7,7 +7,7 @@ import { validateManifest, type SwapManifest } from '../../core/manifest-validat
  */
 function makeValidManifest(overrides?: Partial<SwapManifest>): SwapManifest {
   const base = {
-    party_a_address: 'DIRECT://abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab',
+    party_a_address: 'DIRECT://abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
     party_b_address: '@bob',
     party_a_currency_to_change: 'USD',
     party_a_value_to_change: '1000',
@@ -296,7 +296,7 @@ describe('manifest-validator', () => {
     });
 
     it('should reject when both addresses are identical DIRECT addresses', () => {
-      const sameAddr = 'DIRECT://1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab';
+      const sameAddr = 'DIRECT://1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef';
       const manifest = makeValidManifest({
         party_a_address: sameAddr,
         party_b_address: sameAddr,
@@ -327,7 +327,7 @@ describe('manifest-validator', () => {
       expect(result.valid).toBe(false);
       expect(result.errors).toContainEqual(expect.objectContaining({
         field: 'party_a_currency_to_change',
-        message: expect.stringContaining('non-empty string'),
+        message: expect.stringContaining('alphanumeric'),
       }));
     });
 
@@ -337,7 +337,7 @@ describe('manifest-validator', () => {
       expect(result.valid).toBe(false);
       expect(result.errors).toContainEqual(expect.objectContaining({
         field: 'party_a_currency_to_change',
-        message: expect.stringContaining('non-empty string'),
+        message: expect.stringContaining('alphanumeric'),
       }));
     });
 
@@ -391,10 +391,10 @@ describe('manifest-validator', () => {
       expect(result.valid).toBe(true);
     });
 
-    it('should accept arbitrary currency strings', () => {
+    it('should accept arbitrary alphanumeric currency strings', () => {
       const manifest = makeValidManifest({
-        party_a_currency_to_change: 'CURRENCY_A',
-        party_b_currency_to_change: 'CURRENCY_B',
+        party_a_currency_to_change: 'CURRENCYA',
+        party_b_currency_to_change: 'CURRENCYB',
       });
       const result = validateManifest(manifest);
       expect(result.valid).toBe(true);

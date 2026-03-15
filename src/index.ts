@@ -106,7 +106,7 @@ async function main(): Promise<void> {
   messageHandler.start();
 
   // 7. Graceful shutdown
-  setupGracefulShutdown(messageHandler, orchestrator, timeoutManager, walletManager);
+  setupGracefulShutdown(messageHandler, orchestrator, walletManager);
 
   logger.info('Escrow service started successfully');
 }
@@ -114,7 +114,6 @@ async function main(): Promise<void> {
 function setupGracefulShutdown(
   messageHandler: { stop(): Promise<void> },
   orchestrator: SwapOrchestrator,
-  timeoutManager: TimeoutManager,
   walletManager: { destroy(): Promise<void> },
 ): void {
   let shuttingDown = false;
@@ -132,7 +131,6 @@ function setupGracefulShutdown(
 
     await messageHandler.stop();
     await orchestrator.stop();
-    timeoutManager.destroy();
 
     await walletManager.destroy().catch((err) => {
       logger.error({ err }, 'Error destroying wallet');

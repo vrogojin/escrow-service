@@ -9,10 +9,10 @@ import { InMemorySwapStateStore } from '../../__tests__/helpers/in-memory-swap-s
 import { createMockTransferRef } from '../../__tests__/helpers/mock-invoice-status.js';
 import type { SwapManifest } from '../manifest-validator.js';
 
-const PARTY_A_ADDRESS = 'DIRECT://0xaaaaaa';
-const PARTY_B_ADDRESS = 'DIRECT://0xbbbbbb';
-const CHARLIE_ADDRESS = 'DIRECT://0xcccccc';
-const ESCROW_ADDRESS = 'DIRECT://0xescrow';
+const PARTY_A_ADDRESS = 'DIRECT://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const PARTY_B_ADDRESS = 'DIRECT://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const CHARLIE_ADDRESS = 'DIRECT://cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+const ESCROW_ADDRESS = 'DIRECT://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
 let testCounter = 0;
 function createTestManifest(): SwapManifest {
@@ -194,7 +194,7 @@ describe('SwapOrchestrator', () => {
       const transfer = createMockTransferRef({
         transferId: 'tx1',
         senderAddress: CHARLIE_ADDRESS,
-        refundAddress: 'DIRECT://0xrefund',
+        refundAddress: 'DIRECT://dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
         amount: '1000000',
         coinId: 'GBP',
       });
@@ -205,7 +205,7 @@ describe('SwapOrchestrator', () => {
 
       expect(mockAccounting._getCallOrder()).toContain('returnInvoicePayment');
       expect(messageSender.sendToAddress).toHaveBeenCalledWith(
-        'DIRECT://0xrefund',
+        'DIRECT://dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
         expect.objectContaining({
           type: 'bounce_notification',
           reason: 'WRONG_CURRENCY',
@@ -223,7 +223,7 @@ describe('SwapOrchestrator', () => {
       const transfer = createMockTransferRef({
         transferId: 'tx1',
         senderAddress: null,
-        refundAddress: 'DIRECT://0xrefund',
+        refundAddress: 'DIRECT://dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
         amount: '1000000',
         coinId: 'USD',
       });
@@ -1461,7 +1461,7 @@ describe('SwapOrchestrator', () => {
       // Send wrong currency from specific address
       const transfer = createMockTransferRef({
         transferId: 'tx1',
-        senderAddress: 'DIRECT://0xbouncer',
+        senderAddress: 'DIRECT://1111111111111111111111111111111111111111111111111111111111111111',
         amount: '1000000',
         coinId: 'GBP',
       });
@@ -1472,7 +1472,7 @@ describe('SwapOrchestrator', () => {
 
       // Verify bounce_notification was sent with WRONG_CURRENCY reason
       expect(messageSender.sendToAddress).toHaveBeenCalledWith(
-        'DIRECT://0xbouncer',
+        'DIRECT://1111111111111111111111111111111111111111111111111111111111111111',
         expect.objectContaining({
           type: 'bounce_notification',
           reason: 'WRONG_CURRENCY',

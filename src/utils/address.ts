@@ -17,8 +17,13 @@ export function parseAddress(address: string): ParsedAddress | null {
   if (!address || typeof address !== 'string') return null;
   const trimmed = address.trim();
 
-  if (trimmed.startsWith(DIRECT_PREFIX) && trimmed.length > DIRECT_PREFIX.length) {
-    return { type: 'DIRECT', raw: trimmed, value: trimmed.slice(DIRECT_PREFIX.length) };
+  if (trimmed.startsWith(DIRECT_PREFIX)) {
+    const value = trimmed.slice(DIRECT_PREFIX.length);
+    // DIRECT:// must be followed by exactly 64 lowercase hex chars (secp256k1 pubkey)
+    if (/^[0-9a-f]{64}$/.test(value)) {
+      return { type: 'DIRECT', raw: trimmed, value };
+    }
+    return null;
   }
   if (trimmed.startsWith(PROXY_PREFIX) && trimmed.length > PROXY_PREFIX.length) {
     return { type: 'PROXY', raw: trimmed, value: trimmed.slice(PROXY_PREFIX.length) };

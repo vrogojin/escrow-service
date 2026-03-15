@@ -184,10 +184,11 @@ describe('SwapState state machine', () => {
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return [DEPOSIT_COVERED, CONCLUDING, FAILED] for DEPOSIT_COVERED (includes self-transition)', () => {
+    it('should return [DEPOSIT_COVERED, PARTIAL_DEPOSIT, CONCLUDING, FAILED] for DEPOSIT_COVERED (includes self-transition and coverage regression)', () => {
       const nextStates = getValidNextStates(SwapState.DEPOSIT_COVERED);
-      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toHaveLength(4);
       expect(nextStates).toContain(SwapState.DEPOSIT_COVERED); // self-transition for metadata updates
+      expect(nextStates).toContain(SwapState.PARTIAL_DEPOSIT); // coverage regression during crash
       expect(nextStates).toContain(SwapState.CONCLUDING);
       expect(nextStates).toContain(SwapState.FAILED);
     });

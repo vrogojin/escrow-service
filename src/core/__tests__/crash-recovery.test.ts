@@ -10,9 +10,9 @@ import { SwapState } from '../state-machine.js';
 import { computeSwapId } from '../../utils/hash.js';
 import type { SwapManifest } from '../manifest-validator.js';
 
-const PARTY_A_ADDRESS = 'DIRECT://0xaaaaaa';
-const PARTY_B_ADDRESS = 'DIRECT://0xbbbbbb';
-const ESCROW_ADDRESS = 'DIRECT://escrow';
+const PARTY_A_ADDRESS = 'DIRECT://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const PARTY_B_ADDRESS = 'DIRECT://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const ESCROW_ADDRESS = 'DIRECT://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
 let testCounter = 0;
 function createTestManifest(): SwapManifest {
@@ -1874,8 +1874,8 @@ describe('CrashRecoveryManager', () => {
   describe('Nametag Re-Verification (_reVerifyNametags)', () => {
     const NAMETAG_A = '@alice';
     const NAMETAG_B = '@bob';
-    const RESOLVED_A = 'DIRECT://0xaaaaaa';
-    const RESOLVED_B = 'DIRECT://0xbbbbbb';
+    const RESOLVED_A = 'DIRECT://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const RESOLVED_B = 'DIRECT://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
     function createNametagManifest(): SwapManifest {
       const counter = testCounter++;
@@ -2005,7 +2005,7 @@ describe('CrashRecoveryManager', () => {
 
       // Nametag squatting: @alice now resolves to a different address
       setup.addressResolver.resolve.mockImplementation(async (addr: string) => {
-        if (addr === NAMETAG_A) return 'DIRECT://0xevil1';
+        if (addr === NAMETAG_A) return 'DIRECT://1111111111111111111111111111111111111111111111111111111111111111';
         if (addr === NAMETAG_B) return RESOLVED_B;
         return addr;
       });

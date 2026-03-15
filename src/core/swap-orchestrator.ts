@@ -983,14 +983,18 @@ export class SwapOrchestrator {
 
     if (!concluding) {
       const recheck = this.stateStore.findBySwapId(swap.swap_id);
-      if (recheck?.state === SwapState.CONCLUDING || isTerminalState(recheck?.state as SwapState)) {
+      if (!recheck) {
+        logger.error({ swap_id: swap.swap_id }, 'Swap record not found after CONCLUDING CAS failure');
+        return;
+      }
+      if (recheck.state === SwapState.CONCLUDING || isTerminalState(recheck.state)) {
         logger.info(
-          { swap_id: swap.swap_id, state: recheck?.state },
+          { swap_id: swap.swap_id, state: recheck.state },
           'Another handler already advanced the swap — deferring to winner',
         );
       } else {
         logger.error(
-          { swap_id: swap.swap_id, currentState: recheck?.state },
+          { swap_id: swap.swap_id, currentState: recheck.state },
           'Version mismatch persisting CONCLUDING — swap in unexpected state',
         );
       }
@@ -1248,7 +1252,7 @@ export class SwapOrchestrator {
     );
 
     if (completed) {
-      this._cleanupSwapResources(reloaded);
+      this._cleanupSwapResources(completed);
       logger.info({ swap_id: swap.swap_id }, 'Swap completed successfully');
     } else {
       logger.warn({ swap_id: swap.swap_id }, 'Version mismatch transitioning to COMPLETED (likely already completed)');
