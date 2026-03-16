@@ -74,14 +74,14 @@ export function validateManifest(
     errors.push({ field: 'party_b_address', message: 'Must differ from party_a_address' });
   }
 
-  // party_a_currency_to_change — alphanumeric, 1-64 chars (covers both hex coin IDs and short tickers)
-  if (typeof m.party_a_currency_to_change !== 'string' || !/^[A-Za-z0-9]{1,64}$/.test(m.party_a_currency_to_change)) {
-    errors.push({ field: 'party_a_currency_to_change', message: 'Must be 1-64 alphanumeric characters' });
+  // party_a_currency_to_change — alphanumeric, 1-68 chars (matches SDK AccountingModule's max coinId length)
+  if (typeof m.party_a_currency_to_change !== 'string' || !/^[A-Za-z0-9]{1,68}$/.test(m.party_a_currency_to_change)) {
+    errors.push({ field: 'party_a_currency_to_change', message: 'Must be 1-68 alphanumeric characters' });
   }
 
   // party_b_currency_to_change
-  if (typeof m.party_b_currency_to_change !== 'string' || !/^[A-Za-z0-9]{1,64}$/.test(m.party_b_currency_to_change)) {
-    errors.push({ field: 'party_b_currency_to_change', message: 'Must be 1-64 alphanumeric characters' });
+  if (typeof m.party_b_currency_to_change !== 'string' || !/^[A-Za-z0-9]{1,68}$/.test(m.party_b_currency_to_change)) {
+    errors.push({ field: 'party_b_currency_to_change', message: 'Must be 1-68 alphanumeric characters' });
   }
 
   // currencies must differ

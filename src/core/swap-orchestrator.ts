@@ -30,6 +30,7 @@ import { isSphereError } from './accounting-types.js';
 import { ManifestValidationError } from '../sphere/orchestrator-interfaces.js';
 import { CrashRecoveryManager } from './crash-recovery-manager.js';
 import { normalizeDirectAddress } from './swap-state-store.js';
+import { isValidAddress } from '../utils/address.js';
 
 // =============================================================================
 // Dependency interfaces
@@ -304,11 +305,11 @@ export class SwapOrchestrator {
       this.addressResolver.resolve(manifest.party_b_address),
     ]);
 
-    if (!resolvedA) {
-      throw new Error(`Cannot resolve party A address: ${manifest.party_a_address}`);
+    if (!resolvedA || !resolvedA.startsWith('DIRECT://') || !isValidAddress(resolvedA)) {
+      throw new Error(`Cannot resolve party A address to a valid DIRECT:// address: ${manifest.party_a_address}`);
     }
-    if (!resolvedB) {
-      throw new Error(`Cannot resolve party B address: ${manifest.party_b_address}`);
+    if (!resolvedB || !resolvedB.startsWith('DIRECT://') || !isValidAddress(resolvedB)) {
+      throw new Error(`Cannot resolve party B address to a valid DIRECT:// address: ${manifest.party_b_address}`);
     }
 
     // 4. Create swap record in ANNOUNCED state

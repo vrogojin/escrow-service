@@ -23,6 +23,7 @@ import type { SwapStateStore, SwapRecord } from './types.js';
 import type { SwapOrchestrator, AddressResolver } from './swap-orchestrator.js';
 import type { InvoiceState } from './accounting-types.js';
 import { normalizeDirectAddress } from './swap-state-store.js';
+import { isValidAddress } from '../utils/address.js';
 
 export interface CrashRecoveryDeps {
   invoiceManager: InvoiceManager;
@@ -66,6 +67,9 @@ export class CrashRecoveryManager {
   /**
    * Resets the INVOICE_NOT_TARGET attempt counter for a swap.
    * Call this after any successful recovery path completes.
+   * Note: does NOT clear resolverFailures — those are a separate concern
+   * (address resolver errors) and are cleaned up in _reVerifyNametags on
+   * success, in _failSwap on terminal transition, and in _cancelSwap.
    */
   private resetRecoveryAttempts(swapId: string): void {
     this.recoveryAttempts.delete(swapId);
@@ -985,18 +989,19 @@ export class CrashRecoveryManager {
         return false;
       }
 
-      // Defensive assertion: resolver must return DIRECT:// addresses.
-      // If it returns a different prefix (resolver bug), treat as resolver error
-      // to avoid false-positive mismatch that would strand funds via _failSwap.
-      if (!rawResolved.startsWith('DIRECT://')) {
+      // Defensive assertion: resolver must return a valid DIRECT:// address
+      // (64 lowercase hex chars). Anything else (PROXY, nametag, malformed)
+      // is treated as a resolver error to avoid false-positive mismatch
+      // that would strand funds via _failSwap.
+      if (!rawResolved.startsWith('DIRECT://') || !isValidAddress(rawResolved)) {
         const count = (this.resolverFailures.get(swap.swap_id) ?? 0) + 1;
         this.resolverFailures.set(swap.swap_id, count);
         logger.error(
           { swap_id: swap.swap_id, address, party, rawResolved, attempts: count },
-          'Recovery: address resolver returned non-DIRECT address — treating as resolver error',
+          'Recovery: address resolver returned invalid address — treating as resolver error',
         );
         if (count >= CrashRecoveryManager.MAX_RESOLVER_FAILURES) {
-          this._failSwap(swap, `Address resolver returned non-DIRECT address "${rawResolved}" for party ${party} (${address})`);
+          this._failSwap(swap, `Address resolver returned invalid address "${rawResolved}" for party ${party} (${address})`);
         }
         return false;
       }
@@ -1449,6 +1454,8 @@ export class CrashRecoveryManager {
       swap.version,
     );
     if (cancelled) {
+      this.recoveryAttempts.delete(swap.swap_id);
+      this.resolverFailures.delete(swap.swap_id);
       this.orchestrator.cleanupSwapResources(cancelled);
       logger.info({ swap_id: swap.swap_id }, 'Recovery: Swap transitioned to CANCELLED');
     }
@@ -1472,9 +1479,13 @@ export class CrashRecoveryManager {
       this.orchestrator.cleanupSwapResources(failed);
       logger.error({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: Swap transitioned to FAILED');
     } else {
-      // CAS failed — another handler advanced the state. Do NOT delete counters:
-      // the swap may still be non-terminal under the new state and the counters
-      // should accumulate across recovery cycles until the swap is resolved.
+      // CAS failed — another handler advanced the state. If the swap is now
+      // terminal, clean up counters to prevent permanent memory leaks.
+      const reloaded = this.stateStore.findBySwapId(swap.swap_id);
+      if (!reloaded || isTerminalState(reloaded.state)) {
+        this.recoveryAttempts.delete(swap.swap_id);
+        this.resolverFailures.delete(swap.swap_id);
+      }
       logger.warn({ swap_id: swap.swap_id, error: errorMessage }, 'Recovery: _failSwap CAS failed — version mismatch — state may have been advanced or updated by another path');
     }
   }
