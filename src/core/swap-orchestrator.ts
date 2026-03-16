@@ -315,8 +315,8 @@ export class SwapOrchestrator {
       throw new Error(`Cannot resolve party B address to a valid DIRECT:// address: ${manifest.party_b_address}`);
     }
 
-    // 3b. Prevent self-swaps: resolved addresses must differ
-    if (resolvedA === resolvedB) {
+    // 3b. Prevent self-swaps: resolved addresses must differ (case-insensitive)
+    if (normalizeDirectAddress(resolvedA) === normalizeDirectAddress(resolvedB)) {
       throw new Error('Party A and party B resolve to the same address — self-swaps are not allowed');
     }
 
@@ -739,11 +739,13 @@ export class SwapOrchestrator {
         } else if (err.code === 'INVOICE_NOT_TARGET') {
           // SDK's getActiveAddresses() may return empty if tracked addresses
           // haven't loaded yet. The escrow IS the target (we created the invoice).
-          // Do NOT proceed — leave in DEPOSIT_COVERED for crash recovery to retry,
-          // matching the abort-and-retry pattern used in crash-recovery-manager.
+          // Do NOT proceed — leave in DEPOSIT_COVERED for crash recovery to retry.
+          // Note: no attempt counter here by design. Escalation to FAILED is handled
+          // by CrashRecoveryManager._revalidateCoverageOrRevert which tracks attempts
+          // via _recordInvoiceNotTarget. The live path defers escalation to recovery.
           logger.warn(
             { swap_id: swap.swap_id },
-            'closeDepositInvoice returned INVOICE_NOT_TARGET — leaving in DEPOSIT_COVERED for retry',
+            'closeDepositInvoice returned INVOICE_NOT_TARGET — leaving in DEPOSIT_COVERED for crash recovery retry',
           );
           return;
         } else if (err.code === 'INVOICE_ALREADY_CANCELLED') {

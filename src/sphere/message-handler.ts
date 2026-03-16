@@ -311,7 +311,22 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     const swap = stateStore.findBySwapId(result.swap_id);
     let party: 'A' | 'B' | null = null;
     if (swap) {
-      const senderDirectAddress = npubToDirectAddress(senderPubkey);
+      let senderDirectAddress: string;
+      try {
+        senderDirectAddress = npubToDirectAddress(senderPubkey);
+      } catch {
+        // Invalid npub format — cannot determine party role. The announce
+        // succeeded, so reply with the result but skip role registration.
+        logger.warn({ swap_id: result.swap_id }, 'Invalid senderPubkey format — skipping party role registration');
+        await reply(senderPubkey, {
+          type: 'announce_result',
+          swap_id: result.swap_id,
+          state: swap.state ?? 'DEPOSIT_INVOICE_CREATED',
+          deposit_invoice_id: result.deposit_invoice_id,
+          is_new: result.is_new,
+        });
+        return;
+      }
       if (senderDirectAddress === swap.resolved_party_a_address) {
         party = 'A';
       } else if (senderDirectAddress === swap.resolved_party_b_address) {
