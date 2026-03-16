@@ -97,6 +97,16 @@ export class CrashRecoveryManager {
   }
 
   /**
+   * Cleans up in-memory counters for a swap that has reached a terminal state.
+   * Called by the orchestrator's _cleanupSwapResources when a swap is completed,
+   * cancelled, or failed through the normal event-driven path (not via _failSwap/_cancelSwap).
+   */
+  cleanupCounters(swapId: string): void {
+    this.recoveryAttempts.delete(swapId);
+    this.resolverFailures.delete(swapId);
+  }
+
+  /**
    * Recovers all non-terminal swaps from the state store.
    *
    * Iterates all non-terminal swaps and reconciles each based on its
@@ -1338,8 +1348,15 @@ export class CrashRecoveryManager {
         try {
           await this.invoiceManager.closeDepositInvoice(swap.deposit_invoice_id);
         } catch (err) {
-          if (isSphereError(err) && (err.code === 'INVOICE_ALREADY_CLOSED' || err.code === 'INVOICE_NOT_TARGET')) {
-            logger.info({ swap_id: swap.swap_id }, 'Recovery: Deposit invoice already closed or transient NOT_TARGET');
+          if (isSphereError(err) && err.code === 'INVOICE_ALREADY_CLOSED') {
+            logger.info({ swap_id: swap.swap_id }, 'Recovery: Deposit invoice already closed');
+          } else if (isSphereError(err) && err.code === 'INVOICE_NOT_TARGET') {
+            // Transient SDK condition — deposit invoice is still OPEN.
+            // Do NOT proceed to payouts. Leave for next recovery cycle.
+            if (this._recordInvoiceNotTarget(swap.swap_id, '_revalidateCoverageOrRevert closeDepositInvoice')) {
+              this._failSwap(swap, 'Recovery stuck: INVOICE_NOT_TARGET after max attempts (_revalidateCoverageOrRevert closeDepositInvoice)');
+            }
+            return;
           } else {
             // Unexpected error — let the outer recover() loop catch and retry next cycle
             throw err;

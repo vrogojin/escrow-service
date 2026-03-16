@@ -200,7 +200,10 @@ export class SwapOrchestrator {
   /**
    * Stops listening to invoice events and destroys the timeout manager.
    *
-   * Should be called on graceful shutdown.
+   * Should be called on graceful shutdown. If `stop()` throws, the caller
+   * must call `start()` to re-subscribe event listeners before resuming
+   * normal operation (listeners are unsubscribed synchronously before any
+   * async work, so a failure leaves them detached).
    */
   async stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise; // concurrent callers await same promise
@@ -310,6 +313,11 @@ export class SwapOrchestrator {
     }
     if (!resolvedB || !resolvedB.startsWith('DIRECT://') || !isValidAddress(resolvedB)) {
       throw new Error(`Cannot resolve party B address to a valid DIRECT:// address: ${manifest.party_b_address}`);
+    }
+
+    // 3b. Prevent self-swaps: resolved addresses must differ
+    if (resolvedA === resolvedB) {
+      throw new Error('Party A and party B resolve to the same address — self-swaps are not allowed');
     }
 
     // 4. Create swap record in ANNOUNCED state
@@ -731,11 +739,13 @@ export class SwapOrchestrator {
         } else if (err.code === 'INVOICE_NOT_TARGET') {
           // SDK's getActiveAddresses() may return empty if tracked addresses
           // haven't loaded yet. The escrow IS the target (we created the invoice).
-          // Proceed — the invoice will be implicitly closed when we stop accepting payments.
+          // Do NOT proceed — leave in DEPOSIT_COVERED for crash recovery to retry,
+          // matching the abort-and-retry pattern used in crash-recovery-manager.
           logger.warn(
             { swap_id: swap.swap_id },
-            'closeDepositInvoice returned INVOICE_NOT_TARGET (addresses not yet loaded), proceeding to payouts',
+            'closeDepositInvoice returned INVOICE_NOT_TARGET — leaving in DEPOSIT_COVERED for retry',
           );
+          return;
         } else if (err.code === 'INVOICE_ALREADY_CANCELLED') {
           // Timeout won the race — the invoice is cancelled and deposits are
           // being auto-returned. We cannot proceed with conclusion. The swap is
@@ -1028,6 +1038,7 @@ export class SwapOrchestrator {
       }
       const reResolvedA = normalizeDirectAddress(rawResolvedA);
       if (reResolvedA !== swap.resolved_party_a_address) {
+        const errorMsg = `Nametag address changed: party A address resolved to ${reResolvedA} but was ${swap.resolved_party_a_address} at announcement`;
         logger.error(
           {
             swap_id: swap.swap_id,
@@ -1038,13 +1049,15 @@ export class SwapOrchestrator {
           },
           'Nametag address changed between announcement and payout — halting conclusion',
         );
+        // Reload current version — async address resolution may have allowed
+        // another handler to advance the version since we won the CONCLUDING CAS.
+        const current = this.stateStore.findBySwapId(swap.swap_id);
+        if (!current || isTerminalState(current.state)) return;
         const failed = this.stateStore.updateState(
           swap.swap_id,
           SwapState.FAILED,
-          {
-            error_message: `Nametag address changed: party A address resolved to ${reResolvedA} but was ${swap.resolved_party_a_address} at announcement`,
-          },
-          concluding.version,
+          { error_message: errorMsg },
+          current.version,
         );
         if (failed) this._cleanupSwapResources(failed);
         return;
@@ -1071,6 +1084,7 @@ export class SwapOrchestrator {
       }
       const reResolvedB = normalizeDirectAddress(rawResolvedB);
       if (reResolvedB !== swap.resolved_party_b_address) {
+        const errorMsg = `Nametag address changed: party B address resolved to ${reResolvedB} but was ${swap.resolved_party_b_address} at announcement`;
         logger.error(
           {
             swap_id: swap.swap_id,
@@ -1081,13 +1095,15 @@ export class SwapOrchestrator {
           },
           'Nametag address changed between announcement and payout — halting conclusion',
         );
+        // Reload current version — async address resolution may have allowed
+        // another handler to advance the version since we won the CONCLUDING CAS.
+        const current = this.stateStore.findBySwapId(swap.swap_id);
+        if (!current || isTerminalState(current.state)) return;
         const failed = this.stateStore.updateState(
           swap.swap_id,
           SwapState.FAILED,
-          {
-            error_message: `Nametag address changed: party B address resolved to ${reResolvedB} but was ${swap.resolved_party_b_address} at announcement`,
-          },
-          concluding.version,
+          { error_message: errorMsg },
+          current.version,
         );
         if (failed) this._cleanupSwapResources(failed);
         return;
@@ -1457,6 +1473,7 @@ export class SwapOrchestrator {
       this.bounceCounters.delete(swap.deposit_invoice_id);
     }
     this.timeoutManager.cancel(swap.swap_id);
+    this.crashRecovery.cleanupCounters(swap.swap_id);
   }
 
   private async _transitionToFailed(swap: SwapRecord, errorMessage: string): Promise<void> {

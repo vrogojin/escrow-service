@@ -129,7 +129,9 @@ function setupGracefulShutdown(
     }, 30_000);
     hardKill.unref();
 
-    await messageHandler.stop();
+    await messageHandler.stop().catch((err) => {
+      logger.error({ err }, 'Error stopping message handler');
+    });
     await orchestrator.stop();
 
     await walletManager.destroy().catch((err) => {

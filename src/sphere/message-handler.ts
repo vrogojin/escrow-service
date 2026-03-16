@@ -47,7 +47,11 @@ export type { NpubRoleMap } from './orchestrator-interfaces.js';
  * hex encoding. See protocol-spec.md §Identity.
  */
 export function npubToDirectAddress(npub: string): string {
-  return `DIRECT://${npub.toLowerCase()}`;
+  const hex = npub.toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) {
+    throw new Error(`Invalid npub: expected 64 lowercase hex chars, got ${npub.length} chars`);
+  }
+  return `DIRECT://${hex}`;
 }
 
 // ---------------------------------------------------------------------------

@@ -1817,29 +1817,39 @@ describe('CrashRecoveryManager', () => {
       const { orchestrator, recoveryManager, stateStore, mockAccounting } = await setupOrchestrator();
       const manifest = createTestManifest();
 
-      const announced = await orchestrator.announce(manifest);
-      const swap = stateStore.findBySwapId(manifest.swap_id)!;
-      const actualInvoiceId = swap.deposit_invoice_id!;
+      // Freeze Date.now so that both createDepositInvoice calls produce the
+      // same dueDate, yielding the same deterministic invoice ID hash.
+      const frozenNow = Date.now();
+      const originalDateNow = Date.now;
+      Date.now = () => frozenNow;
 
-      // Simulate crash between createInvoice and store update
-      const orphaned = stateStore.updateState(
-        swap.swap_id,
-        SwapState.ANNOUNCED,
-        { deposit_invoice_id: null },
-        swap.version
-      );
-      expect(orphaned).not.toBeNull();
+      try {
+        const announced = await orchestrator.announce(manifest);
+        const swap = stateStore.findBySwapId(manifest.swap_id)!;
+        const actualInvoiceId = swap.deposit_invoice_id!;
 
-      // Disable deterministic ID support to test memo-based scanning
-      mockAccounting._disableDeterministicId();
+        // Simulate crash between createInvoice and store update
+        const orphaned = stateStore.updateState(
+          swap.swap_id,
+          SwapState.ANNOUNCED,
+          { deposit_invoice_id: null },
+          swap.version
+        );
+        expect(orphaned).not.toBeNull();
 
-      // Recovery should scan invoices by memo pattern and adopt the orphaned invoice
-      await recoveryManager.recoverSwap(orphaned!);
+        // Disable deterministic ID support to test memo-based scanning
+        mockAccounting._disableDeterministicId();
 
-      const recovered = stateStore.findBySwapId(manifest.swap_id)!;
-      // Should have adopted the existing invoice ID via memo scan
-      expect(recovered.deposit_invoice_id).toBe(actualInvoiceId);
-      expect(recovered.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
+        // Recovery should scan invoices by memo pattern and adopt the orphaned invoice
+        await recoveryManager.recoverSwap(orphaned!);
+
+        const recovered = stateStore.findBySwapId(manifest.swap_id)!;
+        // Should have adopted the existing invoice ID via memo scan
+        expect(recovered.deposit_invoice_id).toBe(actualInvoiceId);
+        expect(recovered.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
+      } finally {
+        Date.now = originalDateNow;
+      }
     });
   });
 
