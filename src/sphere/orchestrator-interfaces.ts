@@ -123,8 +123,8 @@ export interface NpubRoleMap {
 // ---------------------------------------------------------------------------
 
 export class ManifestValidationError extends Error {
-  constructor(public readonly errors: Array<{ field: string; message: string }>) {
-    super(`Manifest validation failed: ${errors.map((e) => `${e.field}: ${e.message}`).join(', ')}`);
+  constructor(public readonly errors: string[]) {
+    super(`Manifest validation failed: ${errors.join(', ')}`);
     this.name = 'ManifestValidationError';
   }
 }

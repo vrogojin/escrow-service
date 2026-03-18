@@ -49,6 +49,7 @@ export async function initializeWallet(config: Config): Promise<WalletManager> {
   const { sphere, created } = await Sphere.init({
     ...providers,
     autoGenerate: true,
+    accounting: true,
   });
 
   // Production startup should never silently create a new wallet — that means
