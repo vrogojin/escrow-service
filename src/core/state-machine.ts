@@ -20,11 +20,13 @@ const TERMINAL_STATES = new Set([
 const VALID_TRANSITIONS: Record<string, Set<SwapState>> = {
   [SwapState.ANNOUNCED]: new Set([
     SwapState.DEPOSIT_INVOICE_CREATED,
+    SwapState.CANCELLING,
     SwapState.FAILED,
   ]),
   [SwapState.DEPOSIT_INVOICE_CREATED]: new Set([
     SwapState.PARTIAL_DEPOSIT,
     SwapState.DEPOSIT_COVERED,
+    SwapState.CANCELLING,
     SwapState.TIMED_OUT,
     SwapState.FAILED,
   ]),

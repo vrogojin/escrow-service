@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
 import { SwapOrchestrator } from '../swap-orchestrator.js';
 import { InvoiceManager } from '../invoice-manager.js';
 import { TimeoutManager } from '../timeout-manager.js';
@@ -25,6 +26,7 @@ function createTestManifest(): SwapManifest {
     party_b_currency_to_change: 'EUR',
     party_b_value_to_change: '850000',
     timeout: 300 + testCounter, // varies per test to ensure unique swap_id
+    salt: randomBytes(16).toString('hex'),
   };
   const swap_id = computeSwapId(fields);
   return {
@@ -35,7 +37,7 @@ function createTestManifest(): SwapManifest {
 
 async function setupOrchestrator() {
   const mockAccounting = new MockAccountingModule();
-  const invoiceManager = new InvoiceManager({ accounting: mockAccounting as any, escrowAddress: ESCROW_ADDRESS });
+  const invoiceManager = new InvoiceManager({ accounting: mockAccounting as any, escrowAddress: ESCROW_ADDRESS, getToken: () => undefined });
   const stateStore = new InMemorySwapStateStore();
   const timeoutManager = new TimeoutManager({ onTimeout: async (swapId) => orchestrator._handleTimeout(swapId) });
   const messageSender = {
@@ -1747,6 +1749,244 @@ describe('SwapOrchestrator', () => {
       // Should not create new payouts or call closeInvoice again
       const finalCallCount = mockAccounting._getCallOrder().length;
       expect(finalCallCount).toBe(0);
+    });
+  });
+
+  // ===========================================================================
+  // Announce Gate Tests (Bug 001 — announce race condition fix)
+  // ===========================================================================
+
+  describe('Announce Gate (per-swap serialization)', () => {
+    it('should deduplicate concurrent announce calls for the same swap_id', async () => {
+      const { orchestrator, mockAccounting } = await setupOrchestrator();
+      const manifest = createTestManifest();
+
+      // Introduce delay so the first announce yields to the event loop,
+      // allowing the second announce to hit the gate.
+      mockAccounting._setCreateInvoiceDelay(50);
+
+      const createSpy = vi.spyOn(mockAccounting, 'createInvoice');
+
+      const [result1, result2] = await Promise.all([
+        orchestrator.announce(manifest),
+        orchestrator.announce(manifest),
+      ]);
+
+      // Both return the same deposit invoice ID
+      expect(result1.deposit_invoice_id).toBe(result2.deposit_invoice_id);
+      expect(result1.swap_id).toBe(result2.swap_id);
+
+      // Exactly one is_new: true
+      const newCount = [result1, result2].filter((r) => r.is_new).length;
+      expect(newCount).toBe(1);
+
+      // createInvoice called exactly once (gate prevented duplicate)
+      expect(createSpy).toHaveBeenCalledTimes(1);
+
+      createSpy.mockRestore();
+      mockAccounting._resetCreateInvoiceDelay();
+    });
+
+    it('should coalesce three concurrent announces for the same swap_id', async () => {
+      const { orchestrator, mockAccounting } = await setupOrchestrator();
+      const manifest = createTestManifest();
+
+      mockAccounting._setCreateInvoiceDelay(50);
+      const createSpy = vi.spyOn(mockAccounting, 'createInvoice');
+
+      const [r1, r2, r3] = await Promise.all([
+        orchestrator.announce(manifest),
+        orchestrator.announce(manifest),
+        orchestrator.announce(manifest),
+      ]);
+
+      // All three get the same deposit invoice ID
+      expect(r1.deposit_invoice_id).toBe(r2.deposit_invoice_id);
+      expect(r2.deposit_invoice_id).toBe(r3.deposit_invoice_id);
+
+      // Exactly one is_new: true
+      const newCount = [r1, r2, r3].filter((r) => r.is_new).length;
+      expect(newCount).toBe(1);
+
+      // createInvoice called exactly once
+      expect(createSpy).toHaveBeenCalledTimes(1);
+
+      createSpy.mockRestore();
+      mockAccounting._resetCreateInvoiceDelay();
+    });
+
+    it('should not serialize announces for different swap_ids', async () => {
+      const { orchestrator, mockAccounting } = await setupOrchestrator();
+      const manifest1 = createTestManifest();
+      const manifest2 = createTestManifest();
+
+      mockAccounting._setCreateInvoiceDelay(50);
+      const createSpy = vi.spyOn(mockAccounting, 'createInvoice');
+
+      const [r1, r2] = await Promise.all([
+        orchestrator.announce(manifest1),
+        orchestrator.announce(manifest2),
+      ]);
+
+      // Both proceed independently
+      expect(r1.swap_id).not.toBe(r2.swap_id);
+      expect(r1.is_new).toBe(true);
+      expect(r2.is_new).toBe(true);
+
+      // createInvoice called twice (one per swap)
+      expect(createSpy).toHaveBeenCalledTimes(2);
+
+      createSpy.mockRestore();
+      mockAccounting._resetCreateInvoiceDelay();
+    });
+
+    it('should clean up announce gate on failure so retries succeed', async () => {
+      const { orchestrator, mockAccounting } = await setupOrchestrator();
+      const manifest = createTestManifest();
+
+      mockAccounting._setCreateInvoiceDelay(50);
+
+      // Make createInvoice fail on first call
+      const createSpy = vi.spyOn(mockAccounting, 'createInvoice')
+        .mockRejectedValueOnce(new Error('Simulated SDK failure'));
+
+      // Fire two concurrent announces — both should receive the error
+      const results = await Promise.allSettled([
+        orchestrator.announce(manifest),
+        orchestrator.announce(manifest),
+      ]);
+
+      expect(results[0].status).toBe('rejected');
+      expect(results[1].status).toBe('rejected');
+
+      createSpy.mockRestore();
+
+      // Third announce should succeed (gate was cleared by finally)
+      const result = await orchestrator.announce(manifest);
+      expect(result.deposit_invoice_id).toBeDefined();
+
+      mockAccounting._resetCreateInvoiceDelay();
+    });
+
+    it('should pass swap.created_at to createDepositInvoice', async () => {
+      const { orchestrator, invoiceManager } = await setupOrchestrator();
+      const manifest = createTestManifest();
+
+      // Spy on createDepositInvoice to capture the createdAt argument
+      // Note: createdAt only affects dueDate until SDK gap #8 is resolved
+      const spy = vi.spyOn(invoiceManager, 'createDepositInvoice');
+
+      await orchestrator.announce(manifest);
+
+      expect(spy).toHaveBeenCalledTimes(1);
+      const calledCreatedAt = spy.mock.calls[0][1];
+      expect(typeof calledCreatedAt).toBe('number');
+      // createdAt should be close to now (within 5 seconds)
+      expect(Math.abs(calledCreatedAt! - Date.now())).toBeLessThan(5000);
+
+      spy.mockRestore();
+    });
+
+    it('should reject manifest with non-string swap_id', async () => {
+      const { orchestrator } = await setupOrchestrator();
+
+      // @ts-expect-error — testing runtime guard for non-string swap_id
+      await expect(orchestrator.announce({ swap_id: 123 })).rejects.toThrow(
+        'manifest.swap_id must be a string',
+      );
+
+      // @ts-expect-error
+      await expect(orchestrator.announce({ swap_id: null })).rejects.toThrow(
+        'manifest.swap_id must be a string',
+      );
+
+      // @ts-expect-error
+      await expect(orchestrator.announce({})).rejects.toThrow(
+        'manifest.swap_id must be a string',
+      );
+    });
+
+    it('should drain in-flight announce before completing stop()', async () => {
+      const { orchestrator, mockAccounting } = await setupOrchestrator();
+      const manifest = createTestManifest();
+
+      mockAccounting._setCreateInvoiceDelay(100);
+
+      // Start an announce (will take ~100ms due to delay)
+      const announcePromise = orchestrator.announce(manifest);
+
+      // Call stop while announce is in-flight — stop should wait
+      const stopPromise = orchestrator.stop();
+
+      // Both should resolve (stop waits for announce to complete)
+      const [announceResult] = await Promise.all([announcePromise, stopPromise]);
+      expect(announceResult.deposit_invoice_id).toBeDefined();
+
+      // Subsequent announces should throw
+      await expect(orchestrator.announce(manifest)).rejects.toThrow();
+
+      mockAccounting._resetCreateInvoiceDelay();
+    });
+
+    it('should reject announce with timeout error on hung SDK call', async () => {
+      const originalTimeout = (SwapOrchestrator as any).ANNOUNCE_GATE_TIMEOUT_MS;
+      const { orchestrator, mockAccounting } = await setupOrchestrator();
+      const manifest = createTestManifest();
+
+      try {
+        // Override the timeout to a short value for testing
+        (SwapOrchestrator as any).ANNOUNCE_GATE_TIMEOUT_MS = 100;
+
+        // Make createInvoice never resolve
+        vi.spyOn(mockAccounting, 'createInvoice').mockReturnValue(new Promise(() => {}));
+
+        await expect(orchestrator.announce(manifest)).rejects.toThrow('Announce timed out');
+
+        // Subsequent announce for same swap should get a fresh attempt (gate cleared)
+        vi.restoreAllMocks();
+        const result = await orchestrator.announce(manifest);
+        expect(result.deposit_invoice_id).toBeDefined();
+      } finally {
+        // Always restore timeout, even if assertions fail
+        (SwapOrchestrator as any).ANNOUNCE_GATE_TIMEOUT_MS = originalTimeout;
+      }
+    });
+
+    it('should cancel orphaned invoice in CAS loser path', async () => {
+      const { orchestrator, mockAccounting, stateStore, invoiceManager } = await setupOrchestrator();
+      const manifest = createTestManifest();
+
+      // First, create the swap normally
+      const result = await orchestrator.announce(manifest);
+      expect(result.is_new).toBe(true);
+
+      // Now simulate the CAS loser path by calling _createDepositInvoiceForSwap
+      // with a stale version. The mock produces the same invoice ID for identical
+      // terms, so we spy on cancelDepositInvoice and verify it's called with the
+      // invoice ID returned by createInvoice (even if it matches the winner's).
+      // In production, Date.now() makes IDs different — here we verify the
+      // cancellation logic fires on CAS failure regardless.
+      const cancelSpy = vi.spyOn(invoiceManager, 'cancelDepositInvoice').mockResolvedValue(undefined);
+
+      const swap = stateStore.findBySwapId(manifest.swap_id);
+      expect(swap).not.toBeNull();
+
+      // Call _createDepositInvoiceForSwap with a stale version (0) to trigger CAS failure
+      const loserResult = await (orchestrator as any)._createDepositInvoiceForSwap({
+        ...swap!,
+        state: 'ANNOUNCED',
+        version: 0, // stale version — CAS will fail
+      });
+
+      // Should return the existing (winner's) invoice
+      expect(loserResult.deposit_invoice_id).toBe(result.deposit_invoice_id);
+      expect(loserResult.is_new).toBe(false);
+
+      // cancelDepositInvoice should have been called (fire-and-forget)
+      await new Promise((r) => setTimeout(r, 10));
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
+
+      cancelSpy.mockRestore();
     });
   });
 });

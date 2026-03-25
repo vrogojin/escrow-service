@@ -12,12 +12,21 @@
  * Surplus and refunds are routed to the original payer via effectiveSender.
  */
 
+import { normalizeCoinId as resolveSymbolToCoinId, coinIdsMatch } from '@unicitylabs/sphere-sdk';
 import type { InvoiceTransferRef } from './accounting-types.js';
 import type { SwapManifest } from './manifest-validator.js';
 import type { DepositValidationResult } from './types.js';
 
+// Re-export for backward compat (used by swap-orchestrator.ts)
+export { resolveSymbolToCoinId, coinIdsMatch };
+
 /**
  * Identifies which party side a deposit contributes to based on coinId.
+ *
+ * Manifest currencies may be stored as short symbols ("BTC", "ETH") while
+ * incoming transfer coinIds are hash-based (68-char hex). Both the transfer
+ * coinId and the manifest currencies are resolved through the token registry
+ * before comparison so symbolic and hash-form coinIds match correctly.
  *
  * @param coinId - The coinId from the transfer.
  * @param manifest - The swap manifest.
@@ -27,10 +36,13 @@ export function identifyPartySide(
   coinId: string,
   manifest: SwapManifest,
 ): 'A' | 'B' | null {
-  if (coinId === manifest.party_a_currency_to_change) {
+  const resolvedCoinId = resolveSymbolToCoinId(coinId);
+  const resolvedA = resolveSymbolToCoinId(manifest.party_a_currency_to_change);
+  const resolvedB = resolveSymbolToCoinId(manifest.party_b_currency_to_change);
+  if (resolvedCoinId === resolvedA) {
     return 'A';
   }
-  if (coinId === manifest.party_b_currency_to_change) {
+  if (resolvedCoinId === resolvedB) {
     return 'B';
   }
   return null;

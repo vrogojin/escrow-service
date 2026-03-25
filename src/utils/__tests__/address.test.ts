@@ -79,13 +79,13 @@ describe('address utilities', () => {
       expect(parseAddress('no-prefix-here')).toBeNull();
     });
 
-    it('should return null for DIRECT:// with non-64-char hex', () => {
-      // Short hex
-      expect(parseAddress('DIRECT://abc123')).toBeNull();
-      // Too long
-      expect(parseAddress(`DIRECT://${HEX64_A}ff`)).toBeNull();
-      // Uppercase (DIRECT:// requires lowercase hex)
-      expect(parseAddress(`DIRECT://${HEX64_UPPER}`)).toBeNull();
+    it('should accept any non-empty string after DIRECT:// (SDK behavior)', () => {
+      // SDK's parseAddress accepts any non-empty value after DIRECT://
+      expect(parseAddress('DIRECT://abc123')).not.toBeNull();
+      expect(parseAddress(`DIRECT://${HEX64_A}ff`)).not.toBeNull();
+      expect(parseAddress(`DIRECT://${HEX64_UPPER}`)).not.toBeNull();
+      // Empty value after prefix is still rejected
+      expect(parseAddress('DIRECT://')).toBeNull();
     });
 
     it('should handle special characters in nametag values', () => {
@@ -136,12 +136,10 @@ describe('address utilities', () => {
       expect(isValidAddress('  @alice  ')).toBe(true);
     });
 
-    it('should return false for DIRECT:// with short hex', () => {
-      expect(isValidAddress('DIRECT://abc123')).toBe(false);
-    });
-
-    it('should return false for DIRECT:// with uppercase hex', () => {
-      expect(isValidAddress(`DIRECT://${HEX64_UPPER}`)).toBe(false);
+    it('should return true for DIRECT:// with any non-empty value (SDK behavior)', () => {
+      // SDK accepts any non-empty string after DIRECT://
+      expect(isValidAddress('DIRECT://abc123')).toBe(true);
+      expect(isValidAddress(`DIRECT://${HEX64_UPPER}`)).toBe(true);
     });
   });
 
@@ -197,12 +195,11 @@ describe('address utilities', () => {
       expect(normalized).toBe('');
     });
 
-    it('should return original string for invalid DIRECT (uppercase)', () => {
-      // Uppercase DIRECT:// is not valid per the new rules, so normalizeAddress
-      // returns the original string unchanged
+    it('should lowercase DIRECT:// with uppercase hex', () => {
+      // SDK's normalizeAddress lowercases the value after DIRECT://
       const addr = `DIRECT://${HEX64_UPPER}`;
       const normalized = normalizeAddress(addr);
-      expect(normalized).toBe(addr);
+      expect(normalized).toBe(`DIRECT://${HEX64_UPPER.toLowerCase()}`);
     });
 
     it('should handle leading/trailing whitespace by trimming first', () => {

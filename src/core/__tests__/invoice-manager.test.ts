@@ -24,6 +24,7 @@ describe('InvoiceManager', () => {
     invoiceManager = new InvoiceManager({
       accounting: mockAccounting as any,
       escrowAddress: ESCROW_ADDRESS,
+      getToken: () => undefined,
     });
   });
 

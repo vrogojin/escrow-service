@@ -26,10 +26,21 @@ export interface EventSource {
 }
 
 export interface InvoiceManagerDeps {
+  /**
+   * Receive and finalize pending tokens. Called before cancel/close to ensure
+   * deposit tokens are confirmed and available for auto-return.
+   * Wire as `() => sphere.payments.receive({ finalize: true })`.
+   */
+  receiveAndFinalize?: () => Promise<void>;
   /** AccountingModule from @unicitylabs/sphere-sdk (duck-typed as AccountingModule interface). */
   accounting: AccountingModule;
   /** Escrow's own DIRECT:// address — used as the deposit invoice target. */
   escrowAddress: string;
+  /**
+   * Single-token lookup by ID — wire as `(id) => sphere.payments.getToken(id)`.
+   * Used to retrieve the serialised TxfToken for invoice delivery.
+   */
+  getToken: (id: string) => { sdkData?: string } | undefined;
   /** Event source for invoice events (typically the Sphere instance). */
   eventSource?: EventSource;
 }
@@ -44,12 +55,16 @@ export interface InvoiceManagerDeps {
 export class InvoiceManager {
   private readonly accounting: AccountingModule;
   private readonly escrowAddress: string;
+  private readonly getToken: (id: string) => { sdkData?: string } | undefined;
   private readonly eventSource: EventSource;
+  private readonly receiveAndFinalize: (() => Promise<void>) | null;
 
   constructor(deps: InvoiceManagerDeps) {
     this.accounting = deps.accounting;
+    this.receiveAndFinalize = deps.receiveAndFinalize ?? null;
     // Normalize escrow address for deterministic invoice ID derivation
     this.escrowAddress = normalizeDirectAddress(deps.escrowAddress);
+    this.getToken = deps.getToken;
     // Use explicit eventSource if provided; fall back to accounting (works for mocks with on/off).
     this.eventSource = deps.eventSource ?? (deps.accounting as unknown as EventSource);
   }
@@ -151,6 +166,15 @@ export class InvoiceManager {
    * @param invoiceId - The deposit invoice ID to cancel.
    */
   async cancelDepositInvoice(invoiceId: string): Promise<void> {
+    // Finalize pending deposit tokens before cancelling. Without this,
+    // auto-return may fail because unconfirmed tokens are not spendable.
+    if (this.receiveAndFinalize) {
+      try {
+        await this.receiveAndFinalize();
+      } catch {
+        // Tolerated — cancel should proceed regardless
+      }
+    }
     await this.accounting.cancelInvoice(invoiceId, { autoReturn: true });
   }
 
@@ -223,18 +247,35 @@ export class InvoiceManager {
   }
 
   /**
-   * Retrieve the serialised invoice token for a deposit invoice.
-   * TODO: Implement once the AccountingModule exposes token retrieval.
+   * Retrieve the serialised TxfToken for a deposit invoice.
+   *
+   * The invoice token's ID equals the invoiceId returned by createInvoice().
+   * The raw TxfToken JSON is stored in `token.sdkData`; the recipient imports
+   * it via `sphere.accounting.importInvoice(token)`.
    */
-  async getDepositInvoiceToken(_invoiceId: string): Promise<unknown | null> {
-    return null;
+  async getDepositInvoiceToken(invoiceId: string): Promise<unknown | null> {
+    const token = this.getToken(invoiceId);
+    if (!token?.sdkData) return null;
+    try {
+      return JSON.parse(token.sdkData);
+    } catch {
+      return null;
+    }
   }
 
   /**
-   * Retrieve the serialised invoice token for a payout invoice.
-   * TODO: Implement once the AccountingModule exposes token retrieval.
+   * Retrieve the serialised TxfToken for a payout invoice.
+   *
+   * Same mechanism as getDepositInvoiceToken — payout invoices are also
+   * regular L3 tokens; the recipient imports via `sphere.accounting.importInvoice()`.
    */
-  async getPayoutInvoiceToken(_invoiceId: string): Promise<unknown | null> {
-    return null;
+  async getPayoutInvoiceToken(invoiceId: string): Promise<unknown | null> {
+    const token = this.getToken(invoiceId);
+    if (!token?.sdkData) return null;
+    try {
+      return JSON.parse(token.sdkData);
+    } catch {
+      return null;
+    }
   }
 }

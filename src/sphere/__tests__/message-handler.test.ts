@@ -15,22 +15,31 @@ const PARTY_B_ADDRESS = `DIRECT://${PARTY_B_NPUB}`;
 
 // Mock NpubRoleMap implementation
 class MockNpubRoleMap implements NpubRoleMap {
-  private map = new Map<string, Map<string, 'A' | 'B'>>();
+  private map = new Map<string, Map<string, { party: 'A' | 'B'; directAddress: string }>>();
 
-  register(npub: string, swapId: string, party: 'A' | 'B'): void {
+  register(npub: string, swapId: string, party: 'A' | 'B', directAddress: string): void {
     if (!this.map.has(npub)) {
       this.map.set(npub, new Map());
     }
-    this.map.get(npub)!.set(swapId, party);
+    this.map.get(npub)!.set(swapId, { party, directAddress });
   }
 
-  getRole(npub: string, swapId: string): 'A' | 'B' | null {
-    return this.map.get(npub)?.get(swapId) ?? null;
+  getRole(npub: string, swapId: string): { role: 'A' | 'B'; directAddress: string } | null {
+    const entry = this.map.get(npub)?.get(swapId);
+    return entry ? { role: entry.party, directAddress: entry.directAddress } : null;
   }
 
   getSwapIds(npub: string): string[] {
     const swapMap = this.map.get(npub);
     return swapMap ? Array.from(swapMap.keys()) : [];
+  }
+
+  findNpub(swapId: string, party: 'A' | 'B'): string | null {
+    for (const [npub, swapMap] of this.map) {
+      const entry = swapMap.get(swapId);
+      if (entry && entry.party === party) return npub;
+    }
+    return null;
   }
 }
 
@@ -46,10 +55,20 @@ describe('Message Handler', () => {
   beforeEach(() => {
     dmCallbacks = new Map();
 
-    // Mock Sphere communications
+    // Mock Sphere communications and resolve
     mockSphere = {
+      resolve: vi.fn().mockImplementation(async (input: string) => {
+        // Resolve by transport pubkey (npub)
+        if (input === PARTY_A_NPUB) return { directAddress: PARTY_A_ADDRESS, transportPubkey: PARTY_A_NPUB, chainPubkey: PARTY_A_NPUB, l1Address: '', timestamp: 0 };
+        if (input === PARTY_B_NPUB) return { directAddress: PARTY_B_ADDRESS, transportPubkey: PARTY_B_NPUB, chainPubkey: PARTY_B_NPUB, l1Address: '', timestamp: 0 };
+        // Resolve by DIRECT:// address (reverse resolution for party discovery)
+        if (input === PARTY_A_ADDRESS) return { directAddress: PARTY_A_ADDRESS, transportPubkey: PARTY_A_NPUB, chainPubkey: PARTY_A_NPUB, l1Address: '', timestamp: 0 };
+        if (input === PARTY_B_ADDRESS) return { directAddress: PARTY_B_ADDRESS, transportPubkey: PARTY_B_NPUB, chainPubkey: PARTY_B_NPUB, l1Address: '', timestamp: 0 };
+        return null;
+      }),
       communications: {
         sendDM: vi.fn().mockResolvedValue(undefined),
+        markAsRead: vi.fn().mockResolvedValue(undefined),
         onDirectMessage: vi.fn((callback: (dm: DirectMessage) => void) => {
           dmCallbacks.set('onDirectMessage', callback);
           return () => {
@@ -66,6 +85,7 @@ describe('Message Handler', () => {
         deposit_invoice_id: 'inv_' + 'a'.repeat(60),
         is_new: true,
       }),
+      cancelSwap: vi.fn().mockResolvedValue({ success: true }),
     };
 
     // Mock state store
@@ -129,13 +149,16 @@ describe('Message Handler', () => {
       stateStore: mockStateStore,
       invoiceManager: mockInvoiceManager,
       npubRoleMap,
+      escrowAddress: 'DIRECT://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     };
 
     handler = createMessageHandler(deps);
     handler.start();
   });
 
-  // Helper to simulate an incoming DM
+  // Helper to simulate an incoming DM.
+  // The message handler processes DMs asynchronously (fire-and-forget in the
+  // onDirectMessage callback), so we must wait for the handler to complete.
   async function sendDM(senderPubkey: string, content: Record<string, unknown>) {
     const dm: DirectMessage = {
       id: 'dm_' + Math.random().toString(36).substr(2, 9),
@@ -147,7 +170,9 @@ describe('Message Handler', () => {
 
     const callback = dmCallbacks.get('onDirectMessage');
     if (callback) {
-      await callback(dm);
+      callback(dm);
+      // Allow async handler to complete (processes microtasks + macrotasks)
+      await new Promise((r) => setTimeout(r, 100));
     }
   }
 
@@ -162,6 +187,7 @@ describe('Message Handler', () => {
       party_b_currency_to_change: 'USDU',
       party_b_value_to_change: '500',
       timeout: 600,
+      salt: 'a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8',
     };
   }
 
@@ -262,7 +288,7 @@ describe('Message Handler', () => {
 
       await sendDM(PARTY_A_NPUB, { type: 'announce', manifest });
 
-      expect(registerSpy).toHaveBeenCalledWith(PARTY_A_NPUB, manifest.swap_id, 'A');
+      expect(registerSpy).toHaveBeenCalledWith(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
     });
 
     it('should return existing swap (is_new: false) for duplicate announcement', async () => {
@@ -375,7 +401,7 @@ describe('Message Handler', () => {
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
 
       // First announcer registered
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       // Different npub, same party, resolves to same DIRECT address (same underlying keypair)
       const secondNpubSameAddress = PARTY_A_NPUB; // In this test setup, same npub for simplicity
@@ -383,7 +409,7 @@ describe('Message Handler', () => {
       await sendDM(secondNpubSameAddress, { type: 'announce', manifest });
 
       // Should successfully register the npub
-      expect(npubRoleMap.getRole(secondNpubSameAddress, manifest.swap_id)).toBe('A');
+      expect(npubRoleMap.getRole(secondNpubSameAddress, manifest.swap_id)?.role).toBe('A');
     });
 
     it('should not overwrite resolved_party_a_address on second announce (addresses immutable)', async () => {
@@ -469,7 +495,7 @@ describe('Message Handler', () => {
       const mockSwap = createMockSwap(manifest, SwapState.DEPOSIT_INVOICE_CREATED);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       await sendDM(PARTY_A_NPUB, { type: 'status', swap_id: manifest.swap_id });
 
@@ -512,7 +538,7 @@ describe('Message Handler', () => {
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
 
       // Attacker announced first and registered themselves as party A
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       // But the actual party A (with different npub) tries to query status
       const realPartyANpub = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
@@ -529,7 +555,7 @@ describe('Message Handler', () => {
       const mockSwap = createMockSwap(manifest, SwapState.PARTIAL_DEPOSIT);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       // Mock invoice status with partial coverage
       mockInvoiceManager.getInvoiceStatus.mockResolvedValue({
@@ -593,7 +619,7 @@ describe('Message Handler', () => {
       mockSwap.deposit_invoice_id = null;
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       await sendDM(PARTY_A_NPUB, { type: 'status', swap_id: manifest.swap_id });
 
@@ -609,7 +635,7 @@ describe('Message Handler', () => {
       const mockSwap = createMockSwap(manifest, SwapState.DEPOSIT_INVOICE_CREATED);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       // Mock getInvoiceStatus to throw an error
       mockInvoiceManager.getInvoiceStatus.mockRejectedValue(
@@ -637,7 +663,7 @@ describe('Message Handler', () => {
       mockStateStore.findBySwapId.mockReturnValue(mockSwap2);
 
       // Party A is registered for swap 1, not swap 2
-      npubRoleMap.register(PARTY_A_NPUB, manifest1.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest1.swap_id, 'A', PARTY_A_ADDRESS);
 
       // Try to query swap 2 with swap 1's credentials
       await sendDM(PARTY_A_NPUB, { type: 'status', swap_id: manifest2.swap_id });
@@ -661,7 +687,7 @@ describe('Message Handler', () => {
       const mockSwap = createMockSwap(manifest, SwapState.DEPOSIT_INVOICE_CREATED);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       mockInvoiceManager.getDepositInvoiceToken.mockResolvedValue({ token: 'deposit_token_data' });
 
@@ -714,7 +740,7 @@ describe('Message Handler', () => {
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
 
       // Attacker announced first
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       // Real party A tries to request invoice but their address doesn't match
       const realPartyANpub = 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
@@ -737,7 +763,7 @@ describe('Message Handler', () => {
       mockSwap.payout_b_invoice_id = 'payout_inv_b_' + 'b'.repeat(50);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       mockInvoiceManager.getPayoutInvoiceToken.mockResolvedValue({ token: 'payout_token_a' });
 
@@ -763,7 +789,7 @@ describe('Message Handler', () => {
       mockSwap.payout_a_invoice_id = 'payout_inv_a_' + 'a'.repeat(50);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       mockInvoiceManager.getPayoutInvoiceToken.mockResolvedValue({ token: 'payout_token_a' });
 
@@ -787,7 +813,7 @@ describe('Message Handler', () => {
       const mockSwap = createMockSwap(manifest, SwapState.DEPOSIT_INVOICE_CREATED);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       await sendDM(PARTY_A_NPUB, {
         type: 'request_invoice',
@@ -834,7 +860,7 @@ describe('Message Handler', () => {
       mockSwap.payout_a_invoice_id = null; // Payout invoice not yet created
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       await sendDM(PARTY_A_NPUB, {
         type: 'request_invoice',
@@ -861,7 +887,7 @@ describe('Message Handler', () => {
       const mockSwap = createMockSwap(manifest, SwapState.DEPOSIT_INVOICE_CREATED);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       mockInvoiceManager.getDepositInvoiceToken.mockResolvedValue({ token: 'deposit_token_data' });
 
@@ -894,7 +920,7 @@ describe('Message Handler', () => {
       mockSwap.payout_a_invoice_id = 'payout_inv_a_' + 'a'.repeat(50);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       mockInvoiceManager.getPayoutInvoiceToken.mockResolvedValue({
         token: 'payout_token_a',
@@ -935,7 +961,7 @@ describe('Message Handler', () => {
       mockSwap.payout_a_invoice_id = 'payout_inv_a_' + 'a'.repeat(50);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
 
       // The payout invoice for party A should contain party A's address as recipient
       const payoutTokenA = {
@@ -969,8 +995,8 @@ describe('Message Handler', () => {
       mockSwap.payout_b_invoice_id = 'payout_inv_b_' + 'b'.repeat(50);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
-      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A');
-      npubRoleMap.register(PARTY_B_NPUB, manifest.swap_id, 'B');
+      npubRoleMap.register(PARTY_A_NPUB, manifest.swap_id, 'A', PARTY_A_ADDRESS);
+      npubRoleMap.register(PARTY_B_NPUB, manifest.swap_id, 'B', PARTY_B_ADDRESS);
 
       mockInvoiceManager.getPayoutInvoiceToken.mockImplementation(async (invoiceId: string) => {
         if (invoiceId.includes('payout_inv_a')) {
@@ -1019,8 +1045,8 @@ describe('Message Handler', () => {
   // =========================================================================
 
   describe('Error Handling', () => {
-    it('should return error response for malformed messages', async () => {
-      // Send invalid JSON
+    it('should silently mark as read and not reply for malformed messages', async () => {
+      // Send invalid JSON — the new handler marks as read silently (no error reply)
       const dm: DirectMessage = {
         id: 'dm_invalid',
         senderPubkey: PARTY_A_NPUB,
@@ -1034,35 +1060,31 @@ describe('Message Handler', () => {
         await callback(dm);
       }
 
-      const calls = mockSphere.communications.sendDM.mock.calls;
-      const errorCall = calls.find((c: any[]) => c[1].includes('Invalid JSON'));
-      expect(errorCall).toBeDefined();
-
-      const response = JSON.parse(errorCall![1]);
-      expect(response.type).toBe('error');
-      expect(response.error).toContain('Invalid JSON');
+      // No error reply sent — silently marked as read
+      expect(mockSphere.communications.markAsRead).toHaveBeenCalledWith(['dm_invalid']);
+      // No DM sent (silent drop to avoid information leakage)
+      const errorCalls = mockSphere.communications.sendDM.mock.calls.filter(
+        (c: any[]) => c[1]?.includes?.('error'),
+      );
+      expect(errorCalls.length).toBe(0);
     });
 
-    it('should return error for missing type field', async () => {
+    it('should silently mark as read for missing type field', async () => {
       await sendDM(PARTY_A_NPUB, { manifest: {} });
 
-      const calls = mockSphere.communications.sendDM.mock.calls;
-      const errorCall = calls.find((c: any[]) => c[1].includes('type'));
-      expect(errorCall).toBeDefined();
-
-      const response = JSON.parse(errorCall![1]);
-      expect(response.type).toBe('error');
+      // Silently marked as read — no error reply
+      expect(mockSphere.communications.markAsRead).toHaveBeenCalled();
     });
 
-    it('should return error for unknown message type', async () => {
+    it('should silently ignore unknown message type', async () => {
       await sendDM(PARTY_A_NPUB, { type: 'unknown_message_type' });
 
-      const calls = mockSphere.communications.sendDM.mock.calls;
-      const errorCall = calls.find((c: any[]) => c[1].includes('Unknown message type'));
-      expect(errorCall).toBeDefined();
-
-      const response = JSON.parse(errorCall![1]);
-      expect(response.type).toBe('error');
+      // No error reply for unknown type — silently marked as read
+      expect(mockSphere.communications.markAsRead).toHaveBeenCalled();
+      const errorCalls = mockSphere.communications.sendDM.mock.calls.filter(
+        (c: any[]) => c[1]?.includes?.('Unknown'),
+      );
+      expect(errorCalls.length).toBe(0);
     });
   });
 });

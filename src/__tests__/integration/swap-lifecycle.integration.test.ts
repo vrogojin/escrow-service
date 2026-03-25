@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
 import { SwapOrchestrator } from '../../core/swap-orchestrator.js';
 import { InvoiceManager } from '../../core/invoice-manager.js';
 import { TimeoutManager } from '../../core/timeout-manager.js';
@@ -28,6 +29,7 @@ function createManifest(overrides: Partial<SwapManifest> = {}): SwapManifest {
     party_b_currency_to_change: 'USDU',
     party_b_value_to_change: String(500 + testCounter),
     timeout: 300,
+    salt: randomBytes(16).toString('hex'),
     ...overrides,
   };
   const swap_id = computeSwapId(fields);
@@ -53,6 +55,7 @@ async function setupOrchestrator(): Promise<TestContext> {
   const invoiceManager = new InvoiceManager({
     accounting: mockAccounting as any,
     escrowAddress: ESCROW_ADDRESS,
+    getToken: () => undefined,
   });
   const messageSender = {
     sendToParty: vi.fn().mockResolvedValue(undefined),
@@ -770,7 +773,8 @@ describe('SwapLifecycle Integration Tests', () => {
 
       const invoiceManager = new InvoiceManager({
         accounting: mockAccounting as any,
-        escrowAddress: ESCROW_ADDRESS,
+    escrowAddress: ESCROW_ADDRESS,
+    getToken: () => undefined,
       });
       const timeoutManager = new TimeoutManager({
         onTimeout: async (swapId: string) => {
@@ -861,7 +865,8 @@ describe('SwapLifecycle Integration Tests', () => {
 
       const invoiceManager = new InvoiceManager({
         accounting: mockAccounting as any,
-        escrowAddress: ESCROW_ADDRESS,
+    escrowAddress: ESCROW_ADDRESS,
+    getToken: () => undefined,
       });
       const timeoutManager = new TimeoutManager({
         onTimeout: async (swapId: string) => {
@@ -910,7 +915,8 @@ describe('SwapLifecycle Integration Tests', () => {
 
       const invoiceManager = new InvoiceManager({
         accounting: mockAccounting as any,
-        escrowAddress: ESCROW_ADDRESS,
+    escrowAddress: ESCROW_ADDRESS,
+    getToken: () => undefined,
       });
       const timeoutManager = new TimeoutManager({
         onTimeout: async (swapId: string) => {

@@ -1,4 +1,5 @@
 import type { Sphere, DirectMessage } from '@unicitylabs/sphere-sdk';
+import { verifySwapSignature } from '@unicitylabs/sphere-sdk';
 import type { SwapStateStore, SwapRecord } from '../core/types.js';
 import type {
   SwapOrchestrator,
@@ -25,6 +26,8 @@ export interface MessageHandlerDeps {
   invoiceManager: InvoiceManager;
   /** Tracks npub → (swapId, party role) associations. */
   npubRoleMap: NpubRoleMap;
+  /** The escrow's own DIRECT:// address — used to validate manifest.escrow_address in v2. */
+  escrowAddress: string;
 }
 
 export interface MessageHandler {
@@ -34,25 +37,6 @@ export interface MessageHandler {
 
 // Re-export so callers can import the interface types from one place.
 export type { NpubRoleMap } from './orchestrator-interfaces.js';
-
-// ---------------------------------------------------------------------------
-// Address utilities
-// ---------------------------------------------------------------------------
-
-/**
- * Converts a Nostr hex pubkey (npub) to a DIRECT:// address.
- *
- * Protocol invariant: Nostr secp256k1 hex pubkeys map 1:1 to Unicity
- * DIRECT:// addresses. Both use the same 32-byte compressed public key
- * hex encoding. See protocol-spec.md §Identity.
- */
-export function npubToDirectAddress(npub: string): string {
-  const hex = npub.toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(hex)) {
-    throw new Error(`Invalid npub: expected 64 lowercase hex chars, got ${npub.length} chars`);
-  }
-  return `DIRECT://${hex}`;
-}
 
 // ---------------------------------------------------------------------------
 // Manifest field allow-list
@@ -68,6 +52,9 @@ const MANIFEST_KEYS = [
   'party_b_currency_to_change',
   'party_b_value_to_change',
   'timeout',
+  'salt',
+  'escrow_address',
+  'protocol_version',
 ] as const;
 
 function stripManifest(raw: Record<string, unknown>): Record<string, unknown> {
@@ -104,7 +91,7 @@ const PAYOUT_ELIGIBLE_STATES: ReadonlySet<SwapState> = new Set([
 // ---------------------------------------------------------------------------
 
 export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
-  const { sphere, orchestrator, stateStore, invoiceManager, npubRoleMap } = deps;
+  const { sphere, orchestrator, stateStore, invoiceManager, npubRoleMap, escrowAddress } = deps;
 
   // Lifecycle state.
   // `active` is set synchronously before any await, so the flag-check at
@@ -113,6 +100,9 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   let active = false;
   let unsubscribe: (() => void) | null = null;
   const inFlight = new Set<Promise<void>>();
+  // Per-swap gate: serializes the entire announce+resolve+register+deliver
+  // sequence so concurrent handleAnnounce calls for the same swap don't race.
+  const announceResolveGates = new Map<string, Promise<void>>();
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -143,62 +133,35 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
    * Two conditions must both be satisfied (defence-in-depth against the
    * announce-first attack):
    *
-   * 1. The npub must be registered in npubRoleMap for this swapId.
-   * 2. The npub's resolved DIRECT address must match one of the swap's cached
-   *    party addresses.  This is the "DIRECT address back-check".
+   * 1. The npub must be registered in npubRoleMap for this swapId (role was
+   *    granted during announce after sphere.resolve() confirmed identity).
+   * 2. The cached directAddress stored at registration time must still match
+   *    the swap's resolved party address.  This guards against the role map
+   *    being populated by an attacker who announced first with a spoofed role.
    *
    * Returns the party role ('A' or 'B') or null when either condition fails.
-   *
-   * NOTE: Resolving an npub to a DIRECT:// address requires calling the
-   * sphere SDK.  However, the npub key-space (Nostr secp256k1) and the
-   * DIRECT:// chain address key-space use the same underlying curve, so the
-   * npub can be converted to a DIRECT:// address deterministically.
-   *
-   * In the current design the escrow uses the npubRoleMap entry as a
-   * convenience hint and then back-checks the claim by comparing the
-   * announcer's npub-derived DIRECT address against the resolved party
-   * address stored in the swap record.  If the attacker announced first, their
-   * npub-derived address will NOT match the manifest's party address, and the
-   * check fails.
    */
   function authorizeNpub(
     npub: string,
     swap: SwapRecord,
   ): 'A' | 'B' | null {
-    // Step 1: role map lookup.
-    const roleFromMap = npubRoleMap.getRole(npub, swap.swap_id);
-    if (roleFromMap === null) return null;
+    // Step 1: role map lookup (includes cached directAddress from announce time).
+    const entry = npubRoleMap.getRole(npub, swap.swap_id);
+    if (entry === null) return null;
 
-    // Step 2: DIRECT address back-check.
-    // The npub is the Nostr public key in bech32 format.  We compare the
-    // npub's own DIRECT:// address (which is deterministically derived from
-    // the same secp256k1 key) against the cached resolved party address.
-    // We derive the DIRECT address by asking the sphere SDK for our own
-    // address; however since we're operating on an *external* npub here,
-    // the practical approach used in the reference implementation is to
-    // store the sender's resolved address at announce time and compare at
-    // authorisation time.  In the current architecture, the orchestrator
-    // stores the resolved addresses when the manifest is announced.  The
-    // message handler therefore compares the swap's resolved_party_X_address
-    // (set by the orchestrator from the manifest) against the address that
-    // the announcing npub would resolve to.
-    //
-    // The DM senderPubkey is a raw hex public key (not bech32 npub).  The
-    // DIRECT:// address for that key is "DIRECT://<hex_pubkey>".  This is
-    // compared against the manifest party address (already resolved to
-    // DIRECT:// by the orchestrator at announce time).
-    //
-    // Case-sensitive exact string match — see protocol-spec §7.
-    const senderDirectAddress = npubToDirectAddress(npub);
+    // Step 2: Address back-check — cached directAddress must match the swap's
+    // stored resolved party address.  Case-insensitive comparison.
+    const cachedAddr = entry.directAddress.toLowerCase();
 
-    if (roleFromMap === 'A') {
-      if (senderDirectAddress === swap.resolved_party_a_address) return 'A';
+    if (entry.role === 'A') {
+      if (cachedAddr === swap.resolved_party_a_address?.toLowerCase()) return 'A';
     } else {
-      if (senderDirectAddress === swap.resolved_party_b_address) return 'B';
+      if (cachedAddr === swap.resolved_party_b_address?.toLowerCase()) return 'B';
     }
 
-    // Role map says one party but back-check fails — attacker who announced
-    // first with a spoofed role claim.
+    // Cached address doesn't match current swap record — attacker who announced
+    // first will have their own directAddress cached, which won't match the
+    // legitimate party's resolved address.
     return null;
   }
 
@@ -292,76 +255,205 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       return;
     }
 
-    let result: Awaited<ReturnType<SwapOrchestrator['announce']>>;
-    try {
-      const manifest = stripManifest(msg.manifest as Record<string, unknown>);
-      result = await orchestrator.announce(
-        manifest as unknown as import('../core/manifest-validator.js').SwapManifest,
-        senderPubkey,
-      );
-    } catch (err) {
-      await reply(senderPubkey, mapError(err));
-      return;
-    }
+    const manifest = stripManifest(msg.manifest as Record<string, unknown>);
 
-    // Determine party role for this announcer.
-    // The orchestrator resolves addresses at announce time and stores them in the
-    // swap record.  We use those cached addresses to identify which party the
-    // sender's DIRECT:// address corresponds to.
-    const swap = stateStore.findBySwapId(result.swap_id);
-    let party: 'A' | 'B' | null = null;
-    if (swap) {
-      let senderDirectAddress: string;
-      try {
-        senderDirectAddress = npubToDirectAddress(senderPubkey);
-      } catch {
-        // Invalid npub format — cannot determine party role. The announce
-        // succeeded, so reply with the result but skip role registration.
-        logger.warn({ swap_id: result.swap_id }, 'Invalid senderPubkey format — skipping party role registration');
+    // Protocol v2: verify party signatures before accepting the manifest.
+    // v1 (or omitted version) skips signature verification for backward compatibility —
+    // v1 announces rely on address-based trust (the announcer's npub matches a party address).
+    const rawVersion = msg.version;
+    const version = (typeof rawVersion === 'number' || typeof rawVersion === 'string')
+      ? Number(rawVersion) || 0
+      : 0;
+    if (version === 2) {
+      const signatures = msg.signatures;
+      const chainPubkeys = msg.chain_pubkeys;
+
+      // Type-validate: must be non-null plain objects (not arrays, strings, numbers)
+      if (!signatures || typeof signatures !== 'object' || Array.isArray(signatures) ||
+          !chainPubkeys || typeof chainPubkeys !== 'object' || Array.isArray(chainPubkeys)) {
+        await reply(senderPubkey, { type: 'error', error: 'Protocol v2 requires "signatures" and "chain_pubkeys" objects' });
+        return;
+      }
+
+      const sigs = signatures as Record<string, unknown>;
+      const pubs = chainPubkeys as Record<string, unknown>;
+      const swapId = typeof manifest.swap_id === 'string' ? manifest.swap_id : '';
+
+      // Validate escrow_address matches this escrow's actual address
+      const manifestEscrowAddr = typeof manifest.escrow_address === 'string' ? manifest.escrow_address : '';
+      if (manifestEscrowAddr !== escrowAddress) {
         await reply(senderPubkey, {
-          type: 'announce_result',
-          swap_id: result.swap_id,
-          state: swap.state ?? 'DEPOSIT_INVOICE_CREATED',
-          deposit_invoice_id: result.deposit_invoice_id,
-          is_new: result.is_new,
+          type: 'error',
+          error: `manifest.escrow_address does not match this escrow's address`,
         });
         return;
       }
-      if (senderDirectAddress === swap.resolved_party_a_address) {
-        party = 'A';
-      } else if (senderDirectAddress === swap.resolved_party_b_address) {
-        party = 'B';
-      } else {
-        // Third party announced (griefing note from spec §3 Step 2).
-        // Do NOT register a role or deliver invoice token — address doesn't
-        // match either party. They receive only the public announce_result
-        // (swap_id + invoice_id) which is non-sensitive.
-        logger.info(
-          { swap_id: result.swap_id },
-          'Third-party announcer — address matches neither party, skipping role registration and invoice delivery',
-        );
+
+      // Reject duplicate chain_pubkeys early (before expensive signature verification)
+      if (typeof pubs.party_a === 'string' && typeof pubs.party_b === 'string' &&
+          pubs.party_a === pubs.party_b) {
+        await reply(senderPubkey, { type: 'error', error: 'party_a and party_b chain_pubkeys must be different' });
+        return;
       }
-      if (party) {
-        npubRoleMap.register(senderPubkey, result.swap_id, party);
+
+      let verified = 0;
+      const partyAAddr = typeof manifest.party_a_address === 'string' ? manifest.party_a_address : '';
+      const partyBAddr = typeof manifest.party_b_address === 'string' ? manifest.party_b_address : '';
+
+      // Helper: check if a DIRECT:// address value contains the chain_pubkey.
+      // Searches only the value portion (after "DIRECT://"), not the prefix itself.
+      const addrValueContains = (addr: string, pubkey: string): boolean =>
+        addr.startsWith('DIRECT://') && addr.slice(9).includes(pubkey);
+
+      // Verify party A signature + identity binding
+      if (typeof sigs.party_a === 'string' && typeof pubs.party_a === 'string') {
+        if (!verifySwapSignature(swapId, escrowAddress, sigs.party_a, pubs.party_a)) {
+          await reply(senderPubkey, { type: 'error', error: 'Party A signature verification failed' });
+          return;
+        }
+        // Identity binding: verify chain_pubkey corresponds to manifest.party_a_address.
+        // For DIRECT:// addresses containing the raw pubkey, the chain_pubkey must appear
+        // in the address value. For predicate addresses (derived from the key via SDK),
+        // full derivation requires private key access (SDK limitation — see bugs/004).
+        // For nametag/proxy addresses, binding is verified post-resolution by the orchestrator.
+        if (partyAAddr.startsWith('DIRECT://') && !addrValueContains(partyAAddr, pubs.party_a)) {
+          logger.warn(
+            { swap_id: swapId, chain_pubkey: pubs.party_a, party_a_address: partyAAddr },
+            'Party A chain_pubkey not found in party_a_address — may be a predicate-derived address (cannot verify binding without SDK support)',
+          );
+        }
+        verified++;
       }
+
+      // Verify party B signature + identity binding
+      if (typeof sigs.party_b === 'string' && typeof pubs.party_b === 'string') {
+        if (!verifySwapSignature(swapId, escrowAddress, sigs.party_b, pubs.party_b)) {
+          await reply(senderPubkey, { type: 'error', error: 'Party B signature verification failed' });
+          return;
+        }
+        if (partyBAddr.startsWith('DIRECT://') && !addrValueContains(partyBAddr, pubs.party_b)) {
+          logger.warn(
+            { swap_id: swapId, chain_pubkey: pubs.party_b, party_b_address: partyBAddr },
+            'Party B chain_pubkey not found in party_b_address — may be a predicate-derived address (cannot verify binding without SDK support)',
+          );
+        }
+        verified++;
+      }
+
+      // At least one party must have provided a valid signature
+      if (verified === 0) {
+        await reply(senderPubkey, { type: 'error', error: 'Protocol v2 requires at least one party signature' });
+        return;
+      }
+
+      logger.info({ swap_id: swapId, version: 2, verified }, 'Protocol v2 signatures verified');
     }
 
-    // Per protocol-spec §1.2, announce_result includes state and created_at
-    const announcedSwap = stateStore.findBySwapId(result.swap_id);
-    await reply(senderPubkey, {
-      type: 'announce_result',
-      swap_id: result.swap_id,
-      state: announcedSwap?.state ?? 'DEPOSIT_INVOICE_CREATED',
-      deposit_invoice_id: result.deposit_invoice_id,
-      created_at: announcedSwap ? new Date(announcedSwap.created_at).toISOString() : new Date().toISOString(),
-      is_new: result.is_new,
-    });
+    // The ENTIRE announce+resolve+register+deliver sequence must be serialized
+    // per swap_id. Without this, two concurrent handleAnnounce calls (Bob's v2
+    // and Alice's v1) both see empty npubRoleMap, both call sphere.resolve()
+    // concurrently (doubling relay load), and partial failures leave parties
+    // permanently unregistered ("Unauthorized").
+    const swapId = typeof manifest.swap_id === 'string' ? manifest.swap_id : '';
+    const existingGate = announceResolveGates.get(swapId);
+    if (existingGate) {
+      // Another handleAnnounce for this swap is already running.
+      // Wait for it to complete — it will resolve+register+deliver for both parties.
+      await existingGate.catch(() => {});
+      // After the first handler completes, parties are registered.
+      // Still send announce_result to THIS sender so their SDK gets the response.
+      const swap = stateStore.findBySwapId(swapId);
+      if (swap?.deposit_invoice_id) {
+        await reply(senderPubkey, {
+          type: 'announce_result',
+          swap_id: swapId,
+          state: swap.state,
+          deposit_invoice_id: swap.deposit_invoice_id,
+          created_at: new Date(swap.created_at).toISOString(),
+          is_new: false,
+        });
+        // Deliver invoice to this sender if they're a registered party
+        const role = npubRoleMap.getRole(senderPubkey, swapId);
+        if (role) {
+          await deliverDepositInvoice(senderPubkey, swap, role.role);
+        }
+      }
+      return;
+    }
 
-    // Deliver the deposit invoice token only to verified parties.
-    // Use the already-computed party variable directly — avoid a redundant
-    // getRole() lookup that could race with concurrent register() calls.
-    if (swap && party !== null) {
-      await deliverDepositInvoice(senderPubkey, swap, party);
+    const gate = (async () => {
+      let result: Awaited<ReturnType<SwapOrchestrator['announce']>>;
+      try {
+        result = await orchestrator.announce(
+          manifest as unknown as import('../core/manifest-validator.js').SwapManifest,
+          senderPubkey,
+        );
+      } catch (err) {
+        await reply(senderPubkey, mapError(err));
+        return;
+      }
+
+      const swap = stateStore.findBySwapId(result.swap_id);
+      if (!swap) return;
+
+      // Resolve party transport pubkeys from DIRECT:// manifest addresses.
+      let partyAPubkey = npubRoleMap.findNpub(result.swap_id, 'A');
+      let partyBPubkey = npubRoleMap.findNpub(result.swap_id, 'B');
+
+      const RESOLVE_ATTEMPTS = 3;
+      for (let attempt = 0; attempt < RESOLVE_ATTEMPTS && (!partyAPubkey || !partyBPubkey); attempt++) {
+        if (attempt > 0) {
+          await new Promise(r => setTimeout(r, 2000));
+        }
+
+        const [peerA, peerB] = await Promise.all([
+          !partyAPubkey && swap.resolved_party_a_address
+            ? sphere.resolve(swap.resolved_party_a_address).catch(() => null)
+            : Promise.resolve(null),
+          !partyBPubkey && swap.resolved_party_b_address
+            ? sphere.resolve(swap.resolved_party_b_address).catch(() => null)
+            : Promise.resolve(null),
+        ]);
+
+        if (peerA?.transportPubkey && !partyAPubkey) {
+          partyAPubkey = peerA.transportPubkey;
+          npubRoleMap.register(peerA.transportPubkey, result.swap_id, 'A', swap.resolved_party_a_address!);
+        }
+        if (peerB?.transportPubkey && !partyBPubkey) {
+          partyBPubkey = peerB.transportPubkey;
+          npubRoleMap.register(peerB.transportPubkey, result.swap_id, 'B', swap.resolved_party_b_address!);
+        }
+      }
+
+      // Build announce_result payload
+      const announcePayload = {
+        type: 'announce_result',
+        swap_id: result.swap_id,
+        state: swap.state,
+        deposit_invoice_id: result.deposit_invoice_id,
+        created_at: new Date(swap.created_at).toISOString(),
+        is_new: result.is_new,
+      };
+
+      // Send to BOTH parties
+      for (const [party, pubkey] of [['A', partyAPubkey], ['B', partyBPubkey]] as const) {
+        if (!pubkey) {
+          logger.warn(
+            { swap_id: result.swap_id, party },
+            'Could not resolve party transport pubkey — announce_result skipped',
+          );
+          continue;
+        }
+        await reply(pubkey, announcePayload);
+        await deliverDepositInvoice(pubkey, swap, party);
+      }
+    })();
+
+    announceResolveGates.set(swapId, gate);
+    try {
+      await gate;
+    } finally {
+      announceResolveGates.delete(swapId);
     }
   }
 
@@ -561,6 +653,51 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     });
   }
 
+  /**
+   * Handle a `cancel` message.
+   *
+   * Flow:
+   * 1. Parse and validate swap_id.
+   * 2. Authorize the requesting npub via authorizeNpub().
+   * 3. Delegate to orchestrator.cancelSwap().
+   * 4. Reply with cancel_result.
+   */
+  async function handleCancel(senderPubkey: string, msg: Record<string, unknown>): Promise<void> {
+    const swapId = typeof msg.swap_id === 'string' ? msg.swap_id.toLowerCase() : '';
+    if (!isValidSwapId(swapId)) {
+      await reply(senderPubkey, {
+        type: 'error',
+        error: 'Invalid swap_id: must be exactly 64 lowercase hex characters',
+      });
+      return;
+    }
+
+    try {
+      const swap = stateStore.findBySwapId(swapId);
+      if (!swap) {
+        await reply(senderPubkey, { type: 'error', error: 'Swap not found' });
+        return;
+      }
+
+      const role = authorizeNpub(senderPubkey, swap);
+      if (role === null) {
+        await reply(senderPubkey, { type: 'error', error: 'Unauthorized' });
+        return;
+      }
+
+      const result = await orchestrator.cancelSwap(swapId, role);
+
+      await reply(senderPubkey, {
+        type: 'cancel_result',
+        swap_id: swapId,
+        success: result.success,
+        reason: result.reason,
+      });
+    } catch (err) {
+      await reply(senderPubkey, mapError(err));
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Core DM dispatcher
   // ---------------------------------------------------------------------------
@@ -568,26 +705,28 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   async function onMessage(dm: DirectMessage): Promise<void> {
     if (!active) return;
 
-    if (dm.content.length > MAX_DM_LENGTH) {
-      await reply(dm.senderPubkey, { type: 'error', error: 'Message too large' });
-      return;
-    }
+    // Skip already-processed DMs. The SDK's CommunicationsModule persists
+    // isRead across restarts, so DMs processed in a previous session are
+    // automatically skipped on replay without any custom dedup logic.
+    if (dm.isRead) return;
+
+    if (dm.content.length > MAX_DM_LENGTH) return;
 
     let msg: Record<string, unknown>;
     try {
       msg = JSON.parse(dm.content);
     } catch {
-      await reply(dm.senderPubkey, { type: 'error', error: 'Invalid JSON' });
+      // Not valid JSON — mark as read so we don't retry
+      await sphere.communications.markAsRead([dm.id]);
       return;
     }
 
     if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) {
-      await reply(dm.senderPubkey, { type: 'error', error: 'Message must be a JSON object' });
+      await sphere.communications.markAsRead([dm.id]);
       return;
     }
-
     if (!msg.type || typeof msg.type !== 'string') {
-      await reply(dm.senderPubkey, { type: 'error', error: 'Missing or invalid "type" field' });
+      await sphere.communications.markAsRead([dm.id]);
       return;
     }
 
@@ -607,11 +746,15 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       case 'deposit_instructions':
         await handleDepositInstructions(dm.senderPubkey, msg);
         break;
-      default: {
-        const safeType = msgType.slice(0, 64).replace(/[^\x20-\x7E]/g, '');
-        await reply(dm.senderPubkey, { type: 'error', error: `Unknown message type: ${safeType}` });
-      }
+      case 'cancel':
+        await handleCancel(dm.senderPubkey, msg);
+        break;
+      default:
+        break;
     }
+
+    // Mark as processed — persisted by CommunicationsModule across restarts
+    await sphere.communications.markAsRead([dm.id]);
   }
 
   // ---------------------------------------------------------------------------
@@ -622,16 +765,40 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     start() {
       if (active) return;
       active = true;
-      unsubscribe = sphere.communications.onDirectMessage((dm) => {
-        if (inFlight.size >= MAX_CONCURRENT) {
-          logger.warn({ sender: dm.senderPubkey }, 'DM dropped: concurrency limit reached');
-          return;
+      // Bounded processing queue: up to MAX_CONCURRENT handlers run in
+      // parallel. Excess DMs are queued (FIFO) and processed as slots free.
+      // The shouldSkipDm fast-path runs synchronously BEFORE queuing so
+      // replay-duplicates and terminal-swap DMs never occupy a slot.
+      const pendingQueue: DirectMessage[] = [];
+      let draining = false;
+
+      function drainQueue(): void {
+        if (draining) return;
+        draining = true;
+        while (pendingQueue.length > 0 && inFlight.size < MAX_CONCURRENT) {
+          const next = pendingQueue.shift()!;
+          const p = onMessage(next).catch((err) => {
+            logger.error({ err, dmId: next.id }, 'Unhandled error processing queued DM');
+          });
+          inFlight.add(p);
+          p.finally(() => { inFlight.delete(p); drainQueue(); });
         }
-        const p = onMessage(dm).catch((err) => {
-          logger.error({ err, dmId: dm.id }, 'Unhandled error processing DM');
-        });
-        inFlight.add(p);
-        p.finally(() => inFlight.delete(p));
+        draining = false;
+      }
+
+      unsubscribe = sphere.communications.onDirectMessage((dm) => {
+        // Fast skip: already processed in a previous session (persisted by SDK)
+        if (dm.isRead) return;
+
+        if (inFlight.size < MAX_CONCURRENT) {
+          const p = onMessage(dm).catch((err) => {
+            logger.error({ err, dmId: dm.id }, 'Unhandled error processing DM');
+          });
+          inFlight.add(p);
+          p.finally(() => { inFlight.delete(p); drainQueue(); });
+        } else {
+          pendingQueue.push(dm);
+        }
       });
       logger.info('Message handler started');
     },

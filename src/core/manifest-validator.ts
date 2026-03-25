@@ -8,14 +8,3 @@
  */
 export { validateManifest, verifyManifestIntegrity } from '@unicitylabs/sphere-sdk';
 export type { SwapManifest, ManifestFields } from '@unicitylabs/sphere-sdk';
-
-// Re-export ValidationResult-compatible type for existing consumers
-export interface ValidationError {
-  field: string;
-  message: string;
-}
-
-export interface ValidationResult {
-  valid: boolean;
-  errors: ValidationError[] | string[];
-}

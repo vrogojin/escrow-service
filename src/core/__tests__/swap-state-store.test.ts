@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { InMemorySwapStateStore } from '../swap-state-store.js';
 import { SwapState } from '../state-machine.js';
 import type { SwapManifest, ResolvedAddresses, SwapRecord } from '../types.js';
@@ -48,6 +49,7 @@ function createTestManifest(overrides?: Partial<SwapManifest>): SwapManifest {
     party_b_currency_to_change: 'USDU',
     party_b_value_to_change: '500',
     timeout: 600,
+    salt: randomBytes(16).toString('hex'),
     ...overrides,
   };
 
@@ -59,6 +61,7 @@ function createTestManifest(overrides?: Partial<SwapManifest>): SwapManifest {
     party_b_currency_to_change: base.party_b_currency_to_change,
     party_b_value_to_change: base.party_b_value_to_change,
     timeout: base.timeout,
+    salt: base.salt,
   };
 
   const swap_id = computeSwapId(fields);

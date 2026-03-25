@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
 import { MockAccountingModule } from '../../__tests__/helpers/mock-accounting-module.js';
 import { InMemorySwapStateStore } from '../../__tests__/helpers/in-memory-swap-state-store.js';
 import { createMockTransferRef } from '../../__tests__/helpers/mock-invoice-status.js';
@@ -25,6 +26,7 @@ function createTestManifest(): SwapManifest {
     party_b_currency_to_change: 'USDU',
     party_b_value_to_change: '500',
     timeout: 600,
+    salt: randomBytes(16).toString('hex'),
   };
   const swap_id = computeSwapId(fields);
   return { swap_id, ...fields };
@@ -32,7 +34,7 @@ function createTestManifest(): SwapManifest {
 
 async function setupOrchestrator() {
   const mockAccounting = new MockAccountingModule();
-  const invoiceManager = new InvoiceManager({ accounting: mockAccounting as any, escrowAddress: ESCROW_ADDRESS });
+  const invoiceManager = new InvoiceManager({ accounting: mockAccounting as any, escrowAddress: ESCROW_ADDRESS, getToken: () => undefined });
   const stateStore = new InMemorySwapStateStore();
 
   let handleTimeoutFn: ((swapId: string) => Promise<void>) | null = null;
@@ -1897,6 +1899,7 @@ describe('CrashRecoveryManager', () => {
         party_b_currency_to_change: 'USDU',
         party_b_value_to_change: '500',
         timeout: 600,
+        salt: randomBytes(16).toString('hex'),
       };
       const swap_id = computeSwapId(fields);
       return { swap_id, ...fields };

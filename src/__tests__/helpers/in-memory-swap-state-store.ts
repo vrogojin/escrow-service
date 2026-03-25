@@ -147,6 +147,20 @@ export class InMemorySwapStateStore implements SwapStateStore {
   }
 
   /**
+   * Returns the count of non-terminal swap records.
+   * Avoids cloning all records for a simple count check.
+   */
+  countNonTerminal(): number {
+    let count = 0;
+    for (const record of this.swaps.values()) {
+      if (!isTerminalState(record.state)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
    * Clones a record to ensure immutability from the caller's perspective.
    */
   private clone(record: SwapRecord): SwapRecord {

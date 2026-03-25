@@ -156,6 +156,8 @@ export class MockAccountingModule {
   private callOrder: string[] = [];
   // Track concurrent createInvoice calls by canonical terms to detect concurrent duplicate creates
   private inFlightCreates = new Map<string, Promise<string>>();
+  /** Artificial delay (ms) inserted at the start of createInvoice() to create concurrency windows in tests. */
+  private createInvoiceDelay = 0;
 
   /**
    * Creates a new invoice with a deterministic ID based on canonical terms.
@@ -163,6 +165,12 @@ export class MockAccountingModule {
    * with identical terms are in flight simultaneously (detected via inFlightCreates set).
    */
   async createInvoice(request: CreateInvoiceRequest & { createdAt?: number }): Promise<CreateInvoiceResult> {
+    // Artificial delay to yield to the event loop, creating a real concurrency
+    // window for tests that fire multiple announce() calls via Promise.all.
+    if (this.createInvoiceDelay > 0) {
+      await new Promise((r) => setTimeout(r, this.createInvoiceDelay));
+    }
+
     const terms: InvoiceTerms = {
       targets: request.targets,
       dueDate: request.dueDate,
@@ -582,6 +590,7 @@ export class MockAccountingModule {
     this.handlers.clear();
     this.callOrder = [];
     this.inFlightCreates.clear();
+    this.createInvoiceDelay = 0;
   }
 
   /**
@@ -589,6 +598,23 @@ export class MockAccountingModule {
    */
   _removeInvoice(invoiceId: string): void {
     this.invoices.delete(invoiceId);
+  }
+
+  /**
+   * Sets an artificial delay (in milliseconds) at the start of createInvoice().
+   * When delay > 0, createInvoice() yields to the event loop before executing,
+   * allowing concurrent callers to enter the same code path and create a real
+   * race window for concurrency tests.
+   */
+  _setCreateInvoiceDelay(ms: number): void {
+    this.createInvoiceDelay = ms;
+  }
+
+  /**
+   * Resets the createInvoice delay to 0 (no delay).
+   */
+  _resetCreateInvoiceDelay(): void {
+    this.createInvoiceDelay = 0;
   }
 
   /**

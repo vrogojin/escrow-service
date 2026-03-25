@@ -38,6 +38,19 @@ export interface SwapOrchestrator {
     manifest: import('../core/manifest-validator.js').SwapManifest,
     announcerNpub: string,
   ): Promise<AnnounceResult>;
+
+  /**
+   * Cancel a swap that has not yet received deposits.
+   *
+   * Only allowed in ANNOUNCED or DEPOSIT_INVOICE_CREATED states.
+   * If a deposit invoice exists, it will be cancelled (triggering auto-return
+   * of any payments that arrived in the meantime).
+   *
+   * @param swapId - The swap to cancel.
+   * @param requestingParty - Which party requested the cancellation ('A' or 'B').
+   * @returns Result indicating success or failure with reason.
+   */
+  cancelSwap(swapId: string, requestingParty: 'A' | 'B'): Promise<{ success: boolean; reason?: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,28 +107,44 @@ export interface InvoiceManager {
  * tuples.  The mapping is established during the announce phase and is used
  * for DM-level authorization of status queries and invoice re-delivery.
  *
- * Security note: this mapping is trust-based, not cryptographic.  It must
- * always be combined with a DIRECT-address back-check before granting access
- * to sensitive operations.
+ * Each entry caches the sender's resolved DIRECT:// address (obtained via
+ * sphere.resolve() at announcement time) so that subsequent requests can be
+ * back-checked without an additional network call.
  */
 export interface NpubRoleMap {
   /**
    * Record that `npub` is associated with the given `party` role for `swapId`.
+   * `directAddress` is the resolved DIRECT:// address of the npub, obtained
+   * via sphere.resolve() at announcement time, and is used for authorization
+   * back-checks on subsequent requests.
    * Calling this more than once with the same (npub, swapId, party) tuple is
    * idempotent.
    */
-  register(npub: string, swapId: string, party: 'A' | 'B'): void;
+  register(npub: string, swapId: string, party: 'A' | 'B', directAddress: string): void;
 
   /**
-   * Return the role that `npub` holds for `swapId`, or `null` when no
-   * association has been registered.
+   * Return the role and cached directAddress that `npub` holds for `swapId`,
+   * or `null` when no association has been registered.
    */
-  getRole(npub: string, swapId: string): 'A' | 'B' | null;
+  getRole(npub: string, swapId: string): { role: 'A' | 'B'; directAddress: string } | null;
 
   /**
    * Return all swap IDs for which `npub` has a registered role.
    */
   getSwapIds(npub: string): string[];
+
+  /**
+   * Reverse lookup: given (swapId, party), find the registered npub.
+   * Returns `null` when no npub has been registered for that party in the swap.
+   */
+  findNpub(swapId: string, party: 'A' | 'B'): string | null;
+
+  /**
+   * Reverse lookup: given a DIRECT:// address, find the registered npub.
+   * Used for bounce DM routing when the sender is not a known party.
+   * Optional for backward compatibility with test mocks.
+   */
+  findNpubByAddress?(directAddress: string): string | null;
 }
 
 // ---------------------------------------------------------------------------

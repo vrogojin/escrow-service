@@ -12,6 +12,7 @@ export interface Config {
   swapTimeoutDefault: number;
 
   maxPendingSwaps: number;
+  dataDir: string;
 }
 
 export function loadConfig(): Config {
@@ -29,5 +30,6 @@ export function loadConfig(): Config {
     swapTimeoutDefault: parseInt(process.env.SWAP_TIMEOUT_DEFAULT ?? '3600', 10),
 
     maxPendingSwaps: parseInt(process.env.MAX_PENDING_SWAPS ?? '10000', 10),
+    dataDir: process.env.ESCROW_DATA_DIR ?? './.escrow-data',
   };
 }

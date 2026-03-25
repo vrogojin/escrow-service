@@ -51,6 +51,7 @@ export interface SwapStateStore {
     updates: Partial<SwapRecord>,
     expectedVersion: number,
   ): SwapRecord | null;
+  countNonTerminal(): number;
 }
 
 /**

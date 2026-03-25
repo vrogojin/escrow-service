@@ -160,18 +160,20 @@ describe('SwapState state machine', () => {
   });
 
   describe('getValidNextStates', () => {
-    it('should return [DEPOSIT_INVOICE_CREATED, FAILED] for ANNOUNCED', () => {
+    it('should return [DEPOSIT_INVOICE_CREATED, CANCELLING, FAILED] for ANNOUNCED', () => {
       const nextStates = getValidNextStates(SwapState.ANNOUNCED);
-      expect(nextStates).toHaveLength(2);
+      expect(nextStates).toHaveLength(3);
       expect(nextStates).toContain(SwapState.DEPOSIT_INVOICE_CREATED);
+      expect(nextStates).toContain(SwapState.CANCELLING);
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return [PARTIAL_DEPOSIT, DEPOSIT_COVERED, TIMED_OUT, FAILED] for DEPOSIT_INVOICE_CREATED', () => {
+    it('should return [PARTIAL_DEPOSIT, DEPOSIT_COVERED, CANCELLING, TIMED_OUT, FAILED] for DEPOSIT_INVOICE_CREATED', () => {
       const nextStates = getValidNextStates(SwapState.DEPOSIT_INVOICE_CREATED);
-      expect(nextStates).toHaveLength(4);
+      expect(nextStates).toHaveLength(5);
       expect(nextStates).toContain(SwapState.PARTIAL_DEPOSIT);
       expect(nextStates).toContain(SwapState.DEPOSIT_COVERED);
+      expect(nextStates).toContain(SwapState.CANCELLING);
       expect(nextStates).toContain(SwapState.TIMED_OUT);
       expect(nextStates).toContain(SwapState.FAILED);
     });

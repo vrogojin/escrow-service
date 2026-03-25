@@ -395,6 +395,7 @@ function buildOrchestratorStack(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     accounting: accounting as any,
     escrowAddress,
+    getToken: (id) => escrowSphere.payments.getToken(id),
     // Events are emitted on the Sphere instance, not on AccountingModule directly
     eventSource: escrowSphere as any,
   });
