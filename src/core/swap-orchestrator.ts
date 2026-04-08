@@ -1547,18 +1547,23 @@ export class SwapOrchestrator {
     // Per protocol-spec §3 Step 9: send invoice_delivery DMs to both parties
     // before payment_confirmation so each party receives their payout invoice
     // token first and can verify the terms independently.
+    // IMPORTANT: invoice_token MUST be included — the SDK's parseInvoiceDelivery
+    // requires it as a non-null object. Without it, the payout DM is silently
+    // dropped and the swap never transitions to completed on the trader side.
     await Promise.allSettled([
       this.messageSender.sendToParty(swap.swap_id, 'A', {
         type: 'invoice_delivery',
         swap_id: manifest.swap_id,
         invoice_type: 'payout',
         invoice_id: payoutAId,
+        ...(payoutAResult.token ? { invoice_token: payoutAResult.token } : {}),
       }),
       this.messageSender.sendToParty(swap.swap_id, 'B', {
         type: 'invoice_delivery',
         swap_id: manifest.swap_id,
         invoice_type: 'payout',
         invoice_id: payoutBId,
+        ...(payoutBResult.token ? { invoice_token: payoutBResult.token } : {}),
       }),
     ]);
 
