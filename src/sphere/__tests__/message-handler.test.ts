@@ -171,8 +171,9 @@ describe('Message Handler', () => {
     const callback = dmCallbacks.get('onDirectMessage');
     if (callback) {
       callback(dm);
-      // Allow async handler to complete (processes microtasks + macrotasks)
-      await new Promise((r) => setTimeout(r, 100));
+      // Allow async handler to complete. The handler includes sphere.resolve()
+      // calls and announce gate logic that need multiple event loop ticks.
+      await new Promise((r) => setTimeout(r, 200));
     }
   }
 
@@ -514,13 +515,16 @@ describe('Message Handler', () => {
       const mockSwap = createMockSwap(manifest);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
+      mockSphere.communications.sendDM.mockClear();
 
-      // Don't register the npub with any role
+      // Use a truly unknown npub that sphere.resolve returns null for
+      // (PARTY_A_NPUB would pass the authorizeWithFallback resolve fallback)
+      const UNKNOWN_NPUB = 'unknown_npub_aaaaaaaaaa';
 
-      await sendDM(PARTY_A_NPUB, { type: 'status', swap_id: manifest.swap_id });
+      await sendDM(UNKNOWN_NPUB, { type: 'status', swap_id: manifest.swap_id });
 
       const calls = mockSphere.communications.sendDM.mock.calls;
-      const errorCall = calls.find((c: any[]) => c[1].includes('Unauthorized'));
+      const errorCall = calls.find((c: any[]) => c[1]?.includes?.('Unauthorized'));
       expect(errorCall).toBeDefined();
 
       const response = JSON.parse(errorCall![1]);
@@ -659,8 +663,13 @@ describe('Message Handler', () => {
       const manifest1 = createManifest('1'.repeat(64));
       const manifest2 = createManifest('2'.repeat(64));
       const mockSwap2 = createMockSwap(manifest2);
+      // Swap 2 has DIFFERENT party addresses — party A of swap 1 should not
+      // be authorized for swap 2 even with resolve fallback.
+      mockSwap2.resolved_party_a_address = 'DIRECT://dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+      mockSwap2.resolved_party_b_address = 'DIRECT://eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee';
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap2);
+      mockSphere.communications.sendDM.mockClear();
 
       // Party A is registered for swap 1, not swap 2
       npubRoleMap.register(PARTY_A_NPUB, manifest1.swap_id, 'A', PARTY_A_ADDRESS);
@@ -669,7 +678,7 @@ describe('Message Handler', () => {
       await sendDM(PARTY_A_NPUB, { type: 'status', swap_id: manifest2.swap_id });
 
       const calls = mockSphere.communications.sendDM.mock.calls;
-      const errorCall = calls.find((c: any[]) => c[1].includes('Unauthorized'));
+      const errorCall = calls.find((c: any[]) => c[1]?.includes?.('Unauthorized'));
       expect(errorCall).toBeDefined();
 
       const response = JSON.parse(errorCall![1]);
@@ -712,17 +721,19 @@ describe('Message Handler', () => {
       const mockSwap = createMockSwap(manifest);
 
       mockStateStore.findBySwapId.mockReturnValue(mockSwap);
+      mockSphere.communications.sendDM.mockClear();
 
-      // Don't register the npub
+      // Use a truly unknown npub that sphere.resolve returns null for
+      const UNKNOWN_NPUB = 'unknown_npub_bbbbbbbbbb';
 
-      await sendDM(PARTY_A_NPUB, {
+      await sendDM(UNKNOWN_NPUB, {
         type: 'request_invoice',
         swap_id: manifest.swap_id,
         invoice_type: 'deposit',
       });
 
       const calls = mockSphere.communications.sendDM.mock.calls;
-      const errorCall = calls.find((c: any[]) => c[1].includes('Unauthorized'));
+      const errorCall = calls.find((c: any[]) => c[1]?.includes?.('Unauthorized'));
       expect(errorCall).toBeDefined();
 
       const response = JSON.parse(errorCall![1]);
@@ -1085,6 +1096,37 @@ describe('Message Handler', () => {
         (c: any[]) => c[1]?.includes?.('Unknown'),
       );
       expect(errorCalls.length).toBe(0);
+    });
+  });
+
+  // =========================================================================
+  // Ping Tests
+  // =========================================================================
+
+  describe('ping Message', () => {
+    it('should reply with pong including escrow_address and timestamp', async () => {
+      await sendDM(PARTY_A_NPUB, { type: 'ping' });
+
+      const calls = mockSphere.communications.sendDM.mock.calls;
+      const pongCall = calls.find((c: any[]) => c[1]?.includes?.('pong'));
+      expect(pongCall).toBeDefined();
+
+      const response = JSON.parse(pongCall![1]);
+      expect(response.type).toBe('pong');
+      expect(response.escrow_address).toBe('DIRECT://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+      expect(typeof response.timestamp).toBe('number');
+    });
+
+    it('should respond to ping from any sender (unauthenticated)', async () => {
+      // A completely unknown npub should still get a pong
+      await sendDM('unknown_npub_not_in_role_map', { type: 'ping' });
+
+      const calls = mockSphere.communications.sendDM.mock.calls;
+      const pongCall = calls.find((c: any[]) => c[0] === 'unknown_npub_not_in_role_map');
+      expect(pongCall).toBeDefined();
+
+      const response = JSON.parse(pongCall![1]);
+      expect(response.type).toBe('pong');
     });
   });
 });

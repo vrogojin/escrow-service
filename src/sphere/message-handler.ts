@@ -100,6 +100,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   let active = false;
   let unsubscribe: (() => void) | null = null;
   const inFlight = new Set<Promise<void>>();
+  let startedAt = Date.now();
   // Per-swap gate: serializes the entire announce+resolve+register+deliver
   // sequence so concurrent handleAnnounce calls for the same swap don't race.
   const announceResolveGates = new Map<string, Promise<void>>();
@@ -166,6 +167,35 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   }
 
   /**
+   * Authorize a sender with fallback: try npubRoleMap first, then resolve
+   * the sender's transport pubkey and match against the swap's manifest addresses.
+   * Registers the sender in the role map on success so future calls are fast.
+   */
+  async function authorizeWithFallback(senderPubkey: string, swap: SwapRecord): Promise<'A' | 'B' | null> {
+    const role = authorizeNpub(senderPubkey, swap);
+    if (role !== null) return role;
+
+    // Fallback: resolve sender's transport pubkey to DIRECT address
+    let resolveKey = senderPubkey;
+    if (resolveKey.length === 66 && (resolveKey.startsWith('02') || resolveKey.startsWith('03'))) {
+      resolveKey = resolveKey.slice(2);
+    }
+    const peerInfo = await sphere.resolve(resolveKey).catch(() => null);
+    if (peerInfo?.directAddress) {
+      const addr = peerInfo.directAddress.toLowerCase();
+      if (addr === swap.resolved_party_a_address?.toLowerCase()) {
+        npubRoleMap.register(senderPubkey, swap.swap_id, 'A', swap.resolved_party_a_address!);
+        return 'A';
+      }
+      if (addr === swap.resolved_party_b_address?.toLowerCase()) {
+        npubRoleMap.register(senderPubkey, swap.swap_id, 'B', swap.resolved_party_b_address!);
+        return 'B';
+      }
+    }
+    return null;
+  }
+
+  /**
    * Deliver a deposit invoice token to the given npub with party-specific
    * payment instructions.
    */
@@ -182,7 +212,15 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       return;
     }
 
-    const token = await invoiceManager.getDepositInvoiceToken(swap.deposit_invoice_id);
+    // Retry token retrieval — the invoice was just minted and the token may
+    // not be persisted to storage yet (race between createInvoice returning
+    // the invoiceId and the token being flushed to disk/memory).
+    let token: unknown | null = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      token = await invoiceManager.getDepositInvoiceToken(swap.deposit_invoice_id);
+      if (token) break;
+      if (attempt < 4) await new Promise((r) => setTimeout(r, 500));
+    }
     if (!token) {
       await reply(recipientNpub, {
         type: 'error',
@@ -489,7 +527,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 
       // Cross-swap authorization: reject if the npub's role is for a different
       // swap only — authorizeNpub handles this by scoping to the specific swapId.
-      const role = authorizeNpub(senderPubkey, swap);
+      const role = await authorizeWithFallback(senderPubkey, swap);
       if (role === null) {
         await reply(senderPubkey, { type: 'error', error: 'Unauthorized' });
         return;
@@ -591,7 +629,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
 
       // Authorization: npub must be registered AND pass the DIRECT address
       // back-check.  Reject from unrecognized npubs (never announced).
-      const role = authorizeNpub(senderPubkey, swap);
+      const role = await authorizeWithFallback(senderPubkey, swap);
       if (role === null) {
         await reply(senderPubkey, { type: 'error', error: 'Unauthorized' });
         return;
@@ -679,7 +717,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
         return;
       }
 
-      const role = authorizeNpub(senderPubkey, swap);
+      const role = await authorizeWithFallback(senderPubkey, swap);
       if (role === null) {
         await reply(senderPubkey, { type: 'error', error: 'Unauthorized' });
         return;
@@ -696,6 +734,18 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     } catch (err) {
       await reply(senderPubkey, mapError(err));
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Ping (unauthenticated health check)
+  // ---------------------------------------------------------------------------
+
+  async function handlePing(senderPubkey: string): Promise<void> {
+    await reply(senderPubkey, {
+      type: 'pong',
+      escrow_address: escrowAddress,
+      timestamp: Date.now(),
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -749,6 +799,9 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       case 'cancel':
         await handleCancel(dm.senderPubkey, msg);
         break;
+      case 'ping':
+        await handlePing(dm.senderPubkey);
+        break;
       default:
         break;
     }
@@ -765,6 +818,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     start() {
       if (active) return;
       active = true;
+      startedAt = Date.now();
       // Bounded processing queue: up to MAX_CONCURRENT handlers run in
       // parallel. Excess DMs are queued (FIFO) and processed as slots free.
       // The shouldSkipDm fast-path runs synchronously BEFORE queuing so

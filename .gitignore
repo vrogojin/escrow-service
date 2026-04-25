@@ -4,5 +4,7 @@ dist/
 *.log
 .claude
 .sphere-escrow/
+.sphere-escrow.bak/
+.escrow-data/
 **/mnemonic.backup
 docker-compose.override.yml

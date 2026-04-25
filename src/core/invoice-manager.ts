@@ -32,6 +32,11 @@ export interface InvoiceManagerDeps {
    * Wire as `() => sphere.payments.receive({ finalize: true })`.
    */
   receiveAndFinalize?: () => Promise<void>;
+  /**
+   * Wait for all pending payment operations (sends) to complete.
+   * Wire as `() => sphere.payments.waitForPendingOperations()`.
+   */
+  waitForPendingOperations?: () => Promise<void>;
   /** AccountingModule from @unicitylabs/sphere-sdk (duck-typed as AccountingModule interface). */
   accounting: AccountingModule;
   /** Escrow's own DIRECT:// address — used as the deposit invoice target. */
@@ -58,10 +63,12 @@ export class InvoiceManager {
   private readonly getToken: (id: string) => { sdkData?: string } | undefined;
   private readonly eventSource: EventSource;
   private readonly receiveAndFinalize: (() => Promise<void>) | null;
+  private readonly _waitForPendingOperations: (() => Promise<void>) | null;
 
   constructor(deps: InvoiceManagerDeps) {
     this.accounting = deps.accounting;
     this.receiveAndFinalize = deps.receiveAndFinalize ?? null;
+    this._waitForPendingOperations = deps.waitForPendingOperations ?? null;
     // Normalize escrow address for deterministic invoice ID derivation
     this.escrowAddress = normalizeDirectAddress(deps.escrowAddress);
     this.getToken = deps.getToken;
@@ -191,6 +198,12 @@ export class InvoiceManager {
    */
   async payInvoice(invoiceId: string, params: PayInvoiceParams): Promise<TransferResult> {
     return this.accounting.payInvoice(invoiceId, params);
+  }
+
+  async waitForPendingOperations(): Promise<void> {
+    if (this._waitForPendingOperations) {
+      await this._waitForPendingOperations();
+    }
   }
 
   /**

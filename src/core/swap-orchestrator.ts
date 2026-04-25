@@ -1542,6 +1542,17 @@ export class SwapOrchestrator {
       }
     }
 
+    // Wait for all pending token operations (payout sends) to complete on-chain.
+    // Without this, payInvoice() returns after queueing the send in the SDK's
+    // SpendQueue, but the actual token transfer hasn't been published to the relay
+    // yet. Recipients won't detect the tokens via payments.receive() until the
+    // sends are finalized.
+    try {
+      await this.invoiceManager.waitForPendingOperations();
+    } catch (err) {
+      logger.warn({ err, swap_id: swap.swap_id }, 'waitForPendingOperations after payouts failed (non-fatal)');
+    }
+
     // Surplus returns handled by SDK autoReturn in closeDepositInvoice().
 
     // Per protocol-spec §3 Step 9: send invoice_delivery DMs to both parties
