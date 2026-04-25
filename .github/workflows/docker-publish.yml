@@ -48,6 +48,10 @@ jobs:
           context: .
           file: ./escrow-service/Dockerfile
           push: true
+          # GHCR namespace MUST match the repo owner — GITHUB_TOKEN scopes
+          # are tied to the repo. Currently vrogojin/; switch to
+          # unicitynetwork/ once the repo migrates to the org and a PAT or
+          # GitHub App is configured for cross-org pushes.
           tags: |
-            ghcr.io/unicitynetwork/agentic-hosting/escrow:${{ github.event.release.tag_name }}
-            ghcr.io/unicitynetwork/agentic-hosting/escrow:latest
+            ghcr.io/vrogojin/agentic-hosting/escrow:${{ github.event.release.tag_name }}
+            ghcr.io/vrogojin/agentic-hosting/escrow:latest
