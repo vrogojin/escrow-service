@@ -7,14 +7,20 @@ import {
   ParsedAddress,
 } from '../address.js';
 
+// Valid 64-char lowercase hex for DIRECT:// addresses (secp256k1 pubkey format)
+const HEX64_A = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+const HEX64_B = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210';
+const HEX64_UPPER = '0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF';
+const HEX64_MIXED = '0123456789AbCdEf0123456789aBcDeF0123456789AbCdEf0123456789aBcDeF';
+
 describe('address utilities', () => {
   describe('parseAddress', () => {
     it('should parse DIRECT:// address and return type DIRECT', () => {
-      const result = parseAddress('DIRECT://abc123');
+      const result = parseAddress(`DIRECT://${HEX64_A}`);
       expect(result).not.toBeNull();
       expect(result?.type).toBe('DIRECT');
-      expect(result?.value).toBe('abc123');
-      expect(result?.raw).toBe('DIRECT://abc123');
+      expect(result?.value).toBe(HEX64_A);
+      expect(result?.raw).toBe(`DIRECT://${HEX64_A}`);
     });
 
     it('should parse PROXY:// address and return type PROXY', () => {
@@ -34,11 +40,11 @@ describe('address utilities', () => {
     });
 
     it('should handle leading/trailing whitespace by trimming', () => {
-      const result = parseAddress('  DIRECT://abc123  ');
+      const result = parseAddress(`  DIRECT://${HEX64_A}  `);
       expect(result).not.toBeNull();
       expect(result?.type).toBe('DIRECT');
-      expect(result?.value).toBe('abc123');
-      expect(result?.raw).toBe('DIRECT://abc123');
+      expect(result?.value).toBe(HEX64_A);
+      expect(result?.raw).toBe(`DIRECT://${HEX64_A}`);
     });
 
     it('should return null for empty string', () => {
@@ -73,11 +79,13 @@ describe('address utilities', () => {
       expect(parseAddress('no-prefix-here')).toBeNull();
     });
 
-    it('should handle complex hex values in DIRECT addresses', () => {
-      const hexValue = '0123456789abcdefABCDEF0123456789';
-      const result = parseAddress(`DIRECT://${hexValue}`);
-      expect(result?.value).toBe(hexValue);
-      expect(result?.type).toBe('DIRECT');
+    it('should accept any non-empty string after DIRECT:// (SDK behavior)', () => {
+      // SDK's parseAddress accepts any non-empty value after DIRECT://
+      expect(parseAddress('DIRECT://abc123')).not.toBeNull();
+      expect(parseAddress(`DIRECT://${HEX64_A}ff`)).not.toBeNull();
+      expect(parseAddress(`DIRECT://${HEX64_UPPER}`)).not.toBeNull();
+      // Empty value after prefix is still rejected
+      expect(parseAddress('DIRECT://')).toBeNull();
     });
 
     it('should handle special characters in nametag values', () => {
@@ -95,7 +103,7 @@ describe('address utilities', () => {
 
   describe('isValidAddress', () => {
     it('should return true for valid DIRECT address', () => {
-      expect(isValidAddress('DIRECT://abc123')).toBe(true);
+      expect(isValidAddress(`DIRECT://${HEX64_A}`)).toBe(true);
     });
 
     it('should return true for valid PROXY address', () => {
@@ -124,15 +132,21 @@ describe('address utilities', () => {
 
     it('should return true for addresses with leading/trailing whitespace', () => {
       // parseAddress trims, so these should be valid
-      expect(isValidAddress('  DIRECT://abc123  ')).toBe(true);
+      expect(isValidAddress(`  DIRECT://${HEX64_A}  `)).toBe(true);
       expect(isValidAddress('  @alice  ')).toBe(true);
+    });
+
+    it('should return true for DIRECT:// with any non-empty value (SDK behavior)', () => {
+      // SDK accepts any non-empty string after DIRECT://
+      expect(isValidAddress('DIRECT://abc123')).toBe(true);
+      expect(isValidAddress(`DIRECT://${HEX64_UPPER}`)).toBe(true);
     });
   });
 
   describe('normalizeAddress', () => {
-    it('should lowercase DIRECT hex address', () => {
-      const normalized = normalizeAddress('DIRECT://ABC123');
-      expect(normalized).toBe('DIRECT://abc123');
+    it('should return DIRECT address unchanged (already lowercase)', () => {
+      const normalized = normalizeAddress(`DIRECT://${HEX64_A}`);
+      expect(normalized).toBe(`DIRECT://${HEX64_A}`);
     });
 
     it('should lowercase PROXY hex address', () => {
@@ -146,8 +160,8 @@ describe('address utilities', () => {
     });
 
     it('should preserve already lowercase DIRECT address', () => {
-      const normalized = normalizeAddress('DIRECT://abc123');
-      expect(normalized).toBe('DIRECT://abc123');
+      const normalized = normalizeAddress(`DIRECT://${HEX64_A}`);
+      expect(normalized).toBe(`DIRECT://${HEX64_A}`);
     });
 
     it('should preserve already lowercase PROXY address', () => {
@@ -158,11 +172,6 @@ describe('address utilities', () => {
     it('should preserve already lowercase nametag', () => {
       const normalized = normalizeAddress('@alice');
       expect(normalized).toBe('@alice');
-    });
-
-    it('should handle mixed case in DIRECT address', () => {
-      const normalized = normalizeAddress('DIRECT://AbC123DeF');
-      expect(normalized).toBe('DIRECT://abc123def');
     });
 
     it('should handle mixed case in PROXY address', () => {
@@ -186,21 +195,22 @@ describe('address utilities', () => {
       expect(normalized).toBe('');
     });
 
-    it('should handle leading/trailing whitespace by trimming first', () => {
-      const normalized = normalizeAddress('  DIRECT://ABC123  ');
-      expect(normalized).toBe('DIRECT://abc123');
+    it('should lowercase DIRECT:// with uppercase hex', () => {
+      // SDK's normalizeAddress lowercases the value after DIRECT://
+      const addr = `DIRECT://${HEX64_UPPER}`;
+      const normalized = normalizeAddress(addr);
+      expect(normalized).toBe(`DIRECT://${HEX64_UPPER.toLowerCase()}`);
     });
 
-    it('should handle long hex values in addresses', () => {
-      const longHex = '0123456789abcdefABCDEF0123456789';
-      const normalized = normalizeAddress(`DIRECT://${longHex}`);
-      expect(normalized).toBe(`DIRECT://${longHex.toLowerCase()}`);
+    it('should handle leading/trailing whitespace by trimming first', () => {
+      const normalized = normalizeAddress(`  DIRECT://${HEX64_A}  `);
+      expect(normalized).toBe(`DIRECT://${HEX64_A}`);
     });
   });
 
   describe('addressesMatch', () => {
     it('should return true for identical DIRECT addresses', () => {
-      const addr = 'DIRECT://abc123';
+      const addr = `DIRECT://${HEX64_A}`;
       expect(addressesMatch(addr, addr)).toBe(true);
     });
 
@@ -214,10 +224,6 @@ describe('address utilities', () => {
       expect(addressesMatch(addr, addr)).toBe(true);
     });
 
-    it('should return true for same DIRECT address with different cases', () => {
-      expect(addressesMatch('DIRECT://abc123', 'DIRECT://ABC123')).toBe(true);
-    });
-
     it('should return true for same PROXY address with different cases', () => {
       expect(addressesMatch('PROXY://xyz789', 'PROXY://XYZ789')).toBe(true);
     });
@@ -226,16 +232,12 @@ describe('address utilities', () => {
       expect(addressesMatch('@alice', '@ALICE')).toBe(true);
     });
 
-    it('should return true for mixed case match in DIRECT', () => {
-      expect(addressesMatch('DIRECT://AbC123', 'DIRECT://aBc123')).toBe(true);
-    });
-
     it('should return true for mixed case match in PROXY', () => {
       expect(addressesMatch('PROXY://PrOxY123', 'PROXY://proxy123')).toBe(true);
     });
 
     it('should return false for different DIRECT addresses', () => {
-      expect(addressesMatch('DIRECT://abc123', 'DIRECT://def456')).toBe(false);
+      expect(addressesMatch(`DIRECT://${HEX64_A}`, `DIRECT://${HEX64_B}`)).toBe(false);
     });
 
     it('should return false for different PROXY addresses', () => {
@@ -247,11 +249,11 @@ describe('address utilities', () => {
     });
 
     it('should return false for DIRECT vs PROXY with same hex value', () => {
-      expect(addressesMatch('DIRECT://abc123', 'PROXY://abc123')).toBe(false);
+      expect(addressesMatch(`DIRECT://${HEX64_A}`, `PROXY://${HEX64_A}`)).toBe(false);
     });
 
     it('should return false for DIRECT vs NAMETAG', () => {
-      expect(addressesMatch('DIRECT://alice', '@alice')).toBe(false);
+      expect(addressesMatch(`DIRECT://${HEX64_A}`, '@alice')).toBe(false);
     });
 
     it('should return false for PROXY vs NAMETAG', () => {
@@ -259,12 +261,12 @@ describe('address utilities', () => {
     });
 
     it('should handle leading/trailing whitespace in comparison', () => {
-      expect(addressesMatch('  DIRECT://abc123  ', 'DIRECT://ABC123')).toBe(true);
+      expect(addressesMatch(`  DIRECT://${HEX64_A}  `, `DIRECT://${HEX64_A}`)).toBe(true);
       expect(addressesMatch('@ALICE', '  @alice  ')).toBe(true);
     });
 
     it('should return false for one valid and one invalid address', () => {
-      expect(addressesMatch('DIRECT://abc123', 'INVALID://abc123')).toBe(false);
+      expect(addressesMatch(`DIRECT://${HEX64_A}`, 'INVALID://abc123')).toBe(false);
     });
 
     it('should return false for both invalid addresses', () => {
@@ -273,13 +275,7 @@ describe('address utilities', () => {
 
     it('should handle empty string comparison', () => {
       expect(addressesMatch('', '')).toBe(true);
-      expect(addressesMatch('DIRECT://abc123', '')).toBe(false);
-    });
-
-    it('should return true with long hex values in case-insensitive comparison', () => {
-      const longHex1 = '0123456789ABCDEF0123456789abcdef';
-      const longHex2 = '0123456789abcdef0123456789ABCDEF';
-      expect(addressesMatch(`DIRECT://${longHex1}`, `DIRECT://${longHex2}`)).toBe(true);
+      expect(addressesMatch(`DIRECT://${HEX64_A}`, '')).toBe(false);
     });
   });
 });

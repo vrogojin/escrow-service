@@ -44,7 +44,13 @@ async function main(): Promise<void> {
     if (!identity) {
       throw new Error('Sphere initialized but identity is null — wallet may be corrupt');
     }
-    const escrowAddress = identity.directAddress ?? `DIRECT://${identity.chainPubkey}`;
+    if (!identity.directAddress) {
+      throw new Error(
+        'Sphere identity has no directAddress — wallet initialization may have failed. ' +
+        'Ensure the SDK derives the predicate address during init.',
+      );
+    }
+    const escrowAddress = identity.directAddress;
 
     if (created && !generatedMnemonic) {
       throw new Error(

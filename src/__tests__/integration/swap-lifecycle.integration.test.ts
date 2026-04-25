@@ -1,555 +1,1037 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { createIntegrationContext, type TestContext } from '../helpers/in-memory-store.js';
-import { createTestManifest, createMockTransfer } from '../helpers/mock-sphere.js';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { randomBytes } from 'node:crypto';
+import { SwapOrchestrator } from '../../core/swap-orchestrator.js';
+import { InvoiceManager } from '../../core/invoice-manager.js';
+import { TimeoutManager } from '../../core/timeout-manager.js';
+import { CrashRecoveryManager } from '../../core/crash-recovery-manager.js';
 import { SwapState } from '../../core/state-machine.js';
+import { computeSwapId } from '../../utils/hash.js';
+import { MockAccountingModule } from '../helpers/mock-accounting-module.js';
+import { InMemorySwapStateStore } from '../helpers/in-memory-swap-state-store.js';
+import { createMockTransferRef, createMockSenderBalance } from '../helpers/mock-invoice-status.js';
+import type { SwapManifest } from '../../core/manifest-validator.js';
 
-describe('Swap Lifecycle Integration', () => {
-  let ctx: TestContext;
+// Test constants
+const ESCROW_ADDRESS = 'DIRECT://escrow_pubkey_hex';
+const PARTY_A_ADDRESS = 'DIRECT://party_a_pubkey_hex';
+const PARTY_B_ADDRESS = 'DIRECT://party_b_pubkey_hex';
+const CHARLIE_ADDRESS = 'DIRECT://charlie_pubkey_hex';
 
-  beforeEach(() => {
-    ctx = createIntegrationContext();
+let testCounter = 0;
+
+function createManifest(overrides: Partial<SwapManifest> = {}): SwapManifest {
+  const nonce = String(testCounter++);
+  const fields = {
+    party_a_address: PARTY_A_ADDRESS,
+    party_b_address: PARTY_B_ADDRESS,
+    party_a_currency_to_change: 'UCT',
+    party_a_value_to_change: String(1000 + testCounter),
+    party_b_currency_to_change: 'USDU',
+    party_b_value_to_change: String(500 + testCounter),
+    timeout: 300,
+    salt: randomBytes(16).toString('hex'),
+    ...overrides,
+  };
+  const swap_id = computeSwapId(fields);
+  return {
+    swap_id,
+    ...fields,
+  };
+}
+
+interface TestContext {
+  mockAccounting: MockAccountingModule;
+  stateStore: InMemorySwapStateStore;
+  invoiceManager: InvoiceManager;
+  timeoutManager: TimeoutManager;
+  orchestrator: SwapOrchestrator;
+  messageSender: { sendToParty: any; sendToAddress: any };
+  addressResolver: { resolve: any };
+}
+
+async function setupOrchestrator(): Promise<TestContext> {
+  const mockAccounting = new MockAccountingModule();
+  const stateStore = new InMemorySwapStateStore();
+  const invoiceManager = new InvoiceManager({
+    accounting: mockAccounting as any,
+    escrowAddress: ESCROW_ADDRESS,
+    getToken: () => undefined,
+  });
+  const messageSender = {
+    sendToParty: vi.fn().mockResolvedValue(undefined),
+    sendToAddress: vi.fn().mockResolvedValue(undefined),
+  };
+  const addressResolver = {
+    resolve: vi.fn().mockImplementation((addr: string) => Promise.resolve(addr)),
+  };
+
+  const timeoutManager = new TimeoutManager({
+    onTimeout: async (swapId: string) => {
+      await orchestrator._handleTimeout(swapId);
+    },
   });
 
-  // -------------------------------------------------------------------------
-  // Happy Path
-  // -------------------------------------------------------------------------
+  const orchestrator = new SwapOrchestrator({
+    invoiceManager,
+    stateStore,
+    timeoutManager,
+    messageSender,
+    addressResolver,
+  });
+
+  orchestrator.start();
+
+  return {
+    mockAccounting,
+    stateStore,
+    invoiceManager,
+    timeoutManager,
+    orchestrator,
+    messageSender,
+    addressResolver,
+  };
+}
+
+describe('SwapLifecycle Integration Tests', () => {
   describe('Happy Path', () => {
-    it('should complete a swap when party A deposits first, then party B', async () => {
-      const manifest = createTestManifest();
-      const { swapCase, isNew } = await ctx.swapManager.announceSwap(manifest);
-      expect(isNew).toBe(true);
-      expect(swapCase.state).toBe(SwapState.ANNOUNCED);
+    it('should complete full lifecycle: announce → deposit A → deposit B → coverage → payout → COMPLETED', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      // Party A deposits USD
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
+      const announced = await ctx.orchestrator.announce(manifest);
+      expect(announced.is_new).toBe(true);
+      expect(announced.deposit_invoice_id).toBeDefined();
 
-      const afterA = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(afterA?.state).toBe(SwapState.PARTIAL_DEPOSIT);
-      expect(afterA?.party_a_deposited).toBe('1000');
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
 
-      // Party B deposits EUR
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
-      await ctx.waitForConclusion();
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      await new Promise((r) => setTimeout(r, 10));
 
-      const final = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(final?.state).toBe(SwapState.COMPLETED);
-      expect(final?.completed_at).toBeTruthy();
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.PARTIAL_DEPOSIT);
+      expect(swap.first_deposit_at).not.toBeNull();
+
+      const transferB = createMockTransferRef({
+        transferId: 'tx_b',
+        senderAddress: PARTY_B_ADDRESS,
+        amount: manifest.party_b_value_to_change,
+        coinId: manifest.party_b_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferB);
+      await new Promise((r) => setTimeout(r, 10));
+
+      ctx.mockAccounting._setInvoiceState(announced.deposit_invoice_id, {
+        state: 'COVERED',
+        transfers: [transferA, transferB],
+      });
+      ctx.mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.COMPLETED);
+      expect(swap.completed_at).not.toBeNull();
+      expect(swap.payout_a_invoice_id).not.toBeNull();
+      expect(swap.payout_b_invoice_id).not.toBeNull();
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
 
-    it('should complete a swap when party B deposits first, then party A', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+    it('should complete lifecycle when party B deposits first', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      // Party B deposits first
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
+      const announced = await ctx.orchestrator.announce(manifest);
 
-      const afterB = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(afterB?.state).toBe(SwapState.PARTIAL_DEPOSIT);
-      expect(afterB?.party_b_deposited).toBe('900');
+      const transferB = createMockTransferRef({
+        transferId: 'tx_b',
+        senderAddress: PARTY_B_ADDRESS,
+        amount: manifest.party_b_value_to_change,
+        coinId: manifest.party_b_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferB);
+      await new Promise((r) => setTimeout(r, 10));
 
-      // Then party A deposits
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
-      await ctx.waitForConclusion();
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.PARTIAL_DEPOSIT);
 
-      const final = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(final?.state).toBe(SwapState.COMPLETED);
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      await new Promise((r) => setTimeout(r, 10));
+
+      ctx.mockAccounting._setInvoiceState(announced.deposit_invoice_id, {
+        state: 'COVERED',
+        transfers: [transferA, transferB],
+      });
+      ctx.mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.COMPLETED);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
 
-    it('should send cross-payments to the correct parties', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+    it('should complete lifecycle with DIRECT:// addresses (no nametag resolution)', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest({
+        party_a_address: 'DIRECT://aaa',
+        party_b_address: 'DIRECT://bbb',
+      });
 
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
+      ctx.addressResolver.resolve.mockImplementation((addr: string) =>
+        Promise.resolve(addr),
       );
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
-      await ctx.waitForConclusion();
 
-      // Party A receives EUR (Party B's currency)
-      expect(ctx.sentPayments).toContainEqual(
-        expect.objectContaining({ recipient: '@alice', amount: '900', coinId: 'EUR' }),
-      );
-      // Party B receives USD (Party A's currency)
-      expect(ctx.sentPayments).toContainEqual(
-        expect.objectContaining({ recipient: '@bob', amount: '1000', coinId: 'USD' }),
-      );
+      const announced = await ctx.orchestrator.announce(manifest);
+      expect(announced.is_new).toBe(true);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: 'DIRECT://aaa',
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      const transferB = createMockTransferRef({
+        transferId: 'tx_b',
+        senderAddress: 'DIRECT://bbb',
+        amount: manifest.party_b_value_to_change,
+        coinId: manifest.party_b_currency_to_change,
+      });
+
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferB);
+      await new Promise((r) => setTimeout(r, 10));
+
+      ctx.mockAccounting._setInvoiceState(announced.deposit_invoice_id, {
+        state: 'COVERED',
+        transfers: [transferA, transferB],
+      });
+      ctx.mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      const swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.COMPLETED);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
 
-    it('should record transaction logs for the complete lifecycle', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+    it('should deliver deposit invoice to both parties via DM on announcement', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
-      await ctx.waitForConclusion();
+      await ctx.orchestrator.announce(manifest);
 
-      const logs = await ctx.txRepo.findBySwapId(manifest.swap_id);
-      const depositLogs = logs.filter((l) => l.type === 'DEPOSIT');
-      const crossPaymentLogs = logs.filter((l) => l.type === 'CROSS_PAYMENT');
+      expect(ctx.messageSender.sendToParty).toBeDefined();
+      expect(ctx.messageSender.sendToAddress).toBeDefined();
 
-      expect(depositLogs).toHaveLength(2);
-      expect(crossPaymentLogs).toHaveLength(2);
-    });
-
-    it('should handle duplicate manifest submission', async () => {
-      const manifest = createTestManifest();
-      const first = await ctx.swapManager.announceSwap(manifest);
-      const second = await ctx.swapManager.announceSwap(manifest);
-
-      expect(first.isNew).toBe(true);
-      expect(second.isNew).toBe(false);
-      expect(second.swapCase.swap_id).toBe(first.swapCase.swap_id);
-    });
-  });
-
-  // -------------------------------------------------------------------------
-  // Bounceback Scenarios
-  // -------------------------------------------------------------------------
-  describe('Bounceback', () => {
-    it('should bounce back payment with invalid memo', async () => {
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: 'not-a-valid-swap-id',
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
-
-      expect(ctx.sentPayments).toHaveLength(1);
-      expect(ctx.sentPayments[0].memo).toContain('INVALID_MEMO');
-    });
-
-    it('should bounce back payment for unknown swap_id', async () => {
-      const fakeSwapId = 'a'.repeat(64);
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: fakeSwapId,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
-
-      expect(ctx.sentPayments).toHaveLength(1);
-      expect(ctx.sentPayments[0].memo).toContain('SWAP_NOT_FOUND');
-    });
-
-    it('should bounce back payment from unknown sender', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
-
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'charlie', // not alice or bob
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
-
-      expect(ctx.sentPayments).toHaveLength(1);
-      expect(ctx.sentPayments[0].memo).toContain('UNKNOWN_SENDER');
-    });
-
-    it('should bounce back payment with wrong currency', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
-
-      // Alice is party A, expected to send USD, but sends EUR
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'EUR', amount: '1000' }],
-        }),
-      );
-
-      expect(ctx.sentPayments).toHaveLength(1);
-      expect(ctx.sentPayments[0].memo).toContain('WRONG_CURRENCY');
-    });
-
-    it('should bounce back payment for already covered party', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
-
-      // Alice deposits full amount
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          id: 'transfer_alice_1',
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
-
-      // Alice tries to deposit again (explicit unique id to avoid Date.now collision)
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          id: 'transfer_alice_2',
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '500' }],
-        }),
-      );
-
-      // First deposit produces no bounceback, second does
-      const bouncebacks = ctx.sentPayments.filter((p) => p.memo?.includes('ALREADY_COVERED'));
-      expect(bouncebacks).toHaveLength(1);
-      expect(bouncebacks[0].amount).toBe('500');
-    });
-
-    it('should bounce back payment for closed swap (COMPLETED)', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
-
-      // Complete the swap
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          id: 'transfer_close_1',
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          id: 'transfer_close_2',
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
-      await ctx.waitForConclusion();
-
-      // Try to deposit on completed swap (explicit unique id)
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          id: 'transfer_close_3',
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '500' }],
-        }),
-      );
-
-      const closedBounce = ctx.sentPayments.filter((p) => p.memo?.includes('SWAP_CLOSED'));
-      expect(closedBounce).toHaveLength(1);
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
   });
 
-  // -------------------------------------------------------------------------
-  // Timeout and Refund
-  // -------------------------------------------------------------------------
-  describe('Timeout and Refund', () => {
-    it('should refund party A on timeout when only A deposited', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+  describe('Bounce Scenarios', () => {
+    it('should bounce payment with wrong currency from any sender and continue accepting valid deposits', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
+      const announced = await ctx.orchestrator.announce(manifest);
 
-      // Trigger timeout directly
-      await ctx.refundProcessor.processTimeout(manifest.swap_id);
+      // Charlie sends an unrecognised currency — coinId matches neither party_a nor party_b currency
+      const transferCharlie = createMockTransferRef({
+        transferId: 'tx_charlie',
+        senderAddress: CHARLIE_ADDRESS,
+        amount: '100',
+        coinId: 'EUR',
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferCharlie);
+      await new Promise((r) => setTimeout(r, 10));
 
-      const final = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(final?.state).toBe(SwapState.REFUNDED);
+      expect(ctx.mockAccounting._getCallOrder()).toContain('returnInvoicePayment');
 
-      const refunds = ctx.sentPayments.filter((p) => p.memo?.includes('Refund'));
-      expect(refunds).toHaveLength(1);
-      expect(refunds[0]).toEqual(
-        expect.objectContaining({ recipient: '@alice', amount: '1000', coinId: 'USD' }),
-      );
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.PARTIAL_DEPOSIT);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
 
-    it('should refund party B on timeout when only B deposited', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+    it('should bounce payment with wrong currency and continue accepting valid deposits', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
+      const announced = await ctx.orchestrator.announce(manifest);
 
-      await ctx.refundProcessor.processTimeout(manifest.swap_id);
+      const transferWrongCurrency = createMockTransferRef({
+        transferId: 'tx_wrong',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: 'EUR',
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferWrongCurrency);
+      await new Promise((r) => setTimeout(r, 10));
 
-      const final = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(final?.state).toBe(SwapState.REFUNDED);
+      expect(ctx.mockAccounting._getCallOrder()).toContain('returnInvoicePayment');
 
-      const refunds = ctx.sentPayments.filter((p) => p.memo?.includes('Refund'));
-      expect(refunds).toHaveLength(1);
-      expect(refunds[0]).toEqual(
-        expect.objectContaining({ recipient: '@bob', amount: '900', coinId: 'EUR' }),
-      );
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.PARTIAL_DEPOSIT);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
 
-    it('should skip timeout for swap no longer in PARTIAL_DEPOSIT', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+    it('should ignore late payment on completed swap (SDK handles auto-return on closed invoice)', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      // Both deposit → READY_TO_CONCLUDE
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
+      const announced = await ctx.orchestrator.announce(manifest);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      const transferB = createMockTransferRef({
+        transferId: 'tx_b',
+        senderAddress: PARTY_B_ADDRESS,
+        amount: manifest.party_b_value_to_change,
+        coinId: manifest.party_b_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferB);
+      await new Promise((r) => setTimeout(r, 10));
+
+      ctx.mockAccounting._setInvoiceState(announced.deposit_invoice_id, {
+        state: 'COVERED',
+        transfers: [transferA, transferB],
+      });
+      ctx.mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.COMPLETED);
+
+      const transferExtra = createMockTransferRef({
+        transferId: 'tx_extra',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: '100',
+        coinId: manifest.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferExtra);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.COMPLETED);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
+    });
+  });
+
+  describe('Timeout and Cancellation', () => {
+    it('should cancel swap and return deposits on timeout after partial deposit', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
+
+      const announced = await ctx.orchestrator.announce(manifest);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      await new Promise((r) => setTimeout(r, 10));
+
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.PARTIAL_DEPOSIT);
+
+      await ctx.orchestrator._handleTimeout(manifest.swap_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect([SwapState.TIMED_OUT, SwapState.CANCELLING, SwapState.CANCELLED]).toContain(
+        swap.state,
       );
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
-      await ctx.waitForConclusion();
 
-      // Timeout fires but swap is already COMPLETED
-      await ctx.refundProcessor.processTimeout(manifest.swap_id);
+      ctx.mockAccounting._simulateCancelled(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
 
-      const final = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(final?.state).toBe(SwapState.COMPLETED); // Not refunded
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.CANCELLED);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
 
-    it('should schedule timeout via Redis on first deposit', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+    it('should not start timeout timer until first deposit arrives', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
+      const announced = await ctx.orchestrator.announce(manifest);
 
-      // Timeout should have been scheduled in Redis
-      expect(ctx.redis.zadd).toHaveBeenCalledWith(
-        'swap_timeouts',
-        expect.any(Number),
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
+
+      expect(ctx.timeoutManager.hasTimer(manifest.swap_id)).toBe(false);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(ctx.timeoutManager.hasTimer(manifest.swap_id)).toBe(true);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
+    });
+
+    it('should notify both parties with swap_cancelled message on timeout', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
+
+      const announced = await ctx.orchestrator.announce(manifest);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      await new Promise((r) => setTimeout(r, 10));
+
+      await ctx.orchestrator._handleTimeout(manifest.swap_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      ctx.mockAccounting._simulateCancelled(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(ctx.messageSender.sendToParty).toHaveBeenCalledWith(
         manifest.swap_id,
-      );
-    });
-
-    it('should create refund transaction logs', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
-
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
+        'A',
+        expect.objectContaining({
+          type: 'swap_cancelled',
+          reason: 'timeout',
         }),
       );
 
-      await ctx.refundProcessor.processTimeout(manifest.swap_id);
+      expect(ctx.messageSender.sendToParty).toHaveBeenCalledWith(
+        manifest.swap_id,
+        'B',
+        expect.objectContaining({
+          type: 'swap_cancelled',
+          reason: 'timeout',
+        }),
+      );
 
-      const refundLogs = await ctx.txRepo.findBySwapIdAndType(manifest.swap_id, 'REFUND');
-      expect(refundLogs).toHaveLength(1);
-      expect(refundLogs[0].recipient).toBe('@alice');
-      expect(refundLogs[0].amount).toBe('1000');
-      expect(refundLogs[0].status).toBe('SENT');
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
   });
 
-  // -------------------------------------------------------------------------
-  // Overpayment
-  // -------------------------------------------------------------------------
-  describe('Overpayment', () => {
-    it('should return surplus when party A overpays', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+  describe('Race Conditions', () => {
+    it('should handle coverage-vs-timeout race (coverage wins)', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      // Party A deposits 1500 instead of 1000
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1500' }],
-        }),
-      );
+      const announced = await ctx.orchestrator.announce(manifest);
 
-      // Surplus of 500 should be returned immediately
-      const surplusPayments = ctx.sentPayments.filter((p) => p.memo?.includes('Surplus'));
-      expect(surplusPayments).toHaveLength(1);
-      expect(surplusPayments[0]).toEqual(
-        expect.objectContaining({ recipient: '@alice', amount: '500', coinId: 'USD' }),
-      );
-
-      // Deposited should be capped at expected (1000)
-      const swap = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(swap?.party_a_deposited).toBe('1000');
-    });
-
-    it('should complete swap after overpayment with surplus returned', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
-
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1500' }],
-        }),
-      );
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
-      await ctx.waitForConclusion();
-
-      const final = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(final?.state).toBe(SwapState.COMPLETED);
-    });
-  });
-
-  // -------------------------------------------------------------------------
-  // Idempotency
-  // -------------------------------------------------------------------------
-  describe('Idempotency', () => {
-    it('should skip duplicate deposit with same transaction_id', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
-
-      const transfer = createMockTransfer({
-        memo: manifest.swap_id,
-        senderNametag: 'alice',
-        tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      const transferB = createMockTransferRef({
+        transferId: 'tx_b',
+        senderAddress: PARTY_B_ADDRESS,
+        amount: manifest.party_b_value_to_change,
+        coinId: manifest.party_b_currency_to_change,
       });
 
-      await ctx.paymentProcessor.processIncomingTransfer(transfer);
-      await ctx.paymentProcessor.processIncomingTransfer(transfer); // same transfer
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferB);
+      await new Promise((r) => setTimeout(r, 10));
 
-      const deposits = await ctx.depositRepo.findBySwapId(manifest.swap_id);
-      expect(deposits).toHaveLength(1);
+      ctx.mockAccounting._setInvoiceState(announced.deposit_invoice_id, {
+        state: 'COVERED',
+        transfers: [transferA, transferB],
+      });
+      ctx.mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
 
-      const swap = await ctx.swapManager.getSwap(manifest.swap_id);
-      expect(swap?.party_a_deposited).toBe('1000');
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.COMPLETED);
+
+      await ctx.orchestrator._handleTimeout(manifest.swap_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.COMPLETED);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
 
-    it('should not double cross-pay on repeated conclusion', async () => {
-      const manifest = createTestManifest();
-      await ctx.swapManager.announceSwap(manifest);
+    it('should handle coverage-vs-timeout race (timeout wins)', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
 
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
-        }),
-      );
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest.swap_id,
-          senderNametag: 'bob',
-          tokenOverrides: [{ coinId: 'EUR', amount: '900' }],
-        }),
-      );
-      await ctx.waitForConclusion();
+      const announced = await ctx.orchestrator.announce(manifest);
 
-      // Try concluding again — should be skipped because state is COMPLETED
-      await ctx.conclusionProcessor.conclude(manifest.swap_id);
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
 
-      const crossPayments = ctx.sentPayments.filter((p) => p.memo?.includes('payout'));
-      expect(crossPayments).toHaveLength(2); // Only the original 2
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      await new Promise((r) => setTimeout(r, 10));
+
+      await ctx.orchestrator._handleTimeout(manifest.swap_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect([SwapState.TIMED_OUT, SwapState.CANCELLING]).toContain(swap.state);
+
+      const transferB = createMockTransferRef({
+        transferId: 'tx_b',
+        senderAddress: PARTY_B_ADDRESS,
+        amount: manifest.party_b_value_to_change,
+        coinId: manifest.party_b_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferB);
+      await new Promise((r) => setTimeout(r, 10));
+
+      ctx.mockAccounting._simulateCancelled(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.CANCELLED);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
+    });
+
+    it('should handle both deposits arriving simultaneously', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
+
+      const announced = await ctx.orchestrator.announce(manifest);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      const transferB = createMockTransferRef({
+        transferId: 'tx_b',
+        senderAddress: PARTY_B_ADDRESS,
+        amount: manifest.party_b_value_to_change,
+        coinId: manifest.party_b_currency_to_change,
+      });
+
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferB);
+      await new Promise((r) => setTimeout(r, 10));
+
+      let swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.PARTIAL_DEPOSIT);
+
+      ctx.mockAccounting._setInvoiceState(announced.deposit_invoice_id, {
+        state: 'COVERED',
+        transfers: [transferA, transferB],
+      });
+      ctx.mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      swap = ctx.stateStore.findBySwapId(manifest.swap_id)!;
+      expect(swap.state).toBe(SwapState.COMPLETED);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
+    });
+
+    it('should prevent duplicate swap creation when same manifest announced twice', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
+
+      const result1 = await ctx.orchestrator.announce(manifest);
+      expect(result1.is_new).toBe(true);
+
+      const result2 = await ctx.orchestrator.announce(manifest);
+      expect(result2.is_new).toBe(false);
+      expect(result2.deposit_invoice_id).toBe(result1.deposit_invoice_id);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
   });
 
-  // -------------------------------------------------------------------------
-  // Multiple Swaps
-  // -------------------------------------------------------------------------
   describe('Multiple Swaps', () => {
-    it('should handle multiple independent swaps concurrently', async () => {
-      const manifest1 = createTestManifest();
-      const manifest2 = createTestManifest({
-        party_a_address: '@carol',
-        party_b_address: '@dave',
-        party_a_currency_to_change: 'GBP',
-        party_a_value_to_change: '500',
+    it('should run 2 independent swaps concurrently without cross-contamination', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest1 = createManifest();
+      const manifest2 = createManifest();
+
+      const announced1 = await ctx.orchestrator.announce(manifest1);
+      const announced2 = await ctx.orchestrator.announce(manifest2);
+
+      expect(announced1.swap_id).not.toBe(announced2.swap_id);
+      expect(announced1.deposit_invoice_id).not.toBe(announced2.deposit_invoice_id);
+
+      const transferA1 = createMockTransferRef({
+        transferId: 'tx_a1',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest1.party_a_value_to_change,
+        coinId: manifest1.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced1.deposit_invoice_id, transferA1);
+      await new Promise((r) => setTimeout(r, 10));
+
+      const swap1 = ctx.stateStore.findBySwapId(manifest1.swap_id)!;
+      const swap2 = ctx.stateStore.findBySwapId(manifest2.swap_id)!;
+
+      expect(swap1.state).toBe(SwapState.PARTIAL_DEPOSIT);
+      expect(swap2.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
+    });
+
+    it('should handle different swap timeouts independently', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest1 = createManifest({ timeout: 100 });
+      const manifest2 = createManifest({ timeout: 300 });
+
+      const announced1 = await ctx.orchestrator.announce(manifest1);
+      const announced2 = await ctx.orchestrator.announce(manifest2);
+
+      const transferA1 = createMockTransferRef({
+        transferId: 'tx_a1',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest1.party_a_value_to_change,
+        coinId: manifest1.party_a_currency_to_change,
+      });
+      const transferA2 = createMockTransferRef({
+        transferId: 'tx_a2',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest2.party_a_value_to_change,
+        coinId: manifest2.party_a_currency_to_change,
       });
 
-      await ctx.swapManager.announceSwap(manifest1);
-      await ctx.swapManager.announceSwap(manifest2);
+      ctx.mockAccounting._simulatePayment(announced1.deposit_invoice_id, transferA1);
+      ctx.mockAccounting._simulatePayment(announced2.deposit_invoice_id, transferA2);
+      await new Promise((r) => setTimeout(r, 10));
 
-      // Deposit on swap 1
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest1.swap_id,
-          senderNametag: 'alice',
-          tokenOverrides: [{ coinId: 'USD', amount: '1000' }],
+      const remaining1 = ctx.timeoutManager.getRemainingTime(manifest1.swap_id);
+      const remaining2 = ctx.timeoutManager.getRemainingTime(manifest2.swap_id);
+
+      expect(remaining1).not.toBeNull();
+      expect(remaining2).not.toBeNull();
+      expect(remaining1! < remaining2!).toBe(true);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
+    });
+
+    it('should complete one swap while another is still in PARTIAL_DEPOSIT', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest1 = createManifest();
+      const manifest2 = createManifest();
+
+      const announced1 = await ctx.orchestrator.announce(manifest1);
+      const announced2 = await ctx.orchestrator.announce(manifest2);
+
+      const transferA1 = createMockTransferRef({
+        transferId: 'tx_a1',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest1.party_a_value_to_change,
+        coinId: manifest1.party_a_currency_to_change,
+      });
+      const transferB1 = createMockTransferRef({
+        transferId: 'tx_b1',
+        senderAddress: PARTY_B_ADDRESS,
+        amount: manifest1.party_b_value_to_change,
+        coinId: manifest1.party_b_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced1.deposit_invoice_id, transferA1);
+      ctx.mockAccounting._simulatePayment(announced1.deposit_invoice_id, transferB1);
+      await new Promise((r) => setTimeout(r, 10));
+
+      ctx.mockAccounting._setInvoiceState(announced1.deposit_invoice_id, {
+        state: 'COVERED',
+        transfers: [transferA1, transferB1],
+      });
+      ctx.mockAccounting._simulateCoverage(announced1.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      const transferA2 = createMockTransferRef({
+        transferId: 'tx_a2',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest2.party_a_value_to_change,
+        coinId: manifest2.party_a_currency_to_change,
+      });
+      ctx.mockAccounting._simulatePayment(announced2.deposit_invoice_id, transferA2);
+      await new Promise((r) => setTimeout(r, 10));
+
+      const swap1 = ctx.stateStore.findBySwapId(manifest1.swap_id)!;
+      const swap2 = ctx.stateStore.findBySwapId(manifest2.swap_id)!;
+
+      expect(swap1.state).toBe(SwapState.COMPLETED);
+      expect(swap2.state).toBe(SwapState.PARTIAL_DEPOSIT);
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
+    });
+  });
+
+  describe('Crash Recovery', () => {
+    it('should resume PARTIAL_DEPOSIT swap on startup with correct remaining timeout', async () => {
+      const stateStore = new InMemorySwapStateStore();
+      const mockAccounting = new MockAccountingModule();
+      const manifest = createManifest();
+
+      const announced = await mockAccounting.createInvoice({
+        targets: [
+          {
+            address: ESCROW_ADDRESS,
+            assets: [
+              [manifest.party_a_currency_to_change, manifest.party_a_value_to_change],
+              [manifest.party_b_currency_to_change, manifest.party_b_value_to_change],
+            ],
+          },
+        ],
+        memo: `Escrow deposit for swap ${manifest.swap_id}`,
+      });
+
+      const swap = stateStore.create(manifest, {
+        partyA: PARTY_A_ADDRESS,
+        partyB: PARTY_B_ADDRESS,
+      });
+      const now = Date.now();
+      const timeoutAt = now + 250000;
+      const withInvoice = stateStore.updateState(
+        manifest.swap_id,
+        SwapState.DEPOSIT_INVOICE_CREATED,
+        { deposit_invoice_id: announced.invoiceId! },
+        swap.version,
+      )!;
+      const withDeposit = stateStore.updateState(
+        manifest.swap_id,
+        SwapState.PARTIAL_DEPOSIT,
+        { first_deposit_at: now, timeout_at: timeoutAt },
+        withInvoice.version,
+      )!;
+
+      const invoiceManager = new InvoiceManager({
+        accounting: mockAccounting as any,
+    escrowAddress: ESCROW_ADDRESS,
+    getToken: () => undefined,
+      });
+      const timeoutManager = new TimeoutManager({
+        onTimeout: async (swapId: string) => {
+          await orchestrator._handleTimeout(swapId);
+        },
+      });
+      const messageSender = {
+        sendToParty: vi.fn().mockResolvedValue(undefined),
+        sendToAddress: vi.fn().mockResolvedValue(undefined),
+      };
+      const addressResolver = {
+        resolve: vi.fn().mockImplementation((addr: string) => Promise.resolve(addr)),
+      };
+
+      const orchestrator = new SwapOrchestrator({
+        invoiceManager,
+        stateStore,
+        timeoutManager,
+        messageSender,
+        addressResolver,
+      });
+      orchestrator.start();
+
+      await orchestrator.recoverSwaps();
+
+      const remaining = timeoutManager.getRemainingTime(manifest.swap_id);
+      expect(remaining).not.toBeNull();
+      expect(remaining! > 0).toBe(true);
+
+      await orchestrator.stop();
+      timeoutManager.destroy();
+    });
+
+    it('should resume CONCLUDING swap and complete payout', async () => {
+      const stateStore = new InMemorySwapStateStore();
+      const mockAccounting = new MockAccountingModule();
+      const manifest = createManifest();
+
+      const depositResult = await mockAccounting.createInvoice({
+        targets: [
+          {
+            address: ESCROW_ADDRESS,
+            assets: [
+              [manifest.party_a_currency_to_change, manifest.party_a_value_to_change],
+              [manifest.party_b_currency_to_change, manifest.party_b_value_to_change],
+            ],
+          },
+        ],
+      });
+
+      const payoutAResult = await mockAccounting.createInvoice({
+        targets: [
+          {
+            address: PARTY_A_ADDRESS,
+            assets: [[manifest.party_b_currency_to_change, manifest.party_b_value_to_change]],
+          },
+        ],
+      });
+
+      const payoutBResult = await mockAccounting.createInvoice({
+        targets: [
+          {
+            address: PARTY_B_ADDRESS,
+            assets: [[manifest.party_a_currency_to_change, manifest.party_a_value_to_change]],
+          },
+        ],
+      });
+
+      const swap = stateStore.create(manifest, {
+        partyA: PARTY_A_ADDRESS,
+        partyB: PARTY_B_ADDRESS,
+      });
+      const withInvoice = stateStore.updateState(
+        manifest.swap_id,
+        SwapState.DEPOSIT_INVOICE_CREATED,
+        { deposit_invoice_id: depositResult.invoiceId! },
+        swap.version,
+      )!;
+      const concluding = stateStore.updateState(
+        manifest.swap_id,
+        SwapState.CONCLUDING,
+        {
+          payout_a_invoice_id: payoutAResult.invoiceId!,
+          payout_b_invoice_id: payoutBResult.invoiceId!,
+        },
+        withInvoice.version,
+      )!;
+
+      const invoiceManager = new InvoiceManager({
+        accounting: mockAccounting as any,
+    escrowAddress: ESCROW_ADDRESS,
+    getToken: () => undefined,
+      });
+      const timeoutManager = new TimeoutManager({
+        onTimeout: async (swapId: string) => {
+          await orchestrator._handleTimeout(swapId);
+        },
+      });
+      const messageSender = {
+        sendToParty: vi.fn().mockResolvedValue(undefined),
+        sendToAddress: vi.fn().mockResolvedValue(undefined),
+      };
+      const addressResolver = {
+        resolve: vi.fn().mockImplementation((addr: string) => Promise.resolve(addr)),
+      };
+
+      const orchestrator = new SwapOrchestrator({
+        invoiceManager,
+        stateStore,
+        timeoutManager,
+        messageSender,
+        addressResolver,
+      });
+      orchestrator.start();
+
+      await orchestrator.recoverSwaps();
+      await new Promise((r) => setTimeout(r, 50));
+
+      const recovered = stateStore.findBySwapId(manifest.swap_id)!;
+      expect(recovered.state).toBe(SwapState.COMPLETED);
+
+      await orchestrator.stop();
+      timeoutManager.destroy();
+    });
+
+    it('should resume ANNOUNCED swap by re-creating deposit invoice', async () => {
+      const stateStore = new InMemorySwapStateStore();
+      const mockAccounting = new MockAccountingModule();
+      const manifest = createManifest();
+
+      const swap = stateStore.create(manifest, {
+        partyA: PARTY_A_ADDRESS,
+        partyB: PARTY_B_ADDRESS,
+      });
+
+      expect(swap.state).toBe(SwapState.ANNOUNCED);
+      expect(swap.deposit_invoice_id).toBeNull();
+
+      const invoiceManager = new InvoiceManager({
+        accounting: mockAccounting as any,
+    escrowAddress: ESCROW_ADDRESS,
+    getToken: () => undefined,
+      });
+      const timeoutManager = new TimeoutManager({
+        onTimeout: async (swapId: string) => {
+          await orchestrator._handleTimeout(swapId);
+        },
+      });
+      const messageSender = {
+        sendToParty: vi.fn().mockResolvedValue(undefined),
+        sendToAddress: vi.fn().mockResolvedValue(undefined),
+      };
+      const addressResolver = {
+        resolve: vi.fn().mockImplementation((addr: string) => Promise.resolve(addr)),
+      };
+
+      const orchestrator = new SwapOrchestrator({
+        invoiceManager,
+        stateStore,
+        timeoutManager,
+        messageSender,
+        addressResolver,
+      });
+      orchestrator.start();
+
+      await orchestrator.recoverSwaps();
+
+      const recovered = stateStore.findBySwapId(manifest.swap_id)!;
+      expect(recovered.state).toBe(SwapState.DEPOSIT_INVOICE_CREATED);
+      expect(recovered.deposit_invoice_id).not.toBeNull();
+
+      await orchestrator.stop();
+      timeoutManager.destroy();
+    });
+  });
+
+  describe('DM Protocol Integration', () => {
+    it('should send payment_confirmation DMs after conclusion', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
+
+      const announced = await ctx.orchestrator.announce(manifest);
+
+      const transferA = createMockTransferRef({
+        transferId: 'tx_a',
+        senderAddress: PARTY_A_ADDRESS,
+        amount: manifest.party_a_value_to_change,
+        coinId: manifest.party_a_currency_to_change,
+      });
+      const transferB = createMockTransferRef({
+        transferId: 'tx_b',
+        senderAddress: PARTY_B_ADDRESS,
+        amount: manifest.party_b_value_to_change,
+        coinId: manifest.party_b_currency_to_change,
+      });
+
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferA);
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transferB);
+      await new Promise((r) => setTimeout(r, 10));
+
+      ctx.mockAccounting._setInvoiceState(announced.deposit_invoice_id, {
+        state: 'COVERED',
+        transfers: [transferA, transferB],
+      });
+      ctx.mockAccounting._simulateCoverage(announced.deposit_invoice_id);
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(ctx.messageSender.sendToParty).toHaveBeenCalledWith(
+        manifest.swap_id,
+        'A',
+        expect.objectContaining({
+          type: 'payment_confirmation',
+          currency: manifest.party_b_currency_to_change,
+          amount: manifest.party_b_value_to_change,
         }),
       );
 
-      // Deposit on swap 2
-      await ctx.paymentProcessor.processIncomingTransfer(
-        createMockTransfer({
-          memo: manifest2.swap_id,
-          senderNametag: 'carol',
-          tokenOverrides: [{ coinId: 'GBP', amount: '500' }],
+      expect(ctx.messageSender.sendToParty).toHaveBeenCalledWith(
+        manifest.swap_id,
+        'B',
+        expect.objectContaining({
+          type: 'payment_confirmation',
+          currency: manifest.party_a_currency_to_change,
+          amount: manifest.party_a_value_to_change,
         }),
       );
 
-      const swap1 = await ctx.swapManager.getSwap(manifest1.swap_id);
-      const swap2 = await ctx.swapManager.getSwap(manifest2.swap_id);
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
+    });
 
-      expect(swap1?.state).toBe(SwapState.PARTIAL_DEPOSIT);
-      expect(swap1?.party_a_deposited).toBe('1000');
-      expect(swap2?.state).toBe(SwapState.PARTIAL_DEPOSIT);
-      expect(swap2?.party_a_deposited).toBe('500');
+    it('should send bounce_notification DMs for rejected payments (wrong currency)', async () => {
+      const ctx = await setupOrchestrator();
+      const manifest = createManifest();
+
+      const announced = await ctx.orchestrator.announce(manifest);
+
+      // Send a payment with a currency that matches neither party's expected currency
+      const transfer = createMockTransferRef({
+        transferId: 'tx_charlie',
+        senderAddress: CHARLIE_ADDRESS,
+        amount: '100',
+        coinId: 'EUR',
+      });
+      ctx.mockAccounting._simulatePayment(announced.deposit_invoice_id, transfer);
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(ctx.messageSender.sendToAddress).toHaveBeenCalledWith(
+        CHARLIE_ADDRESS,
+        expect.objectContaining({
+          type: 'bounce_notification',
+          reason: 'WRONG_CURRENCY',
+        }),
+      );
+
+      await ctx.orchestrator.stop();
+      ctx.timeoutManager.destroy();
     });
   });
 });

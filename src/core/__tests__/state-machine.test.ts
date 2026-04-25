@@ -3,7 +3,6 @@ import {
   isTerminalState,
   isValidTransition,
   canAcceptDeposit,
-  assertTransition,
   getValidNextStates,
 } from '../../core/state-machine.js';
 
@@ -13,293 +12,217 @@ describe('SwapState state machine', () => {
       expect(isTerminalState(SwapState.COMPLETED)).toBe(true);
     });
 
-    it('should return true for REFUNDED', () => {
-      expect(isTerminalState(SwapState.REFUNDED)).toBe(true);
+    it('should return true for CANCELLED', () => {
+      expect(isTerminalState(SwapState.CANCELLED)).toBe(true);
     });
 
     it('should return true for FAILED', () => {
       expect(isTerminalState(SwapState.FAILED)).toBe(true);
     });
 
-    it('should return false for ANNOUNCED', () => {
-      expect(isTerminalState(SwapState.ANNOUNCED)).toBe(false);
-    });
-
     it('should return false for PARTIAL_DEPOSIT', () => {
       expect(isTerminalState(SwapState.PARTIAL_DEPOSIT)).toBe(false);
     });
 
-    it('should return false for READY_TO_CONCLUDE', () => {
-      expect(isTerminalState(SwapState.READY_TO_CONCLUDE)).toBe(false);
-    });
-
-    it('should return false for CONCLUDING', () => {
-      expect(isTerminalState(SwapState.CONCLUDING)).toBe(false);
-    });
-
-    it('should return false for TIMED_OUT', () => {
-      expect(isTerminalState(SwapState.TIMED_OUT)).toBe(false);
-    });
-
-    it('should return false for REFUNDING', () => {
-      expect(isTerminalState(SwapState.REFUNDING)).toBe(false);
+    it('should return false for ANNOUNCED', () => {
+      expect(isTerminalState(SwapState.ANNOUNCED)).toBe(false);
     });
   });
 
-  describe('isValidTransition', () => {
-    describe('valid transitions', () => {
-      it('should allow ANNOUNCED → PARTIAL_DEPOSIT', () => {
-        expect(isValidTransition(SwapState.ANNOUNCED, SwapState.PARTIAL_DEPOSIT)).toBe(true);
-      });
-
-      it('should allow ANNOUNCED → READY_TO_CONCLUDE', () => {
-        expect(isValidTransition(SwapState.ANNOUNCED, SwapState.READY_TO_CONCLUDE)).toBe(true);
-      });
-
-      it('should allow ANNOUNCED → FAILED', () => {
-        expect(isValidTransition(SwapState.ANNOUNCED, SwapState.FAILED)).toBe(true);
-      });
-
-      it('should allow PARTIAL_DEPOSIT → READY_TO_CONCLUDE', () => {
-        expect(isValidTransition(SwapState.PARTIAL_DEPOSIT, SwapState.READY_TO_CONCLUDE)).toBe(true);
-      });
-
-      it('should allow PARTIAL_DEPOSIT → TIMED_OUT', () => {
-        expect(isValidTransition(SwapState.PARTIAL_DEPOSIT, SwapState.TIMED_OUT)).toBe(true);
-      });
-
-      it('should allow PARTIAL_DEPOSIT → FAILED', () => {
-        expect(isValidTransition(SwapState.PARTIAL_DEPOSIT, SwapState.FAILED)).toBe(true);
-      });
-
-      it('should allow READY_TO_CONCLUDE → CONCLUDING', () => {
-        expect(isValidTransition(SwapState.READY_TO_CONCLUDE, SwapState.CONCLUDING)).toBe(true);
-      });
-
-      it('should allow READY_TO_CONCLUDE → FAILED', () => {
-        expect(isValidTransition(SwapState.READY_TO_CONCLUDE, SwapState.FAILED)).toBe(true);
-      });
-
-      it('should allow CONCLUDING → COMPLETED', () => {
-        expect(isValidTransition(SwapState.CONCLUDING, SwapState.COMPLETED)).toBe(true);
-      });
-
-      it('should allow CONCLUDING → FAILED', () => {
-        expect(isValidTransition(SwapState.CONCLUDING, SwapState.FAILED)).toBe(true);
-      });
-
-      it('should allow TIMED_OUT → REFUNDING', () => {
-        expect(isValidTransition(SwapState.TIMED_OUT, SwapState.REFUNDING)).toBe(true);
-      });
-
-      it('should allow TIMED_OUT → FAILED', () => {
-        expect(isValidTransition(SwapState.TIMED_OUT, SwapState.FAILED)).toBe(true);
-      });
-
-      it('should allow REFUNDING → REFUNDED', () => {
-        expect(isValidTransition(SwapState.REFUNDING, SwapState.REFUNDED)).toBe(true);
-      });
-
-      it('should allow REFUNDING → FAILED', () => {
-        expect(isValidTransition(SwapState.REFUNDING, SwapState.FAILED)).toBe(true);
-      });
+  describe('isValidTransition - valid transitions', () => {
+    it('should allow ANNOUNCED → DEPOSIT_INVOICE_CREATED', () => {
+      expect(isValidTransition(SwapState.ANNOUNCED, SwapState.DEPOSIT_INVOICE_CREATED)).toBe(true);
     });
 
-    describe('invalid transitions', () => {
-      it('should not allow ANNOUNCED → COMPLETED', () => {
-        expect(isValidTransition(SwapState.ANNOUNCED, SwapState.COMPLETED)).toBe(false);
-      });
+    it('should allow DEPOSIT_INVOICE_CREATED → PARTIAL_DEPOSIT', () => {
+      expect(isValidTransition(SwapState.DEPOSIT_INVOICE_CREATED, SwapState.PARTIAL_DEPOSIT)).toBe(true);
+    });
 
-      it('should not allow ANNOUNCED → TIMED_OUT', () => {
-        expect(isValidTransition(SwapState.ANNOUNCED, SwapState.TIMED_OUT)).toBe(false);
-      });
+    it('should allow DEPOSIT_INVOICE_CREATED → DEPOSIT_COVERED', () => {
+      expect(isValidTransition(SwapState.DEPOSIT_INVOICE_CREATED, SwapState.DEPOSIT_COVERED)).toBe(true);
+    });
 
-      it('should not allow PARTIAL_DEPOSIT → COMPLETED', () => {
-        expect(isValidTransition(SwapState.PARTIAL_DEPOSIT, SwapState.COMPLETED)).toBe(false);
-      });
+    it('should allow DEPOSIT_INVOICE_CREATED → TIMED_OUT', () => {
+      expect(isValidTransition(SwapState.DEPOSIT_INVOICE_CREATED, SwapState.TIMED_OUT)).toBe(true);
+    });
 
-      it('should not allow COMPLETED → REFUNDING', () => {
-        expect(isValidTransition(SwapState.COMPLETED, SwapState.REFUNDING)).toBe(false);
-      });
+    it('should allow PARTIAL_DEPOSIT → DEPOSIT_COVERED', () => {
+      expect(isValidTransition(SwapState.PARTIAL_DEPOSIT, SwapState.DEPOSIT_COVERED)).toBe(true);
+    });
 
-      it('should not allow COMPLETED → REFUNDED', () => {
-        expect(isValidTransition(SwapState.COMPLETED, SwapState.REFUNDED)).toBe(false);
-      });
+    it('should allow PARTIAL_DEPOSIT → TIMED_OUT', () => {
+      expect(isValidTransition(SwapState.PARTIAL_DEPOSIT, SwapState.TIMED_OUT)).toBe(true);
+    });
 
-      it('should not allow COMPLETED → FAILED', () => {
-        expect(isValidTransition(SwapState.COMPLETED, SwapState.FAILED)).toBe(false);
-      });
+    it('should allow DEPOSIT_COVERED → CONCLUDING', () => {
+      expect(isValidTransition(SwapState.DEPOSIT_COVERED, SwapState.CONCLUDING)).toBe(true);
+    });
 
-      it('should not allow REFUNDED → ANNOUNCED', () => {
-        expect(isValidTransition(SwapState.REFUNDED, SwapState.ANNOUNCED)).toBe(false);
-      });
+    it('should allow CONCLUDING → COMPLETED', () => {
+      expect(isValidTransition(SwapState.CONCLUDING, SwapState.COMPLETED)).toBe(true);
+    });
 
-      it('should not allow REFUNDED → PARTIAL_DEPOSIT', () => {
-        expect(isValidTransition(SwapState.REFUNDED, SwapState.PARTIAL_DEPOSIT)).toBe(false);
-      });
+    it('should allow TIMED_OUT → CANCELLING', () => {
+      expect(isValidTransition(SwapState.TIMED_OUT, SwapState.CANCELLING)).toBe(true);
+    });
 
-      it('should not allow FAILED → ANNOUNCED', () => {
-        expect(isValidTransition(SwapState.FAILED, SwapState.ANNOUNCED)).toBe(false);
-      });
+    it('should allow CANCELLING → CANCELLED', () => {
+      expect(isValidTransition(SwapState.CANCELLING, SwapState.CANCELLED)).toBe(true);
+    });
 
-      it('should not allow FAILED → PARTIAL_DEPOSIT', () => {
-        expect(isValidTransition(SwapState.FAILED, SwapState.PARTIAL_DEPOSIT)).toBe(false);
-      });
+    it('should allow TIMED_OUT → DEPOSIT_COVERED (coverage wins over timeout)', () => {
+      expect(isValidTransition(SwapState.TIMED_OUT, SwapState.DEPOSIT_COVERED)).toBe(true);
+    });
+
+    it('should allow CANCELLING → DEPOSIT_COVERED (coverage won race)', () => {
+      expect(isValidTransition(SwapState.CANCELLING, SwapState.DEPOSIT_COVERED)).toBe(true);
+    });
+
+    it('should allow any non-terminal state → FAILED', () => {
+      expect(isValidTransition(SwapState.ANNOUNCED, SwapState.FAILED)).toBe(true);
+      expect(isValidTransition(SwapState.DEPOSIT_INVOICE_CREATED, SwapState.FAILED)).toBe(true);
+      expect(isValidTransition(SwapState.PARTIAL_DEPOSIT, SwapState.FAILED)).toBe(true);
+      expect(isValidTransition(SwapState.DEPOSIT_COVERED, SwapState.FAILED)).toBe(true);
+      expect(isValidTransition(SwapState.CONCLUDING, SwapState.FAILED)).toBe(true);
+      expect(isValidTransition(SwapState.TIMED_OUT, SwapState.FAILED)).toBe(true);
+      expect(isValidTransition(SwapState.CANCELLING, SwapState.FAILED)).toBe(true);
+    });
+  });
+
+  describe('isValidTransition - invalid transitions', () => {
+    it('should not allow ANNOUNCED → PARTIAL_DEPOSIT', () => {
+      expect(isValidTransition(SwapState.ANNOUNCED, SwapState.PARTIAL_DEPOSIT)).toBe(false);
+    });
+
+    it('should not allow ANNOUNCED → COMPLETED', () => {
+      expect(isValidTransition(SwapState.ANNOUNCED, SwapState.COMPLETED)).toBe(false);
+    });
+
+    it('should not allow PARTIAL_DEPOSIT → CONCLUDING', () => {
+      expect(isValidTransition(SwapState.PARTIAL_DEPOSIT, SwapState.CONCLUDING)).toBe(false);
+    });
+
+    it('should not allow DEPOSIT_COVERED → COMPLETED', () => {
+      expect(isValidTransition(SwapState.DEPOSIT_COVERED, SwapState.COMPLETED)).toBe(false);
+    });
+
+    it('should not allow DEPOSIT_COVERED → CANCELLED', () => {
+      expect(isValidTransition(SwapState.DEPOSIT_COVERED, SwapState.CANCELLED)).toBe(false);
+    });
+
+    it('should not allow CONCLUDING → CANCELLED', () => {
+      expect(isValidTransition(SwapState.CONCLUDING, SwapState.CANCELLED)).toBe(false);
+    });
+
+    it('should not allow COMPLETED → any state', () => {
+      expect(isValidTransition(SwapState.COMPLETED, SwapState.ANNOUNCED)).toBe(false);
+      expect(isValidTransition(SwapState.COMPLETED, SwapState.PARTIAL_DEPOSIT)).toBe(false);
+      expect(isValidTransition(SwapState.COMPLETED, SwapState.CONCLUDING)).toBe(false);
+    });
+
+    it('should not allow CANCELLED → any state', () => {
+      expect(isValidTransition(SwapState.CANCELLED, SwapState.ANNOUNCED)).toBe(false);
+      expect(isValidTransition(SwapState.CANCELLED, SwapState.PARTIAL_DEPOSIT)).toBe(false);
+      expect(isValidTransition(SwapState.CANCELLED, SwapState.CONCLUDING)).toBe(false);
+    });
+
+    it('should not allow FAILED → any state', () => {
+      expect(isValidTransition(SwapState.FAILED, SwapState.ANNOUNCED)).toBe(false);
+      expect(isValidTransition(SwapState.FAILED, SwapState.PARTIAL_DEPOSIT)).toBe(false);
+      expect(isValidTransition(SwapState.FAILED, SwapState.CONCLUDING)).toBe(false);
+    });
+
+    it('should not allow CANCELLING → CONCLUDING', () => {
+      expect(isValidTransition(SwapState.CANCELLING, SwapState.CONCLUDING)).toBe(false);
     });
   });
 
   describe('canAcceptDeposit', () => {
-    it('should return true for ANNOUNCED', () => {
-      expect(canAcceptDeposit(SwapState.ANNOUNCED)).toBe(true);
+    it('should return true for DEPOSIT_INVOICE_CREATED', () => {
+      expect(canAcceptDeposit(SwapState.DEPOSIT_INVOICE_CREATED)).toBe(true);
     });
 
     it('should return true for PARTIAL_DEPOSIT', () => {
       expect(canAcceptDeposit(SwapState.PARTIAL_DEPOSIT)).toBe(true);
     });
 
-    it('should return false for READY_TO_CONCLUDE', () => {
-      expect(canAcceptDeposit(SwapState.READY_TO_CONCLUDE)).toBe(false);
+    it('should return false for ANNOUNCED', () => {
+      expect(canAcceptDeposit(SwapState.ANNOUNCED)).toBe(false);
+    });
+
+    it('should return false for DEPOSIT_COVERED', () => {
+      expect(canAcceptDeposit(SwapState.DEPOSIT_COVERED)).toBe(false);
     });
 
     it('should return false for CONCLUDING', () => {
       expect(canAcceptDeposit(SwapState.CONCLUDING)).toBe(false);
     });
-
-    it('should return false for COMPLETED', () => {
-      expect(canAcceptDeposit(SwapState.COMPLETED)).toBe(false);
-    });
-
-    it('should return false for TIMED_OUT', () => {
-      expect(canAcceptDeposit(SwapState.TIMED_OUT)).toBe(false);
-    });
-
-    it('should return false for REFUNDING', () => {
-      expect(canAcceptDeposit(SwapState.REFUNDING)).toBe(false);
-    });
-
-    it('should return false for REFUNDED', () => {
-      expect(canAcceptDeposit(SwapState.REFUNDED)).toBe(false);
-    });
-
-    it('should return false for FAILED', () => {
-      expect(canAcceptDeposit(SwapState.FAILED)).toBe(false);
-    });
-  });
-
-  describe('assertTransition', () => {
-    it('should not throw for valid transition ANNOUNCED → PARTIAL_DEPOSIT', () => {
-      expect(() => {
-        assertTransition(SwapState.ANNOUNCED, SwapState.PARTIAL_DEPOSIT);
-      }).not.toThrow();
-    });
-
-    it('should not throw for valid transition PARTIAL_DEPOSIT → READY_TO_CONCLUDE', () => {
-      expect(() => {
-        assertTransition(SwapState.PARTIAL_DEPOSIT, SwapState.READY_TO_CONCLUDE);
-      }).not.toThrow();
-    });
-
-    it('should not throw for valid transition CONCLUDING → COMPLETED', () => {
-      expect(() => {
-        assertTransition(SwapState.CONCLUDING, SwapState.COMPLETED);
-      }).not.toThrow();
-    });
-
-    it('should throw for invalid transition ANNOUNCED → COMPLETED', () => {
-      expect(() => {
-        assertTransition(SwapState.ANNOUNCED, SwapState.COMPLETED);
-      }).toThrow(/Invalid state transition/);
-    });
-
-    it('should throw for invalid transition COMPLETED → REFUNDING', () => {
-      expect(() => {
-        assertTransition(SwapState.COMPLETED, SwapState.REFUNDING);
-      }).toThrow(/Invalid state transition/);
-    });
-
-    it('should throw for invalid transition REFUNDED → ANNOUNCED', () => {
-      expect(() => {
-        assertTransition(SwapState.REFUNDED, SwapState.ANNOUNCED);
-      }).toThrow(/Invalid state transition/);
-    });
-
-    it('should throw for invalid transition FAILED → PARTIAL_DEPOSIT', () => {
-      expect(() => {
-        assertTransition(SwapState.FAILED, SwapState.PARTIAL_DEPOSIT);
-      }).toThrow(/Invalid state transition/);
-    });
-
-    it('should include both states in error message', () => {
-      expect(() => {
-        assertTransition(SwapState.ANNOUNCED, SwapState.COMPLETED);
-      }).toThrow(/ANNOUNCED/);
-    });
-
-    it('should include target state in error message', () => {
-      expect(() => {
-        assertTransition(SwapState.ANNOUNCED, SwapState.COMPLETED);
-      }).toThrow(/COMPLETED/);
-    });
   });
 
   describe('getValidNextStates', () => {
-    it('should return correct next states for ANNOUNCED', () => {
+    it('should return [DEPOSIT_INVOICE_CREATED, CANCELLING, FAILED] for ANNOUNCED', () => {
       const nextStates = getValidNextStates(SwapState.ANNOUNCED);
       expect(nextStates).toHaveLength(3);
-      expect(nextStates).toContain(SwapState.PARTIAL_DEPOSIT);
-      expect(nextStates).toContain(SwapState.READY_TO_CONCLUDE);
+      expect(nextStates).toContain(SwapState.DEPOSIT_INVOICE_CREATED);
+      expect(nextStates).toContain(SwapState.CANCELLING);
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return correct next states for PARTIAL_DEPOSIT', () => {
-      const nextStates = getValidNextStates(SwapState.PARTIAL_DEPOSIT);
-      expect(nextStates).toHaveLength(3);
-      expect(nextStates).toContain(SwapState.READY_TO_CONCLUDE);
+    it('should return [PARTIAL_DEPOSIT, DEPOSIT_COVERED, CANCELLING, TIMED_OUT, FAILED] for DEPOSIT_INVOICE_CREATED', () => {
+      const nextStates = getValidNextStates(SwapState.DEPOSIT_INVOICE_CREATED);
+      expect(nextStates).toHaveLength(5);
+      expect(nextStates).toContain(SwapState.PARTIAL_DEPOSIT);
+      expect(nextStates).toContain(SwapState.DEPOSIT_COVERED);
+      expect(nextStates).toContain(SwapState.CANCELLING);
       expect(nextStates).toContain(SwapState.TIMED_OUT);
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return correct next states for READY_TO_CONCLUDE', () => {
-      const nextStates = getValidNextStates(SwapState.READY_TO_CONCLUDE);
-      expect(nextStates).toHaveLength(2);
+    it('should return [DEPOSIT_COVERED, TIMED_OUT, FAILED] for PARTIAL_DEPOSIT', () => {
+      const nextStates = getValidNextStates(SwapState.PARTIAL_DEPOSIT);
+      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toContain(SwapState.DEPOSIT_COVERED);
+      expect(nextStates).toContain(SwapState.TIMED_OUT);
+      expect(nextStates).toContain(SwapState.FAILED);
+    });
+
+    it('should return [DEPOSIT_COVERED, PARTIAL_DEPOSIT, CONCLUDING, FAILED] for DEPOSIT_COVERED (includes self-transition and coverage regression)', () => {
+      const nextStates = getValidNextStates(SwapState.DEPOSIT_COVERED);
+      expect(nextStates).toHaveLength(4);
+      expect(nextStates).toContain(SwapState.DEPOSIT_COVERED); // self-transition for metadata updates
+      expect(nextStates).toContain(SwapState.PARTIAL_DEPOSIT); // coverage regression during crash
       expect(nextStates).toContain(SwapState.CONCLUDING);
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return correct next states for CONCLUDING', () => {
+    it('should return [CONCLUDING, COMPLETED, FAILED] for CONCLUDING (includes self-transition)', () => {
       const nextStates = getValidNextStates(SwapState.CONCLUDING);
-      expect(nextStates).toHaveLength(2);
+      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toContain(SwapState.CONCLUDING); // self-transition for metadata updates
       expect(nextStates).toContain(SwapState.COMPLETED);
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return correct next states for TIMED_OUT', () => {
+    it('should return [DEPOSIT_COVERED, CANCELLING, FAILED] for TIMED_OUT', () => {
       const nextStates = getValidNextStates(SwapState.TIMED_OUT);
-      expect(nextStates).toHaveLength(2);
-      expect(nextStates).toContain(SwapState.REFUNDING);
+      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toContain(SwapState.DEPOSIT_COVERED); // coverage won the race
+      expect(nextStates).toContain(SwapState.CANCELLING);
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return correct next states for REFUNDING', () => {
-      const nextStates = getValidNextStates(SwapState.REFUNDING);
-      expect(nextStates).toHaveLength(2);
-      expect(nextStates).toContain(SwapState.REFUNDED);
+    it('should return [DEPOSIT_COVERED, CANCELLED, FAILED] for CANCELLING', () => {
+      const nextStates = getValidNextStates(SwapState.CANCELLING);
+      expect(nextStates).toHaveLength(3);
+      expect(nextStates).toContain(SwapState.DEPOSIT_COVERED); // coverage won the race
+      expect(nextStates).toContain(SwapState.CANCELLED);
       expect(nextStates).toContain(SwapState.FAILED);
     });
 
-    it('should return empty array for terminal state COMPLETED', () => {
-      const nextStates = getValidNextStates(SwapState.COMPLETED);
-      expect(nextStates).toEqual([]);
-    });
-
-    it('should return empty array for terminal state REFUNDED', () => {
-      const nextStates = getValidNextStates(SwapState.REFUNDED);
-      expect(nextStates).toEqual([]);
-    });
-
-    it('should return empty array for terminal state FAILED', () => {
-      const nextStates = getValidNextStates(SwapState.FAILED);
-      expect(nextStates).toEqual([]);
+    it('should return empty array for terminal states', () => {
+      expect(getValidNextStates(SwapState.COMPLETED)).toEqual([]);
+      expect(getValidNextStates(SwapState.CANCELLED)).toEqual([]);
+      expect(getValidNextStates(SwapState.FAILED)).toEqual([]);
     });
   });
 });

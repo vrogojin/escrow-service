@@ -10,9 +10,9 @@ This is a **trusted escrow service** for executing currency swaps on the Unicity
 
 The core entity is a **swap manifest** — a JSON object containing:
 - `swap_id`: 64 hex digits, derived as a hash of the manifest contents
-- `party_A_address`, `party_B_address`: nametag/proxy or direct addresses
-- `party_A_currency_to_change`, `party_A_value_to_change`
-- `party_B_currency_to_change`, `party_B_value_to_change`
+- `party_a_address`, `party_b_address`: nametag/proxy or direct addresses
+- `party_a_currency_to_change`, `party_a_value_to_change`
+- `party_b_currency_to_change`, `party_b_value_to_change`
 - `timeout`: seconds to wait from first deposit before auto-concluding
 
 ## Swap Lifecycle (5 phases)

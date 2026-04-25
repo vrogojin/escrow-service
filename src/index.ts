@@ -1,166 +1,166 @@
+import * as fs from 'node:fs';
 import { loadConfig } from './config.js';
-import { getPool, closePool, migrate } from './storage/database.js';
-import { connectRedis, closeRedis } from './storage/redis.js';
 import { initializeWallet } from './sphere/wallet-manager.js';
-import { createPaymentSender } from './sphere/payment-sender.js';
-import { createPaymentListener } from './sphere/payment-listener.js';
 import { createMessageHandler } from './sphere/message-handler.js';
-import { SwapRepository } from './storage/repositories/swap.repository.js';
-import { DepositRepository } from './storage/repositories/deposit.repository.js';
-import { TransactionRepository } from './storage/repositories/transaction.repository.js';
-import { SwapManager } from './core/swap-manager.js';
-import { PaymentProcessor } from './core/payment-processor.js';
-import { ConclusionProcessor } from './core/conclusion-processor.js';
-import { RefundProcessor } from './core/refund-processor.js';
+import { SwapOrchestrator } from './core/swap-orchestrator.js';
+import { InvoiceManager } from './core/invoice-manager.js';
+import type { InvoiceManagerDeps } from './core/invoice-manager.js';
+import { DurableSwapStateStore } from './core/durable-swap-state-store.js';
+import { DurableNpubRoleMap } from './core/durable-npub-role-map.js';
 import { TimeoutManager } from './core/timeout-manager.js';
-import { SwapState } from './core/state-machine.js';
 import { logger } from './utils/logger.js';
+import type {
+  SwapOrchestrator as ISwapOrchestrator,
+} from './sphere/orchestrator-interfaces.js';
 
 async function main(): Promise<void> {
   const config = loadConfig();
   logger.info({ nodeEnv: config.nodeEnv }, 'Starting escrow service');
 
-  // 1. Initialize PostgreSQL pool + run migration
-  const pool = getPool(config.databaseUrl);
-  await migrate(config.databaseUrl);
-  logger.info('Database initialized');
-
-  // 2. Initialize Redis client
-  const redis = await connectRedis(config.redisUrl);
-  logger.info('Redis connected');
-
-  // 3. Initialize Sphere wallet
+  // 1. Initialize Sphere wallet
   const walletManager = await initializeWallet(config);
   const sphere = walletManager.getSphere();
   const escrowAddress = walletManager.getEscrowAddress();
   logger.info({ escrowAddress }, 'Sphere wallet ready');
 
-  // 4. Create repositories
-  const swapRepo = new SwapRepository(pool);
-  const depositRepo = new DepositRepository(pool);
-  const txRepo = new TransactionRepository(pool);
-
-  // 5. Create payment infrastructure
-  const paymentSender = createPaymentSender(sphere);
-  const paymentListener = createPaymentListener(sphere);
-
-  // 6. Create processors
-  const conclusionProcessor = new ConclusionProcessor({
-    pool,
-    swapRepo,
-    txRepo,
-    paymentSender,
+  // 2. Create invoice-based infrastructure
+  // Access the AccountingModule via the Sphere instance.
+  // The SDK's main export type does not expose the accounting property in all
+  // configurations, so we use a type-safe property existence check instead of
+  // a blanket `as any` cast.
+  if (!sphere.accounting) {
+    throw new Error('AccountingModule not available — ensure Sphere is initialized with accounting enabled');
+  }
+  const invoiceManager = new InvoiceManager({
+    accounting: sphere.accounting as unknown as InvoiceManagerDeps['accounting'],
     escrowAddress,
-    config,
+    getToken: (id) => sphere.payments.getToken(id),
+    eventSource: sphere,
+    receiveAndFinalize: async () => { await sphere.payments.receive({ finalize: true }); },
   });
 
-  const refundProcessor = new RefundProcessor({
-    pool,
-    swapRepo,
-    txRepo,
-    paymentSender,
-    escrowAddress,
-    config,
-  });
+  // Create durable data directory for WAL files
+  fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
 
+  const stateStore = new DurableSwapStateStore(config.dataDir);
+  const npubRoleStore = new DurableNpubRoleMap(config.dataDir);
+
+  // 3. Create orchestrator with timeout manager
+  // Use a late-bound callback to break the circular dependency between
+  // timeoutManager and orchestrator (same pattern as tests).
+  let orchestratorRef: SwapOrchestrator;
   const timeoutManager = new TimeoutManager({
-    pool,
-    swapRepo,
-    redis,
-    onTimeout: (swapId: string) => refundProcessor.processTimeout(swapId),
+    onTimeout: async (swapId: string) => orchestratorRef._handleTimeout(swapId),
   });
 
-  const paymentProcessor = new PaymentProcessor({
-    pool,
-    redis,
-    swapRepo,
-    depositRepo,
-    txRepo,
-    paymentSender,
-    escrowAddress,
-    onReadyToConclude: (swapId: string) => {
-      conclusionProcessor.conclude(swapId).catch((err) => {
-        logger.error({ err, swap_id: swapId }, 'Conclusion failed');
-      });
+  const orchestrator = new SwapOrchestrator({
+    invoiceManager,
+    stateStore,
+    timeoutManager,
+    messageSender: {
+      sendToParty: async (swapId, party, message) => {
+        const npub = npubRoleStore.findNpub(swapId, party);
+        if (!npub) {
+          logger.warn({ swapId, party }, 'No npub found for party — DM not sent');
+          return;
+        }
+        try {
+          await sphere.communications.sendDM(npub, JSON.stringify(message));
+        } catch (err) {
+          logger.warn({ err, swapId, party }, 'Failed to send DM to party');
+        }
+      },
+      sendToAddress: async (address, message) => {
+        // Primary: look up npub from the address-to-npub index (populated during announce)
+        const npub = npubRoleStore.findNpubByAddress(address);
+        if (npub) {
+          try {
+            await sphere.communications.sendDM(npub, JSON.stringify(message));
+            return;
+          } catch (err) {
+            logger.warn({ err, address }, 'Failed to send DM via cached npub');
+          }
+        }
+        // Fallback: third-party depositor — not in our role map. Bounce notifications
+        // are undeliverable. Escalate to WARN for operator visibility.
+        logger.warn({ address, type: (message as Record<string, unknown>).type }, 'Bounce DM undeliverable — sender not in role map');
+      },
     },
-    onFirstDeposit: (swapId: string, timeoutSeconds: number) => {
-      timeoutManager.scheduleTimeout(swapId, timeoutSeconds).catch((err) => {
-        logger.error({ err, swap_id: swapId }, 'Failed to schedule timeout');
-      });
+    addressResolver: {
+      resolve: async (address) => {
+        if (address.startsWith('DIRECT://')) return address;
+        if (address.startsWith('PROXY://')) {
+          logger.warn({ address }, 'PROXY:// address resolution not yet supported');
+          return null;
+        }
+        try {
+          const peer = await sphere.resolve(address);
+          return peer?.directAddress ?? null;
+        } catch (err) {
+          logger.warn({ err, address }, 'Address resolution failed');
+          return null;
+        }
+      },
     },
-    sphere,
-    depositConfirmationTimeoutMs: config.depositConfirmationTimeoutMs,
+    maxPendingSwaps: config.maxPendingSwaps,
   });
 
-  // 7. Create swap manager
-  const swapManager = new SwapManager({
-    pool,
-    swapRepo,
-    depositRepo,
-    config,
-  });
+  // 4. Start orchestrator (subscribes to invoice events)
+  orchestratorRef = orchestrator;
+  orchestrator.start();
 
-  // 8. Start payment listener
-  paymentListener.start((transfer) => paymentProcessor.processIncomingTransfer(transfer));
+  // 5. Crash recovery: reconcile non-terminal swaps
+  await orchestrator.recoverSwaps();
 
-  // 9. Start timeout manager with recovery
-  await timeoutManager.recover();
-  timeoutManager.start();
+  // Compact WAL after crash recovery to rewrite clean state
+  stateStore.compact();
 
-  // 10. Startup recovery: retry stuck swaps
-  await recoverStuckSwaps(swapRepo, conclusionProcessor, refundProcessor);
-
-  // 11. Start DM message handler
+  // 6. Start DM message handler with durable NpubRoleMap
   const messageHandler = createMessageHandler({
     sphere,
-    swapManager,
-    depositRepo,
-    txRepo,
-    walletManager,
+    orchestrator: orchestrator as ISwapOrchestrator,
+    stateStore,
+    invoiceManager,
+    npubRoleMap: npubRoleStore,
+    escrowAddress,
   });
   messageHandler.start();
 
-  // 12. Graceful shutdown
-  setupGracefulShutdown(messageHandler, paymentListener, timeoutManager, walletManager);
+  // 8. Catch-up: replay any DMs that arrived while the service was offline.
+  // NIP-17 gift wraps have created_at randomized ±2 days; the sphere-sdk transport
+  // now widens the since filter by 172800 s, so this call retrieves DMs that
+  // would otherwise be invisible due to timestamp drift.
+  await sphere.fetchPendingEvents().catch((err) => {
+    logger.warn({ err }, 'fetchPendingEvents failed on startup — missed DMs may not be replayed');
+  });
+
+  // 8. Periodic token receive loop.
+  // Uses payments.receive() which fetches pending Nostr events AND finalizes
+  // unconfirmed tokens (triggers transfer:confirmed → invoice:covered with confirmed=true).
+  // The receive() → load() cycle reloads tokens from disk, which is safe as long
+  // as addToken() → save() completes before the next receive() call.
+  const RECEIVE_INTERVAL_MS = 15_000;
+  const receiveLoop = setInterval(async () => {
+    try {
+      await sphere.payments.receive({ finalize: true });
+    } catch (err) {
+      logger.debug({ err }, 'Receive loop error (tolerated)');
+    }
+  }, RECEIVE_INTERVAL_MS);
+
+  // 7. Graceful shutdown
+  setupGracefulShutdown(messageHandler, orchestrator, walletManager, receiveLoop, stateStore, npubRoleStore);
 
   logger.info('Escrow service started successfully');
 }
 
-async function recoverStuckSwaps(
-  swapRepo: SwapRepository,
-  conclusionProcessor: ConclusionProcessor,
-  refundProcessor: RefundProcessor,
-): Promise<void> {
-  // Retry swaps stuck in CONCLUDING
-  const concludingResult = await swapRepo.findByState(SwapState.CONCLUDING);
-  for (const swap of concludingResult) {
-    logger.warn({ swap_id: swap.swap_id }, 'Retrying stuck CONCLUDING swap');
-    conclusionProcessor.conclude(swap.swap_id).catch((err) => {
-      logger.error({ err, swap_id: swap.swap_id }, 'Recovery conclusion failed');
-    });
-  }
-
-  // Retry swaps stuck in REFUNDING
-  const refundingResult = await swapRepo.findByState(SwapState.REFUNDING);
-  for (const swap of refundingResult) {
-    logger.warn({ swap_id: swap.swap_id }, 'Retrying stuck REFUNDING swap');
-    refundProcessor.retryRefund(swap.swap_id).catch((err) => {
-      logger.error({ err, swap_id: swap.swap_id }, 'Recovery refund failed');
-    });
-  }
-
-  // Log FAILED swaps for manual review
-  const failedCount = await swapRepo.countByState(SwapState.FAILED);
-  if (failedCount > 0) {
-    logger.warn({ count: failedCount }, 'FAILED swaps require manual review');
-  }
-}
-
 function setupGracefulShutdown(
   messageHandler: { stop(): Promise<void> },
-  paymentListener: { stop(): void },
-  timeoutManager: TimeoutManager,
+  orchestrator: SwapOrchestrator,
   walletManager: { destroy(): Promise<void> },
+  receiveLoop: ReturnType<typeof setInterval>,
+  stateStore: DurableSwapStateStore,
+  npubRoleStore: DurableNpubRoleMap,
 ): void {
   let shuttingDown = false;
 
@@ -169,29 +169,33 @@ function setupGracefulShutdown(
     shuttingDown = true;
     logger.info({ signal }, 'Graceful shutdown initiated');
 
-    // Hard-kill fallback if graceful shutdown hangs
     const hardKill = setTimeout(() => {
       logger.error('Graceful shutdown timed out, forcing exit');
       process.exit(1);
     }, 30_000);
     hardKill.unref();
 
-    // Stop accepting new messages and drain in-flight handlers
-    await messageHandler.stop();
+    clearInterval(receiveLoop);
+    await messageHandler.stop().catch((err) => {
+      logger.error({ err }, 'Error stopping message handler');
+    });
+    await orchestrator.stop();
 
-    // Stop payment listener and timeout manager
-    paymentListener.stop();
-    timeoutManager.stop();
+    // Compact WAL files on clean shutdown
+    try {
+      stateStore.compact();
+      npubRoleStore.compact((swapId) => {
+        const swap = stateStore.findBySwapId(swapId);
+        if (!swap) return true; // unknown swap = treat as terminal
+        return swap.state === 'COMPLETED' || swap.state === 'CANCELLED' || swap.state === 'FAILED';
+      });
+      logger.info('WAL files compacted');
+    } catch (err) {
+      logger.error({ err }, 'Error compacting WAL files during shutdown');
+    }
 
-    // Close connections
     await walletManager.destroy().catch((err) => {
       logger.error({ err }, 'Error destroying wallet');
-    });
-    await closeRedis().catch((err) => {
-      logger.error({ err }, 'Error closing Redis');
-    });
-    await closePool().catch((err) => {
-      logger.error({ err }, 'Error closing database pool');
     });
 
     logger.info('Shutdown complete');

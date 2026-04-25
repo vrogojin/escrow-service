@@ -10,6 +10,7 @@ describe('hash utilities', () => {
     party_b_currency_to_change: 'EUR',
     party_b_value_to_change: '90.00',
     timeout: 3600,
+    salt: 'a1b2c3d4e5f6a7b8a1b2c3d4e5f6a7b8',
   };
 
   describe('computeSwapId', () => {
