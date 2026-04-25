@@ -30,9 +30,12 @@ import { join } from 'node:path';
 
 // ACP-adapter local modules (copied from agentic-hosting during decoupling)
 import { parseTenantConfig } from './shared/tenant-config.js';
-import { createAcpMessage, isValidAcpMessage } from './protocols/acp.js';
-import type { AcpMessage, AcpCommandPayload } from './protocols/acp.js';
-import { serializeMessage } from './protocols/envelope.js';
+import {
+  createAcpMessage,
+  isAcpCommandPayload,
+  isAcpHelloAckPayload,
+} from './protocols/acp.js';
+import { isTimestampFresh, parseAcpJson, serializeMessage } from './protocols/envelope.js';
 import { pubkeysEqual } from './shared/crypto.js';
 import { resolveApiKey } from './shared/api-key.js';
 import { createReplayGuard } from './shared/replay-guard.js';
@@ -205,6 +208,12 @@ export async function startEscrow(): Promise<void> {
   // visible to future contributors).
   const ESCROW_SYSTEM_COMMANDS = new Set(['STATUS', 'SHUTDOWN_GRACEFUL']);
 
+  // Heartbeat interval bounds: 1s floor matches the spec minimum; 5min ceiling
+  // prevents a malicious/buggy manager from pushing the tenant into a near-
+  // infinite "appear-alive" silence by sending an absurdly large interval.
+  const HEARTBEAT_MIN_MS = 1_000;
+  const HEARTBEAT_MAX_MS = 300_000;
+
   const acpUnsubscribe = sphere.on('message:dm', (msg: DirectMessage) => {
     const senderPubkey = msg.senderPubkey;
     const content = msg.content;
@@ -215,18 +224,30 @@ export async function startEscrow(): Promise<void> {
     // Only handle ACP messages from the manager
     if (!pubkeysEqual(senderPubkey, config.manager_pubkey)) return;
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
+    // Single-call boundary parser: size cap + JSON.parse + dangerous-keys + structural validator.
+    // Returns null on any of those failures so we don't have to repeat the
+    // size/JSON/proto-pollution checks at every call site.
+    const acpMsg = parseAcpJson(content);
+    if (acpMsg === null) return;
+
+    // Clock-skew gate: defense-in-depth on top of the content-hash replay guard.
+    // A captured DM replayed AFTER the replay-guard TTL (or against a fresh
+    // container with empty replay log) would otherwise execute again. The
+    // structural validator only requires `ts_ms` to be a finite number —
+    // freshness is a separate liveness invariant and must be enforced here,
+    // BEFORE the replay-guard records the hash (so a stale message doesn't
+    // poison the dedup cache).
+    if (!isTimestampFresh(acpMsg.ts_ms)) {
+      log.debug(
+        { msg_id: acpMsg.msg_id, type: acpMsg.type, ts_ms: acpMsg.ts_ms },
+        'acp_ts_ms_out_of_window',
+      );
       return;
     }
 
-    if (!isValidAcpMessage(parsed)) return;
-    const acpMsg = parsed as AcpMessage;
-
     // Replay guard: reject content we've seen before within the retention window.
-    // Applied AFTER shape validation so malformed messages don't burn dedup slots.
+    // Applied AFTER shape validation AND freshness check so malformed/stale messages
+    // don't burn dedup slots.
     if (!acpReplayGuard.check(content)) {
       log.debug({ msg_id: acpMsg.msg_id, type: acpMsg.type }, 'acp_replay_rejected');
       return;
@@ -234,7 +255,11 @@ export async function startEscrow(): Promise<void> {
 
     switch (acpMsg.type) {
       case 'acp.hello_ack': {
-        const payload = acpMsg.payload as { accepted?: boolean; heartbeat_interval_ms?: number };
+        if (!isAcpHelloAckPayload(acpMsg.payload)) {
+          log.debug({ msg_id: acpMsg.msg_id }, 'acp_hello_ack_payload_invalid');
+          break;
+        }
+        const payload = acpMsg.payload;
         if (payload.accepted === false) {
           log.warn({ instance_id: config.instance_id }, 'hello_ack_rejected');
           break;
@@ -242,11 +267,15 @@ export async function startEscrow(): Promise<void> {
         // Clear boot token from env after successful handshake
         delete process.env['UNICITY_BOOT_TOKEN'];
 
-        // Start heartbeat
-        const interval = Math.max(
-          typeof payload.heartbeat_interval_ms === 'number' ? payload.heartbeat_interval_ms : config.heartbeat_interval_ms,
-          1000,
-        );
+        // Start heartbeat. The guard already rejects NaN/Infinity/<=0 for the
+        // optional manager-supplied value, so by this point either the value
+        // is a finite positive number, or it's undefined and we use the
+        // configured default. Clamp to [HEARTBEAT_MIN_MS, HEARTBEAT_MAX_MS]
+        // to bound abuse.
+        const requested = typeof payload.heartbeat_interval_ms === 'number'
+          ? payload.heartbeat_interval_ms
+          : config.heartbeat_interval_ms;
+        const interval = Math.min(Math.max(requested, HEARTBEAT_MIN_MS), HEARTBEAT_MAX_MS);
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         heartbeatInterval = setInterval(() => {
           const hb = createAcpMessage('acp.heartbeat', config.instance_id, config.instance_name, {
@@ -272,18 +301,11 @@ export async function startEscrow(): Promise<void> {
       }
 
       case 'acp.command': {
-        const cmdPayload = acpMsg.payload as unknown as AcpCommandPayload;
-        if (typeof cmdPayload.name !== 'string' || typeof cmdPayload.command_id !== 'string') {
-          const errResponse = createAcpMessage('acp.error', config.instance_id, config.instance_name, {
-            command_id: typeof cmdPayload.command_id === 'string' ? cmdPayload.command_id : '',
-            ok: false,
-            error_code: 'INVALID_PAYLOAD',
-            message: 'acp.command requires string command_id and name fields',
-          });
-          sphere.communications.sendDM(managerAddress, serializeMessage(errResponse)).catch(() => {});
+        if (!isAcpCommandPayload(acpMsg.payload)) {
+          log.debug({ msg_id: acpMsg.msg_id }, 'acp_command_payload_invalid');
           break;
         }
-
+        const cmdPayload = acpMsg.payload;
         const commandName = cmdPayload.name.toUpperCase();
 
         // Reject non-allowlisted commands explicitly.

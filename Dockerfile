@@ -23,7 +23,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Build
 # ---------------------------------------------------------------------------
-FROM node:22-alpine AS build
+FROM node:22-alpine@sha256:8ea2348b068a9544dae7317b4f3aafcdc032df1647bb7d768a05a5cad1a7683f AS build
 
 WORKDIR /build
 
@@ -44,7 +44,7 @@ RUN cd escrow-service && npm ci && npm run build
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
 # ---------------------------------------------------------------------------
-FROM node:22-alpine
+FROM node:22-alpine@sha256:8ea2348b068a9544dae7317b4f3aafcdc032df1647bb7d768a05a5cad1a7683f
 
 # tini handles PID-1 signal forwarding so SIGTERM from the host manager
 # triggers our graceful-shutdown handler instead of being swallowed.
