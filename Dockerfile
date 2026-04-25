@@ -1,71 +1,80 @@
-# Escrow Service ACP Template — Docker image
-# Wraps the escrow-service in the ACP tenant framework so it can be
-# spawned via hm.spawn like any other tenant.
+# Escrow Service — Docker image
 #
-# Build context: parent directory (needs agentic_hosting/, sphere-sdk/, escrow-service/)
-# Build: cd .. && docker build -f escrow-service/Dockerfile -t ghcr.io/unicitynetwork/agentic-hosting/escrow:0.1 .
-# Run:   Spawned by the Host Manager via hm.spawn (not run directly)
+# Two ways to run the resulting image:
+#   1. As a standalone service (the original entrypoint, dist/index.js)
+#   2. As a tenant under the agentic-hosting Host Manager via the ACP adapter
+#      (dist/acp-adapter/main.js — selected by overriding CMD).
+#
+# The default CMD targets the ACP adapter, since this image is published to
+# `ghcr.io/unicitynetwork/agentic-hosting/escrow:0.1` and consumed by the host
+# manager. Standalone deployments can override CMD with ["node", "/app/dist/index.js"].
+#
+# Build context:
+#   - escrow-service repo (this directory)
+#   - sphere-sdk sibling at ../sphere-sdk (until @unicitylabs/sphere-sdk
+#     publishes the swap-module exports to npm)
+#
+# Build:
+#   cd /path/to/parent && \
+#   docker build -f escrow-service/Dockerfile \
+#                -t ghcr.io/unicitynetwork/agentic-hosting/escrow:0.1 \
+#                .
 
+# ---------------------------------------------------------------------------
 # Stage 1: Build
+# ---------------------------------------------------------------------------
 FROM node:22-alpine AS build
 
 WORKDIR /build
 
-# Copy package files and dependencies from the parent build context
-COPY agentic_hosting/package.json agentic_hosting/package-lock.json ./
+# sphere-sdk is consumed via `file:../sphere-sdk` and must be built (compiled
+# to dist/) before npm install can resolve the file: link to its declared
+# exports. Both repos must be present in the build context.
 COPY sphere-sdk/ ./sphere-sdk/
 COPY escrow-service/ ./escrow-service/
 
-# Rewrite file: references to point to local copies inside the build context
-RUN sed -i 's|"file:../sphere-sdk"|"file:./sphere-sdk"|' package.json \
- && sed -i 's|"file:../escrow-service"|"file:./escrow-service"|' package.json \
- && npm install
+# Build sphere-sdk in-place so its dist/ exists when escrow-service does its
+# install. (file: dependencies install via symlink — they aren't copied, so we
+# need the dist artifacts beside the package.json the link points at.)
+RUN cd sphere-sdk && npm ci && npm run build
 
-# Build escrow-service first (produces dist/ with .d.ts for type resolution)
-RUN cd escrow-service && npx tsc
+# Install + build escrow-service (compiles src/ + src/acp-adapter/ to dist/).
+RUN cd escrow-service && npm ci && npm run build
 
-# Copy source code and build configuration
-COPY agentic_hosting/src/ ./src/
-COPY agentic_hosting/tsconfig.json agentic_hosting/tsup.config.ts ./
-
-# Build TypeScript (tsup bundles escrow entry point with escrow-service deps)
-RUN npx tsup
-
+# ---------------------------------------------------------------------------
 # Stage 2: Runtime
+# ---------------------------------------------------------------------------
 FROM node:22-alpine
 
-# Install tini for proper PID 1 signal handling
+# tini handles PID-1 signal forwarding so SIGTERM from the host manager
+# triggers our graceful-shutdown handler instead of being swallowed.
 RUN apk add --no-cache tini
 
 WORKDIR /app
 
-# Copy compiled output from build stage
-COPY --from=build /build/dist ./dist/
+# Copy compiled output + package files for production install.
+COPY --from=build /build/escrow-service/dist ./dist/
+COPY --from=build /build/escrow-service/package.json /build/escrow-service/package-lock.json ./
+COPY --from=build /build/sphere-sdk/ ./sphere-sdk/
 
-# Copy package files for production dependencies
-COPY agentic_hosting/package.json agentic_hosting/package-lock.json ./
-
-# Copy sphere-sdk and escrow-service for production dependency resolution
-COPY sphere-sdk/ ./sphere-sdk/
-COPY escrow-service/ ./escrow-service/
-
-# Rewrite file: references and install production dependencies only
+# Rewrite the file: dependency to the local copy in the image (the original
+# `file:../sphere-sdk` would point outside the container). Then install only
+# production deps.
 RUN sed -i 's|"file:../sphere-sdk"|"file:./sphere-sdk"|' package.json \
- && sed -i 's|"file:../escrow-service"|"file:./escrow-service"|' package.json \
- && npm install --omit=dev
+ && npm install --omit=dev --ignore-scripts
 
-# Create required directories for wallet, tokens, and escrow state
+# Standard host-manager-injected directory layout. Mounted at runtime by the
+# manager; created here so the ACP adapter can mkdir under them without
+# tripping permission errors on the first boot.
 RUN mkdir -p /data/wallet /data/tokens /data/escrow && chown -R node:node /data
 
-# Set environment variables
 ENV NODE_ENV=production
 ENV ESCROW_DATA_DIR=/data/escrow
 
-# Run as non-root user
 USER node
 
-# Use tini as entrypoint for proper signal handling
 ENTRYPOINT ["tini", "--"]
 
-# Run the ACP-wrapped escrow service
-CMD ["node", "/app/dist/escrow.js"]
+# Default to the ACP-wrapped entrypoint (host-manager tenant mode).
+# Standalone mode: docker run ... <image> node /app/dist/index.js
+CMD ["node", "/app/dist/acp-adapter/main.js"]
