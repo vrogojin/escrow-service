@@ -55,7 +55,7 @@ jobs:
           git clone https://github.com/unicity-sphere/sphere-sdk.git ../sphere-sdk
           git -C ../sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
 
-      - name: Build sphere-sdk (required for file: dependency to resolve types)
+      - name: "Build sphere-sdk (required for file: dependency to resolve types)"
         run: |
           cd ../sphere-sdk
           npm ci
