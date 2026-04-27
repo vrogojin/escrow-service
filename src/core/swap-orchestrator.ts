@@ -159,6 +159,20 @@ export class SwapOrchestrator {
 
     // Bind handlers so the same reference can be passed to on() and off()
     this.handlePayment = (payload) => {
+      // DIAGNOSTIC: log every invoice:payment arrival, even before stopping check
+      logger.info(
+        {
+          invoiceId: payload.invoiceId,
+          paymentDirection: payload.paymentDirection,
+          transferId: payload.transfer?.transferId,
+          coinId: payload.transfer?.coinId,
+          amount: payload.transfer?.amount,
+          senderAddress: payload.transfer?.senderAddress,
+          confirmed: payload.transfer?.confirmed,
+          stopping: this.stopping,
+        },
+        'diag_invoice_payment_received',
+      );
       if (this.stopping) return;
       const p = this._onInvoicePayment(payload).catch((err) => {
         logger.error({ err, invoiceId: payload.invoiceId }, 'Error handling invoice:payment');
@@ -167,6 +181,15 @@ export class SwapOrchestrator {
       p.finally(() => this.inFlight.delete(p));
     };
     this.handleCovered = (payload) => {
+      // DIAGNOSTIC: log every invoice:covered arrival
+      logger.info(
+        {
+          invoiceId: payload.invoiceId,
+          confirmed: payload.confirmed,
+          stopping: this.stopping,
+        },
+        'diag_invoice_covered_received',
+      );
       if (this.stopping) return;
       const p = this._onInvoiceCovered(payload).catch((err) => {
         logger.error({ err, invoiceId: payload.invoiceId }, 'Error handling invoice:covered');
@@ -1504,10 +1527,30 @@ export class SwapOrchestrator {
     // returns INVOICE_INVALID_AMOUNT. Passing an explicit amount would
     // bypass the zero-remaining guard and cause a double-payment.
     try {
-      await this.invoiceManager.payInvoice(payoutAId, {
+      const payoutAResult = await this.invoiceManager.payInvoice(payoutAId, {
         targetIndex: 0,
         assetIndex: 0,
       });
+      // DIAGNOSTIC: log what payInvoice actually returned so we can correlate
+      // with the trader-side coverage check.
+      logger.info(
+        {
+          swap_id: swap.swap_id,
+          payoutAId,
+          transfer_id: payoutAResult?.id,
+          transfer_status: payoutAResult?.status,
+          token_count: payoutAResult?.tokens?.length,
+          token_transfers: payoutAResult?.tokenTransfers?.map((t) => ({
+            sourceTokenId: t.sourceTokenId?.slice(0, 16),
+            method: t.method,
+            requestIdHex: t.requestIdHex?.slice(0, 16),
+            splitGroupId: t.splitGroupId?.slice(0, 16),
+            nostrEventId: t.nostrEventId?.slice(0, 16),
+          })),
+          error: payoutAResult?.error,
+        },
+        'diag_payout_a_payInvoice_result',
+      );
     } catch (err) {
       if (isSphereError(err) && (err.code === 'INVOICE_TERMINATED' || err.code === 'INVOICE_INVALID_AMOUNT')) {
         logger.info({ swap_id: swap.swap_id, payoutAId }, 'Payout A already covered (idempotent)');
@@ -1524,10 +1567,28 @@ export class SwapOrchestrator {
     // Step 6: Pay payout B — targetIndex 0, assetIndex 0.
     // Same idempotent pattern: omit amount so SDK computes remaining.
     try {
-      await this.invoiceManager.payInvoice(payoutBId, {
+      const payoutBResult = await this.invoiceManager.payInvoice(payoutBId, {
         targetIndex: 0,
         assetIndex: 0,
       });
+      logger.info(
+        {
+          swap_id: swap.swap_id,
+          payoutBId,
+          transfer_id: payoutBResult?.id,
+          transfer_status: payoutBResult?.status,
+          token_count: payoutBResult?.tokens?.length,
+          token_transfers: payoutBResult?.tokenTransfers?.map((t) => ({
+            sourceTokenId: t.sourceTokenId?.slice(0, 16),
+            method: t.method,
+            requestIdHex: t.requestIdHex?.slice(0, 16),
+            splitGroupId: t.splitGroupId?.slice(0, 16),
+            nostrEventId: t.nostrEventId?.slice(0, 16),
+          })),
+          error: payoutBResult?.error,
+        },
+        'diag_payout_b_payInvoice_result',
+      );
     } catch (err) {
       if (isSphereError(err) && (err.code === 'INVOICE_TERMINATED' || err.code === 'INVOICE_INVALID_AMOUNT')) {
         logger.info({ swap_id: swap.swap_id, payoutBId }, 'Payout B already covered (idempotent)');

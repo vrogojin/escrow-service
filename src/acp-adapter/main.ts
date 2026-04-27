@@ -424,7 +424,32 @@ export async function startEscrow(): Promise<void> {
     },
     addressResolver: {
       resolve: async (address) => {
-        if (address.startsWith('DIRECT://')) return address;
+        if (address.startsWith('DIRECT://')) {
+          // DIAGNOSTIC: even when the address is already DIRECT://, look up
+          // the corresponding peer info so we can see what transport pubkey
+          // the SDK resolves the address to (the same lookup payInvoice does
+          // when sending the actual token transfer to this address).
+          try {
+            const transport = (sphere as { getTransport?: () => { resolve?: (a: string) => Promise<{ transportPubkey?: string; chainPubkey?: string; directAddress?: string; nametag?: string } | null> } }).getTransport?.();
+            const directPeer = (await transport?.resolve?.(address)) ?? null;
+            log.info(
+              {
+                address,
+                resolved_transportPubkey: directPeer?.transportPubkey ?? null,
+                resolved_chainPubkey: directPeer?.chainPubkey ?? null,
+                resolved_directAddress: directPeer?.directAddress ?? null,
+                resolved_nametag: directPeer?.nametag ?? null,
+              },
+              'diag_direct_address_peer_resolution',
+            );
+          } catch (err) {
+            log.warn(
+              { address, err: err instanceof Error ? err.message : String(err) },
+              'diag_direct_address_peer_resolution_failed',
+            );
+          }
+          return address;
+        }
         if (address.startsWith('PROXY://')) {
           log.warn({ address }, 'proxy_address_not_supported');
           return null;
@@ -465,11 +490,32 @@ export async function startEscrow(): Promise<void> {
   });
 
   // Periodic sync: receive tokens AND fetch pending DM events.
+  // DIAGNOSTIC: log non-empty receive results to track whether deposit tokens
+  // are arriving at the wallet. The InvoiceManager subscribes separately to
+  // invoice:payment / invoice:covered for attribution; if those fire we'll see
+  // them via SwapOrchestrator's existing logging.
   const receiveLoop = setInterval(async () => {
     try {
-      await sphere.payments.receive({ finalize: true });
-    } catch {
-      // Transient errors are tolerable
+      const result = await sphere.payments.receive({ finalize: true });
+      const transferCount = result?.transfers?.length ?? 0;
+      if (transferCount > 0) {
+        const senderSummaries = result.transfers.map((t) => ({
+          id: t.id,
+          sender: t.senderPubkey?.slice(0, 16),
+          memo: t.memo?.slice(0, 80) ?? null,
+          token_count: t.tokens?.length ?? 0,
+        }));
+        log.info(
+          { transferCount, transfers: senderSummaries },
+          'receive_loop_finalized_transfers',
+        );
+      }
+    } catch (err) {
+      // Transient errors are tolerable, but log in debug for visibility
+      log.debug(
+        { err: err instanceof Error ? err.message : String(err) },
+        'receive_loop_error',
+      );
     }
     try {
       await (sphere as unknown as { fetchPendingEvents(): Promise<void> }).fetchPendingEvents();
