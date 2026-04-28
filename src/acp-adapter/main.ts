@@ -425,28 +425,34 @@ export async function startEscrow(): Promise<void> {
     addressResolver: {
       resolve: async (address) => {
         if (address.startsWith('DIRECT://')) {
-          // DIAGNOSTIC: even when the address is already DIRECT://, look up
-          // the corresponding peer info so we can see what transport pubkey
-          // the SDK resolves the address to (the same lookup payInvoice does
-          // when sending the actual token transfer to this address).
-          try {
-            const transport = (sphere as { getTransport?: () => { resolve?: (a: string) => Promise<{ transportPubkey?: string; chainPubkey?: string; directAddress?: string; nametag?: string } | null> } }).getTransport?.();
-            const directPeer = (await transport?.resolve?.(address)) ?? null;
-            log.info(
-              {
-                address,
-                resolved_transportPubkey: directPeer?.transportPubkey ?? null,
-                resolved_chainPubkey: directPeer?.chainPubkey ?? null,
-                resolved_directAddress: directPeer?.directAddress ?? null,
-                resolved_nametag: directPeer?.nametag ?? null,
-              },
-              'diag_direct_address_peer_resolution',
-            );
-          } catch (err) {
-            log.warn(
-              { address, err: err instanceof Error ? err.message : String(err) },
-              'diag_direct_address_peer_resolution_failed',
-            );
+          // Optional verbose resolution diagnostic. Logs (transportPubkey,
+          // chainPubkey, directAddress, nametag) — a tuple that makes it
+          // trivial to correlate Nostr transport identity ↔ on-chain
+          // identity ↔ human-readable nametag for every counterparty that
+          // sends an invoice payment. Useful for development; off by
+          // default to avoid putting a deanonymization primitive in
+          // production logs.
+          // Enable with `ESCROW_DIAG_PEER_RESOLUTION=1`.
+          if (process.env['ESCROW_DIAG_PEER_RESOLUTION'] === '1') {
+            try {
+              const transport = (sphere as { getTransport?: () => { resolve?: (a: string) => Promise<{ transportPubkey?: string; chainPubkey?: string; directAddress?: string; nametag?: string } | null> } }).getTransport?.();
+              const directPeer = (await transport?.resolve?.(address)) ?? null;
+              log.debug(
+                {
+                  address,
+                  resolved_transportPubkey: directPeer?.transportPubkey ?? null,
+                  resolved_chainPubkey: directPeer?.chainPubkey ?? null,
+                  resolved_directAddress: directPeer?.directAddress ?? null,
+                  resolved_nametag: directPeer?.nametag ?? null,
+                },
+                'diag_direct_address_peer_resolution',
+              );
+            } catch (err) {
+              log.warn(
+                { address, err: err instanceof Error ? err.message : String(err) },
+                'diag_direct_address_peer_resolution_failed',
+              );
+            }
           }
           return address;
         }
