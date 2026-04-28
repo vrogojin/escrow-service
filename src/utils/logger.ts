@@ -1,4 +1,5 @@
 import pino from 'pino';
+import { stdSerializers } from 'pino';
 
 /**
  * Sensitive field names. Used both as pino `redact` paths (at every depth
@@ -71,24 +72,95 @@ const REDACT_PATHS: ReadonlyArray<string> = [
  * lookalikes — and `0` is NOT in the charset either. Earlier the regex
  * permitted `[02-9ac-hj-np-z]{58}` which incorrectly accepted `0`.
  *
- * The 64-hex pattern is intentionally aggressive: token IDs are typically
- * not logged as bare strings (they appear inside structured fields the
- * field-name redact already covers). The narrow lookbehind/ahead avoids
- * partial matches inside longer hex blobs.
+ * 64-HEX SECRET DETECTION: the threat model is "a private key (32-byte
+ * raw secp256k1) leaked into a free-form Error message". Many legitimate
+ * identifiers in this codebase are ALSO 64-char hex — `swap_id`,
+ * `coinId`, token-id hashes — and are logged as bare values. We
+ * distinguish at the `scrubString` level:
+ *  - if the entire string IS exactly 64 hex chars (matches
+ *    `BARE_64_HEX_RE`), it is treated as an identifier and returned
+ *    unchanged.
+ *  - otherwise, the 64-hex pattern below scans for embedded blobs
+ *    inside surrounding prose (e.g. an Error message body).
+ * The pattern uses negative lookbehind/ahead `(?<![0-9a-fA-F])` /
+ * `(?![0-9a-fA-F])` which match at string boundaries (start/end count
+ * as "no neighbour"); the BARE_64_HEX_RE short-circuit removes the
+ * one collision (a string that IS only the hex).
+ *
+ * TWO PATTERN SETS — we expose two ordered lists.
+ *  - `SECRET_VALUE_PATTERNS` runs on per-value strings inside
+ *    `formatters.log` (deepScrub) and on `msg` arguments via
+ *    `hooks.logMethod`. The bare-64-hex short-circuit applies here
+ *    via scrubString.
+ *  - `STREAM_WRITE_PATTERNS` runs on the FINAL JSON output line via
+ *    `hooks.streamWrite`. JSON wraps every string field in `"`; we
+ *    exclude the 64-hex pattern at this layer because the JSON
+ *    quoting would interact badly with the lookbehind/ahead and
+ *    cause swap_id false-positives. The 64-hex layer-1 scrub
+ *    (formatters.log + logMethod) already covers the threat model
+ *    for inputs that pino doesn't post-process; the streamWrite hook
+ *    exists primarily to scrub secrets that come from pino's default
+ *    err serializer (which reads err.message/stack from the prototype
+ *    chain, bypassing formatters.log).
  */
 export const SECRET_VALUE_PATTERNS: ReadonlyArray<RegExp> = [
   // bech32-encoded Nostr secret keys (5-char prefix + 58-char body)
   /nsec1[ac-hj-np-z2-9]{58}/gi,
   // generic secret-key tokens (sk_<hex>)
   /sk_[0-9a-f]{32,}/gi,
-  // 64-char hex (private keys, raw secp256k1 secrets)
+  // 64-char hex (private keys, raw secp256k1 secrets). The
+  // lookbehind/ahead prevent partial matches inside a longer hex blob.
+  // The bare-64-hex case (a value that IS exactly 64 hex chars) is
+  // short-circuited inside `scrubString` because it's almost certainly
+  // a legitimate identifier (swap_id, coinId, tokenId) rather than a
+  // leaked secret with surrounding prose.
   /(?<![0-9a-fA-F])[0-9a-f]{64}(?![0-9a-fA-F])/gi,
   // JWT (header.payload.signature, base64url segments)
   /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/g,
 ];
 
-/** Apply the value-level scrubber to a string. */
+/**
+ * Patterns safe to run on already-JSON-serialized output. Excludes the
+ * 64-hex pattern (the surrounding `"` chars are non-hex and would always
+ * match swap_id values). See SECRET_VALUE_PATTERNS docstring.
+ */
+const STREAM_WRITE_PATTERNS: ReadonlyArray<RegExp> = [
+  /nsec1[ac-hj-np-z2-9]{58}/gi,
+  /sk_[0-9a-f]{32,}/gi,
+  /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/g,
+];
+
+function scrubStreamLine(value: string): string {
+  let out = value;
+  for (const pat of STREAM_WRITE_PATTERNS) {
+    out = out.replace(pat, '[REDACTED]');
+  }
+  return out;
+}
+
+/**
+ * Match exactly-64-char-lowercase-hex strings. Used to short-circuit
+ * the 64-hex secret scan in scrubString — a string that IS exactly
+ * 64 hex chars is almost certainly an identifier (swap_id, coinId,
+ * tokenId hash) rather than a leaked private key with surrounding
+ * prose.
+ */
+const BARE_64_HEX_RE = /^[0-9a-fA-F]{64}$/;
+
+/**
+ * Apply the value-level scrubber to a string. Special-case: a string
+ * that is EXACTLY 64 hex chars is treated as a legitimate identifier
+ * (swap_id, coinId, tokenId hash) rather than a leaked private key,
+ * and is returned unchanged. The other patterns (nsec1, sk_, JWT) still
+ * run so a string-shaped-like-an-identifier doesn't bypass non-hex
+ * detection — but BARE_64_HEX_RE matches only when the entire string
+ * is 64 hex with nothing else, so those other patterns can't match
+ * anyway.
+ */
 export function scrubString(value: string): string {
+  if (BARE_64_HEX_RE.test(value)) {
+    return value;
+  }
   let out = value;
   for (const pat of SECRET_VALUE_PATTERNS) {
     out = out.replace(pat, '[REDACTED]');
@@ -154,11 +226,47 @@ export function deepScrub(
 
 const MAX_SCRUB_DEPTH = 12;
 
+/**
+ * Walk an arbitrary object once and apply scrubString to every string
+ * leaf. Used inside the err serializer to catch secrets in
+ * `_err.message` / `_err.stack` that arrive AFTER deepScrub has run.
+ */
+function scrubObjectStrings(value: unknown, depth: number, seen: WeakSet<object>): unknown {
+  if (depth <= 0) return value;
+  if (typeof value === 'string') return scrubString(value);
+  if (value === null || typeof value !== 'object') return value;
+  if (seen.has(value as object)) return value;
+  seen.add(value as object);
+  if (Array.isArray(value)) {
+    return value.map((v) => scrubObjectStrings(v, depth - 1, seen));
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = scrubObjectStrings(v, depth - 1, seen);
+  }
+  return out;
+}
+
 export const logger = pino({
   level: process.env.LOG_LEVEL ?? 'info',
   redact: {
     paths: [...REDACT_PATHS],
     censor: '[REDACTED]',
+  },
+  serializers: {
+    /**
+     * Wrap pino's default `err` serializer so `_err.message` and
+     * `_err.stack` (and any other string leaves the default emits) get
+     * the full SECRET_VALUE_PATTERNS scrub. The default serializer
+     * reads `err.message` and `err.stack` from Error.prototype, which
+     * `formatters.log`'s deepScrub cannot enumerate via Object.entries.
+     * Without this wrapper, a leaked secret in an Error message
+     * silently slips out via `log.error({ err })`.
+     */
+    err(err: unknown) {
+      const _err = stdSerializers.err(err as Error);
+      return scrubObjectStrings(_err, 12, new WeakSet()) as typeof _err;
+    },
   },
   hooks: {
     /**
@@ -188,6 +296,36 @@ export const logger = pino({
         args[0] = scrubString(args[0]);
       }
       return method.apply(this, args as Parameters<typeof method>);
+    },
+    /**
+     * Final-stage scrub on the stringified JSON line.
+     *
+     * MOTIVATION: pino's pipeline is
+     *   formatters.log(obj)  →  per-key serializers  →  JSON.stringify
+     * The default `serializers.err` (pino-std-serializers) reads
+     * `err.message` and `err.stack` from prototype chain and emits them
+     * AFTER `formatters.log` has already run, so deepScrub never sees
+     * them. (Object.entries(error) returns [] — the message/stack live
+     * on the Error prototype, not as own enumerable properties.)
+     *
+     * Concretely, without this hook a leaked secret in
+     *   log.error({ err: new Error('failed: nsec1...') }, 'oops');
+     * emits the raw nsec.
+     *
+     * `streamWrite` runs `scrubStreamLine` on the final JSON string
+     * just before transport write. This catches secrets that arrived
+     * via the err serializer, custom serializers, or any future code
+     * path we don't control. NOTE: `scrubStreamLine` uses
+     * STREAM_WRITE_PATTERNS, which excludes the 64-hex pattern; see
+     * SECRET_VALUE_PATTERNS for the rationale (JSON `"` quoting
+     * defeats the surrounding-prose lookbehind for 64-hex). The
+     * 64-hex pattern still runs on per-value strings inside
+     * formatters.log, which catches the threat-model case. The cost
+     * is one regex pass per log line — acceptable at the volumes this
+     * service emits (heartbeat-rate, not request-rate).
+     */
+    streamWrite(s) {
+      return scrubStreamLine(s);
     },
   },
   formatters: {

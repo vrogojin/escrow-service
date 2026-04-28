@@ -21,6 +21,7 @@
 
 import { describe, it, expect } from 'vitest';
 import pino from 'pino';
+import { stdSerializers } from 'pino';
 import { Writable } from 'node:stream';
 import {
   SECRET_FIELD_NAMES,
@@ -40,10 +41,29 @@ function buildTestLogger(stream: NodeJS.WritableStream) {
     ...SECRET_FIELD_NAMES.map((n) => `*.*.${n}`),
     ...SECRET_FIELD_NAMES.flatMap((n) => [`err.${n}`, `error.${n}`]),
   ];
+  function scrubObjectStrings(value: unknown, depth: number, seen: WeakSet<object>): unknown {
+    if (depth <= 0) return value;
+    if (typeof value === 'string') return scrubString(value);
+    if (value === null || typeof value !== 'object') return value;
+    if (seen.has(value as object)) return value;
+    seen.add(value as object);
+    if (Array.isArray(value)) return value.map((v) => scrubObjectStrings(v, depth - 1, seen));
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = scrubObjectStrings(v, depth - 1, seen);
+    }
+    return out;
+  }
   return pino(
     {
       level: 'info',
       redact: { paths: REDACT_PATHS, censor: '[REDACTED]' },
+      serializers: {
+        err(err: unknown) {
+          const _err = stdSerializers.err(err as Error);
+          return scrubObjectStrings(_err, 12, new WeakSet()) as typeof _err;
+        },
+      },
       hooks: {
         logMethod(args, method) {
           if (args.length >= 2 && typeof args[1] === 'string') {
@@ -52,6 +72,23 @@ function buildTestLogger(stream: NodeJS.WritableStream) {
             args[0] = scrubString(args[0]);
           }
           return method.apply(this, args as Parameters<typeof method>);
+        },
+        streamWrite(s: string): string {
+          // Mirror the production split — only run the safe-on-JSON
+          // patterns at the stream layer (no 64-hex; that pattern's
+          // surrounding-prose lookbehind doesn't survive JSON quoting).
+          // Keep this list in sync with logger.ts's
+          // STREAM_WRITE_PATTERNS.
+          const STREAM_PATTERNS: RegExp[] = [
+            /nsec1[ac-hj-np-z2-9]{58}/gi,
+            /sk_[0-9a-f]{32,}/gi,
+            /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/g,
+          ];
+          let out = s;
+          for (const pat of STREAM_PATTERNS) {
+            out = out.replace(pat, '[REDACTED]');
+          }
+          return out;
         },
       },
       formatters: {
@@ -320,5 +357,80 @@ describe('pino logger — msg-string scrubbing via logMethod hook (H2)', () => {
       'nsec1qpzry9x8gf2tvdwks3jn54khce6mua7lqpzry9x8gf2tvdwks3jn54khce';
     const out = captureLog((log) => log.info(`plain: ${fakeNsec}`));
     expect(out['msg']).toBe('plain: [REDACTED]');
+  });
+});
+
+describe('pino logger — Error message/stack scrubbing via streamWrite (H3)', () => {
+  it('scrubs an inline nsec1... in Error.message via the streamWrite hook', () => {
+    // The default pino err serializer emits err.message from the
+    // prototype chain. deepScrub cannot reach it (Object.entries(err)
+    // returns []). streamWrite runs on the final JSON line and catches
+    // the leak.
+    const fakeNsec =
+      'nsec1qpzry9x8gf2tvdwks3jn54khce6mua7lqpzry9x8gf2tvdwks3jn54khce';
+    const e = new Error(`failed to load wallet: ${fakeNsec}`);
+    const out = captureLog((log) => log.error({ err: e }, 'wallet_load_failed'));
+    const errOut = out['err'] as { message?: string; stack?: string };
+    expect(errOut.message).not.toContain('nsec1');
+    expect(errOut.message).toContain('[REDACTED]');
+  });
+
+  it('scrubs a 64-hex secret embedded in Error.message', () => {
+    const hex64 = 'a'.repeat(64);
+    const e = new Error(`failed: ${hex64} oops`);
+    const out = captureLog((log) => log.error({ err: e }, 'evt'));
+    const errOut = out['err'] as { message?: string };
+    expect(errOut.message).toBe('failed: [REDACTED] oops');
+  });
+
+  it('scrubs Error.stack when it contains a leaked secret', () => {
+    const fakeNsec =
+      'nsec1qpzry9x8gf2tvdwks3jn54khce6mua7lqpzry9x8gf2tvdwks3jn54khce';
+    const e = new Error(`outer: ${fakeNsec}`);
+    const out = captureLog((log) => log.error({ err: e }, 'evt'));
+    const errOut = out['err'] as { stack?: string };
+    expect(errOut.stack).not.toContain('nsec1qpzry9x8');
+  });
+});
+
+describe('pino logger — 64-hex regex sparing legitimate identifiers (H4)', () => {
+  it('does NOT redact a bare swap_id (64-char hex as the entire field value)', () => {
+    // swap_ids in this codebase are 64-char lowercase hex. They are
+    // logged as bare values throughout the service. Redacting them
+    // destroys log correlation. The 64-hex regex now requires non-hex
+    // CONTEXT around the match, so a bare-value swap_id is left alone.
+    const swapId = 'a'.repeat(64);
+    const out = captureLog((log) => log.info({ swap_id: swapId }, 'announce'));
+    expect(out['swap_id']).toBe(swapId);
+  });
+
+  it('DOES redact a 64-hex blob followed by non-hex prose (suspicious)', () => {
+    // A field value that combines a 64-hex blob with surrounding text
+    // is treated as suspicious — the bare-value short-circuit only
+    // fires for strings that are EXACTLY 64 hex chars. The codebase
+    // does not legitimately emit `<swap_id> <verb>` style strings
+    // (verified by grep); swap_ids appear as bare values inside
+    // structured fields.
+    const swapId = 'b'.repeat(64);
+    const out = captureLog((log) =>
+      log.info({ note: `${swapId} processed` }, 'evt'),
+    );
+    expect(out['note']).toBe('[REDACTED] processed');
+  });
+
+  it('DOES redact a 64-hex blob surrounded by non-hex prose', () => {
+    // The threat-model case: a private key embedded in an Error
+    // message body. The lookbehind/ahead pass; the regex matches.
+    const hex64 = 'c'.repeat(64);
+    const out = captureLog((log) =>
+      log.info({ note: `priv: ${hex64} bad` }, 'evt'),
+    );
+    expect(out['note']).toBe('priv: [REDACTED] bad');
+  });
+
+  it('does NOT redact a 32-hex value (too short for the pattern)', () => {
+    const hex32 = 'd'.repeat(32);
+    const out = captureLog((log) => log.info({ token_id: hex32 }, 'evt'));
+    expect(out['token_id']).toBe(hex32);
   });
 });
