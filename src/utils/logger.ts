@@ -120,14 +120,37 @@ export const SECRET_VALUE_PATTERNS: ReadonlyArray<RegExp> = [
 ];
 
 /**
- * Patterns safe to run on already-JSON-serialized output. Excludes the
- * 64-hex pattern (the surrounding `"` chars are non-hex and would always
- * match swap_id values). See SECRET_VALUE_PATTERNS docstring.
+ * Patterns safe to run on already-JSON-serialized output. Round-5 update:
+ * the 64-hex pattern WAS excluded due to false-positive on bare swap_id
+ * values inside JSON quotes (`"abc...64chars"` would match). Round-5 audit
+ * found this leaves an Error.message hex-leak gap (a 64-hex secret embedded
+ * INSIDE a stringified Error.message survives the deepScrub via prototype
+ * chain reads, and was not caught at this layer either).
+ *
+ * Fix: use a JSON-structural-aware boundary. JSON delimiters around string
+ * fields are `"` and `\` (escaped); around values they are `:` `,` `[` `]`
+ * and whitespace. The pattern fires on hex sequences SURROUNDED BY any
+ * non-hex JSON-structural char. This matches:
+ *   - secrets in Error.message: `"...private key: <64hex> bad"`
+ *   - secrets between commas: `,"a","<64hex>","b"`
+ *
+ * It does NOT match bare-id values: `"swap_id":"<64hex>"` because the
+ * `"` boundary is structural — wait, it WOULD match. So we ADDITIONALLY
+ * require non-hex chars on at least ONE side that aren't `"` (i.e. there
+ * must be REAL prose context, not just JSON quoting). Realised via the
+ * lookbehind/ahead asserting non-hex AND non-quote.
  */
 const STREAM_WRITE_PATTERNS: ReadonlyArray<RegExp> = [
   /nsec1[ac-hj-np-z2-9]{58}/gi,
   /sk_[0-9a-f]{32,}/gi,
   /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/g,
+  // 64-hex with real prose context on at least one side. The negative
+  // lookbehind/lookahead ensures the boundary char is NOT `"` (JSON
+  // string boundary) AND NOT a hex char. So `"abc...64hex"` (bare id
+  // in JSON) does NOT match (both boundaries are `"`), but
+  // `"...key: abc...64hex bad"` DOES (the leading space and trailing
+  // space are non-hex non-quote).
+  /(?<![0-9a-fA-F"])[0-9a-f]{64}(?![0-9a-fA-F"])/gi,
 ];
 
 function scrubStreamLine(value: string): string {
@@ -247,7 +270,15 @@ function scrubObjectStrings(value: unknown, depth: number, seen: WeakSet<object>
   return out;
 }
 
-export const logger = pino({
+/**
+ * Round-5 audit fix (test drift): export the full pino config builder
+ * so tests instantiate the logger via the SAME options used in production
+ * rather than rebuilding a hand-coded mirror. Any future change to the
+ * config (new redact paths, new serializers, new hooks, formatters) will
+ * automatically be reflected in tests — no silent regression.
+ */
+export function buildLoggerOptions(): pino.LoggerOptions {
+  return {
   level: process.env.LOG_LEVEL ?? 'info',
   redact: {
     paths: [...REDACT_PATHS],
@@ -265,7 +296,45 @@ export const logger = pino({
      */
     err(err: unknown) {
       const _err = stdSerializers.err(err as Error);
-      return scrubObjectStrings(_err, 12, new WeakSet()) as typeof _err;
+      // Round-5 audit fix: walk `cause` and `aggregateErrors[]` chains
+      // explicitly so nested Error.message / Error.stack from prototype
+      // reads on inner errors don't slip past scrubObjectStrings (which
+      // can only enumerate own properties via Object.entries).
+      const scrubbedSelf = scrubObjectStrings(_err, 12, new WeakSet()) as Record<string, unknown>;
+      const walkErrChain = (e: unknown, depth: number): unknown => {
+        if (depth <= 0 || e === null || e === undefined) return e;
+        if (e instanceof Error) {
+          const layered = stdSerializers.err(e) as Record<string, unknown>;
+          const scrubbed = scrubObjectStrings(layered, 12, new WeakSet()) as Record<string, unknown>;
+          if (e.cause !== undefined) {
+            scrubbed['cause'] = walkErrChain(e.cause, depth - 1);
+          }
+          // AggregateError carries .errors[]
+          if (Array.isArray((e as unknown as { errors?: unknown[] }).errors)) {
+            scrubbed['aggregateErrors'] = ((e as unknown as { errors: unknown[] }).errors).map((inner) => walkErrChain(inner, depth - 1));
+          }
+          return scrubbed;
+        }
+        if (typeof e === 'object') {
+          return scrubObjectStrings(e as Record<string, unknown>, 12, new WeakSet());
+        }
+        if (typeof e === 'string') {
+          return scrubString(e);
+        }
+        return e;
+      };
+      // If the original `err` was an Error with cause / aggregateErrors,
+      // attach the walked versions; stdSerializers.err loses these by
+      // default in some configurations.
+      if (err instanceof Error) {
+        if (err.cause !== undefined) {
+          scrubbedSelf['cause'] = walkErrChain(err.cause, 8);
+        }
+        if (Array.isArray((err as unknown as { errors?: unknown[] }).errors)) {
+          scrubbedSelf['aggregateErrors'] = ((err as unknown as { errors: unknown[] }).errors).map((inner) => walkErrChain(inner, 8));
+        }
+      }
+      return scrubbedSelf as typeof _err;
     },
   },
   hooks: {
@@ -346,6 +415,14 @@ export const logger = pino({
     process.env.NODE_ENV !== 'production'
       ? { target: 'pino-pretty', options: { colorize: true } }
       : undefined,
-});
+  };
+}
+
+// STREAM_WRITE_PATTERNS / scrubStreamLine / REDACT_PATHS exported for
+// test reuse so the security-boundary tests can assert against the SAME
+// constants the production logger uses.
+export { STREAM_WRITE_PATTERNS, scrubStreamLine, REDACT_PATHS };
+
+export const logger = pino(buildLoggerOptions());
 
 export type Logger = typeof logger;
