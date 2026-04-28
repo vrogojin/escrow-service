@@ -22,26 +22,21 @@
 import { describe, it, expect } from 'vitest';
 import pino from 'pino';
 import { Writable } from 'node:stream';
+// Import from production rather than inlining a copy. Pre-round-3 the
+// constants were re-declared in this file — drift risk if production
+// adds a new alias (e.g. `webhookSecret`) without updating the test.
+import { SECRET_FIELD_NAMES, SECRET_VALUE_PATTERNS } from '../logger.js';
 
-// Re-import the SAME redact + formatter config the production logger
-// uses, by re-exporting it here for testing.
 function buildTestLogger(stream: NodeJS.WritableStream) {
-  // Inlined from src/utils/logger.ts — keep in sync. We don't import the
-  // production module because the prod transport (pino-pretty in
-  // dev / undefined in prod) makes capture awkward.
-  const SECRET_FIELD_NAMES = [
-    'mnemonic', 'privateKey', 'private_key', 'nsec', 'boot_token',
-    'bootToken', 'password', 'secret', 'apiKey', 'api_key',
-  ];
+  // Mirror the production redact + formatter config, but route output
+  // to our captured stream and skip the `transport: pino-pretty` branch
+  // that the prod logger uses in dev (pretty makes JSON-capture
+  // awkward).
   const REDACT_PATHS: string[] = [
     ...SECRET_FIELD_NAMES,
     ...SECRET_FIELD_NAMES.map((n) => `*.${n}`),
     ...SECRET_FIELD_NAMES.map((n) => `*.*.${n}`),
     ...SECRET_FIELD_NAMES.flatMap((n) => [`err.${n}`, `error.${n}`]),
-  ];
-  const SECRET_VALUE_PATTERNS: ReadonlyArray<RegExp> = [
-    /nsec1[02-9ac-hj-np-z]{58}/gi,
-    /sk_[0-9a-f]{32,}/gi,
   ];
   function scrubString(value: string): string {
     let out = value;

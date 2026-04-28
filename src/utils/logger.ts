@@ -11,7 +11,7 @@ import pino from 'pino';
  * AND wildcards at depth 1 + 2, AND fall through to the recursive
  * formatter below for anything beyond.
  */
-const SECRET_FIELD_NAMES = [
+export const SECRET_FIELD_NAMES = [
   'mnemonic',
   'privateKey',
   'private_key',
@@ -41,7 +41,7 @@ const REDACT_PATHS: ReadonlyArray<string> = [
  * (e.g. an Error message "failed to load wallet: nsec1...") that pino's
  * path-based redact cannot reach.
  */
-const SECRET_VALUE_PATTERNS: ReadonlyArray<RegExp> = [
+export const SECRET_VALUE_PATTERNS: ReadonlyArray<RegExp> = [
   /nsec1[02-9ac-hj-np-z]{58}/gi, // bech32-encoded Nostr secret keys
   /sk_[0-9a-f]{32,}/gi,           // generic secret-key tokens
 ];
