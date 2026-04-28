@@ -21,84 +21,23 @@
 
 import { describe, it, expect } from 'vitest';
 import pino from 'pino';
-import { stdSerializers } from 'pino';
 import { Writable } from 'node:stream';
 import {
   SECRET_FIELD_NAMES,
   SECRET_VALUE_PATTERNS,
   deepScrub,
   scrubString,
+  buildLoggerOptions,
 } from '../logger.js';
 
-function buildTestLogger(stream: NodeJS.WritableStream) {
-  // Mirror the production redact + formatter + hook config, but route
-  // output to our captured stream and skip the `transport: pino-pretty`
-  // branch that the prod logger uses in dev (pretty makes JSON-capture
-  // awkward).
-  const REDACT_PATHS: string[] = [
-    ...SECRET_FIELD_NAMES,
-    ...SECRET_FIELD_NAMES.map((n) => `*.${n}`),
-    ...SECRET_FIELD_NAMES.map((n) => `*.*.${n}`),
-    ...SECRET_FIELD_NAMES.flatMap((n) => [`err.${n}`, `error.${n}`]),
-  ];
-  function scrubObjectStrings(value: unknown, depth: number, seen: WeakSet<object>): unknown {
-    if (depth <= 0) return value;
-    if (typeof value === 'string') return scrubString(value);
-    if (value === null || typeof value !== 'object') return value;
-    if (seen.has(value as object)) return value;
-    seen.add(value as object);
-    if (Array.isArray(value)) return value.map((v) => scrubObjectStrings(v, depth - 1, seen));
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      out[k] = scrubObjectStrings(v, depth - 1, seen);
-    }
-    return out;
-  }
-  return pino(
-    {
-      level: 'info',
-      redact: { paths: REDACT_PATHS, censor: '[REDACTED]' },
-      serializers: {
-        err(err: unknown) {
-          const _err = stdSerializers.err(err as Error);
-          return scrubObjectStrings(_err, 12, new WeakSet()) as typeof _err;
-        },
-      },
-      hooks: {
-        logMethod(args, method) {
-          if (args.length >= 2 && typeof args[1] === 'string') {
-            args[1] = scrubString(args[1]);
-          } else if (args.length >= 1 && typeof args[0] === 'string') {
-            args[0] = scrubString(args[0]);
-          }
-          return method.apply(this, args as Parameters<typeof method>);
-        },
-        streamWrite(s: string): string {
-          // Mirror the production split — only run the safe-on-JSON
-          // patterns at the stream layer (no 64-hex; that pattern's
-          // surrounding-prose lookbehind doesn't survive JSON quoting).
-          // Keep this list in sync with logger.ts's
-          // STREAM_WRITE_PATTERNS.
-          const STREAM_PATTERNS: RegExp[] = [
-            /nsec1[ac-hj-np-z2-9]{58}/gi,
-            /sk_[0-9a-f]{32,}/gi,
-            /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}/g,
-          ];
-          let out = s;
-          for (const pat of STREAM_PATTERNS) {
-            out = out.replace(pat, '[REDACTED]');
-          }
-          return out;
-        },
-      },
-      formatters: {
-        log(obj) {
-          return deepScrub(obj, 12, new WeakSet()) as Record<string, unknown>;
-        },
-      },
-    },
-    stream,
-  );
+function buildTestLogger(stream: NodeJS.WritableStream): pino.Logger {
+  // Round-5 (audit fix for test drift): use the PRODUCTION pino options
+  // builder so any change to logger.ts (new hooks, serializers,
+  // formatters, streamWrite patterns) is automatically reflected here.
+  // Override `transport` to undefined so we don't fork into pino-pretty
+  // (which makes JSON capture unreliable in tests).
+  const options = buildLoggerOptions();
+  return pino({ ...options, transport: undefined }, stream);
 }
 
 function captureLog(fn: (log: pino.Logger) => void): Record<string, unknown> {
@@ -432,5 +371,65 @@ describe('pino logger — 64-hex regex sparing legitimate identifiers (H4)', () 
     const hex32 = 'd'.repeat(32);
     const out = captureLog((log) => log.info({ token_id: hex32 }, 'evt'));
     expect(out['token_id']).toBe(hex32);
+  });
+});
+
+// ============================================================================
+// Round-5 audit fix: 64-hex secret embedded in Error.message hits streamWrite
+// ============================================================================
+
+describe('pino logger — round-5 64-hex in Error.message via streamWrite', () => {
+  it('redacts a 64-hex secret embedded with prose context in Error.message', () => {
+    // pino's stdSerializers.err reads `.message` from prototype, so
+    // formatters.log/deepScrub never sees it. The wrapped err()
+    // serializer scrubs known patterns, BUT the 64-hex pattern only
+    // matches with non-hex prose context (so swap_ids in dedicated
+    // fields aren't false-positively redacted). When a 64-hex value is
+    // embedded in an Error.message with surrounding prose, the
+    // streamWrite hook's JSON-aware 64-hex pattern catches it on the
+    // final JSON line.
+    const hex64 = 'a'.repeat(64);
+    const e = new Error(`failed to import: ${hex64} is invalid`);
+    const out = captureLog((log) => log.error({ err: e }, 'import'));
+    const errOut = out['err'] as { message?: string };
+    expect(errOut.message).not.toContain(hex64);
+  });
+});
+
+// ============================================================================
+// Round-5 audit fix: AggregateError / Error.cause chain walking
+// ============================================================================
+
+describe('pino logger — round-5 cause / aggregateErrors walking', () => {
+  it('redacts a secret nested in Error.cause.message', () => {
+    const fakeNsec =
+      'nsec1qpzry9x8gf2tvdwks3jn54khce6mua7lqpzry9x8gf2tvdwks3jn54khce';
+    const inner = new Error(`auth failed: ${fakeNsec}`);
+    const outer = new Error('outer wrapper', { cause: inner });
+    const out = captureLog((log) => log.error({ err: outer }, 'evt'));
+    const errOut = out['err'] as { cause?: { message?: string } };
+    expect(errOut.cause?.message).not.toContain('nsec1qpzry9x');
+  });
+
+  it('redacts secrets in deeper cause chains (depth 3)', () => {
+    const fakeNsec =
+      'nsec1qpzry9x8gf2tvdwks3jn54khce6mua7lqpzry9x8gf2tvdwks3jn54khce';
+    const deepest = new Error(`leaked: ${fakeNsec}`);
+    const mid = new Error('mid layer', { cause: deepest });
+    const outer = new Error('outer wrapper', { cause: mid });
+    const out = captureLog((log) => log.error({ err: outer }, 'evt'));
+    const errOut = out['err'] as { cause?: { cause?: { message?: string } } };
+    expect(errOut.cause?.cause?.message).not.toContain('nsec1qpzry9x');
+  });
+
+  it('redacts secrets in AggregateError.errors[]', () => {
+    const fakeNsec =
+      'nsec1qpzry9x8gf2tvdwks3jn54khce6mua7lqpzry9x8gf2tvdwks3jn54khce';
+    const inner1 = new Error(`first: ${fakeNsec}`);
+    const inner2 = new Error('second: clean');
+    const aggregate = new AggregateError([inner1, inner2], 'multiple errors');
+    const out = captureLog((log) => log.error({ err: aggregate }, 'evt'));
+    const errOut = out['err'] as { aggregateErrors?: Array<{ message?: string }> };
+    expect(errOut.aggregateErrors?.[0]?.message).not.toContain('nsec1qpzry9x');
   });
 });
