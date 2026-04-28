@@ -54,22 +54,31 @@ describe('InvoiceManager', () => {
     });
 
     /**
-     * Regression coverage for the SDK canonical-sort vs. SwapModule.deposit
-     * positional-indexing skew (sphere-sdk
-     * tests/unit/modules/SwapModule.deposit.test.ts UT-SWAP-DEP-009).
+     * Smoke test for `createDepositInvoice` with reverse-sorting party
+     * currencies (party A=ZUSD, party B=AUSD).
      *
-     * The escrow passes [party_a, party_b] to accounting.createInvoice, but
-     * the SDK's canonicalSerialize() sorts assets by coinId for hash-
-     * determinism. After that sort, slot positions no longer correspond to
-     * party A / party B unless the currencies happen to sort that way.
+     * SCOPE: this test only verifies that escrow's `createDepositInvoice`
+     * accepts a manifest whose party A currency sorts AFTER party B's
+     * (alphabetically) without crashing, and that both currencies are
+     * present in the invoice's asset list with the correct amounts. The
+     * mock `accounting.createInvoice` does NOT apply the SDK's
+     * canonical-sort step, so input order is preserved here.
      *
-     * Consumers of the deposit invoice (i.e. SwapModule.deposit on each
-     * party's side) MUST therefore look up the slot by currency-match, not
-     * by position. This test exercises a manifest where party A's currency
-     * sorts AFTER party B's, which is precisely the case that exposed the
-     * bug in production.
+     * NOT COVERED: the production bug surfaced when the real SDK's
+     * `canonicalSerialize()` sorts assets by coinId before hashing,
+     * causing slot positions to skew from (partyA, partyB) → (sortedA,
+     * sortedB). The slot-lookup-by-currency contract that mitigates this
+     * lives in `SwapModule.deposit()` inside sphere-sdk and is covered by
+     * the SDK's own UT-SWAP-DEP-009. To regression-cover that
+     * end-to-end here we would need to either:
+     *   (a) import `canonicalSerialize` from sphere-sdk's accounting
+     *       submodule (not currently re-exported at the package
+     *       boundary), or
+     *   (b) wire the test against the real SDK accounting module.
+     * Both are out of scope for this unit-level mock; the e2e regression
+     * coverage lives in the SDK test suite.
      */
-    it('should accept manifests with reverse-sorting party currencies (party A=ZUSD, party B=AUSD)', async () => {
+    it('createDepositInvoice accepts reverse-input-order currencies without crashing', async () => {
       const reversedManifest: SwapManifest = {
         ...manifest,
         party_a_currency_to_change: 'ZUSD', // sorts AFTER 'AUSD'
@@ -83,20 +92,15 @@ describe('InvoiceManager', () => {
       expect(result.success).toBe(true);
       const invoiceState = mockAccounting._getInvoiceState(result.invoiceId!);
 
-      // The escrow passes assets in (partyA, partyB) order to the accounting
-      // module — the mock does not sort, so the input order is preserved.
-      // The real SDK's canonicalSerialize would sort by coinId, producing
-      // [AUSD, ZUSD]. SwapModule.deposit() then looks up by currency rather
-      // than position, so either ordering must work end-to-end.
       const assets = invoiceState!.terms.targets![0].assets || [];
       expect(assets).toHaveLength(2);
 
-      // Verify both currencies are present regardless of order.
+      // Both currencies present (order is whatever the mock preserves —
+      // see SCOPE note above; this assertion is order-independent).
       const allCoins = assets.map((a) => a.coin?.[0]).filter(Boolean);
       expect(allCoins).toContain('ZUSD');
       expect(allCoins).toContain('AUSD');
 
-      // Each currency maps to its expected amount.
       const zusdAsset = assets.find((a) => a.coin?.[0] === 'ZUSD');
       const ausdAsset = assets.find((a) => a.coin?.[0] === 'AUSD');
       expect(zusdAsset?.coin?.[1]).toBe('7000');

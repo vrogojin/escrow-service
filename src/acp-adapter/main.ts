@@ -54,6 +54,41 @@ import { logger } from '../utils/logger.js';
 const TRUSTBASE_URL =
   'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
 
+/**
+ * Build the structured payload for the receive-loop "finalized transfers"
+ * log line. When `diagEnabled` is false (default) we emit ONLY the
+ * aggregate count — the per-transfer summary contains a sender pubkey
+ * (deanonymization vector) and is therefore gated.
+ *
+ * Exported for unit tests; not part of the module's public surface.
+ */
+export interface ReceiveLoopTransfer {
+  readonly id?: string;
+  readonly senderPubkey?: string;
+  readonly memo?: string;
+  readonly tokens?: ReadonlyArray<unknown>;
+}
+
+export function buildReceiveLoopLogPayload(
+  transfers: ReadonlyArray<ReceiveLoopTransfer>,
+  diagEnabled: boolean,
+): Record<string, unknown> {
+  const transferCount = transfers.length;
+  if (!diagEnabled) {
+    return { transferCount };
+  }
+  const senderSummaries = transfers.map((t) => ({
+    id: t.id,
+    sender: t.senderPubkey?.slice(0, 16),
+    // memo intentionally dropped — it is free-form operator-supplied text
+    // (potential PII / secret leak vector). If memo content is needed,
+    // capture at the SwapOrchestrator layer where it's scoped to a
+    // swap_id.
+    token_count: t.tokens?.length ?? 0,
+  }));
+  return { transferCount, transfers: senderSummaries };
+}
+
 export async function startEscrow(): Promise<void> {
   const config = parseTenantConfig();
 
@@ -500,21 +535,25 @@ export async function startEscrow(): Promise<void> {
   // are arriving at the wallet. The InvoiceManager subscribes separately to
   // invoice:payment / invoice:covered for attribution; if those fire we'll see
   // them via SwapOrchestrator's existing logging.
+  //
+  // The per-transfer summary (sender pubkey + free-form memo) is gated
+  // behind `ESCROW_DIAG_RECEIVE_LOOP=1` because:
+  //   - the sender pubkey can be cross-referenced with on-chain identity
+  //     (deanonymization vector for the swap counterparty);
+  //   - the memo is operator-supplied free-form text that may contain
+  //     anything the sender pasted in.
+  // When the diag is OFF we still log the aggregate count so operators can
+  // tell traffic is flowing without exposing per-transfer detail.
   const receiveLoop = setInterval(async () => {
     try {
       const result = await sphere.payments.receive({ finalize: true });
       const transferCount = result?.transfers?.length ?? 0;
       if (transferCount > 0) {
-        const senderSummaries = result.transfers.map((t) => ({
-          id: t.id,
-          sender: t.senderPubkey?.slice(0, 16),
-          memo: t.memo?.slice(0, 80) ?? null,
-          token_count: t.tokens?.length ?? 0,
-        }));
-        log.info(
-          { transferCount, transfers: senderSummaries },
-          'receive_loop_finalized_transfers',
+        const payload = buildReceiveLoopLogPayload(
+          result.transfers,
+          process.env['ESCROW_DIAG_RECEIVE_LOOP'] === '1',
         );
+        log.info(payload, 'receive_loop_finalized_transfers');
       }
     } catch (err) {
       // Transient errors are tolerable, but log in debug for visibility
