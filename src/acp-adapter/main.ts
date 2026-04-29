@@ -54,6 +54,41 @@ import { logger } from '../utils/logger.js';
 const TRUSTBASE_URL =
   'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
 
+/**
+ * Build the structured payload for the receive-loop "finalized transfers"
+ * log line. When `diagEnabled` is false (default) we emit ONLY the
+ * aggregate count — the per-transfer summary contains a sender pubkey
+ * (deanonymization vector) and is therefore gated.
+ *
+ * Exported for unit tests; not part of the module's public surface.
+ */
+export interface ReceiveLoopTransfer {
+  readonly id?: string;
+  readonly senderPubkey?: string;
+  readonly memo?: string;
+  readonly tokens?: ReadonlyArray<unknown>;
+}
+
+export function buildReceiveLoopLogPayload(
+  transfers: ReadonlyArray<ReceiveLoopTransfer>,
+  diagEnabled: boolean,
+): Record<string, unknown> {
+  const transferCount = transfers.length;
+  if (!diagEnabled) {
+    return { transferCount };
+  }
+  const senderSummaries = transfers.map((t) => ({
+    id: t.id,
+    sender: t.senderPubkey?.slice(0, 16),
+    // memo intentionally dropped — it is free-form operator-supplied text
+    // (potential PII / secret leak vector). If memo content is needed,
+    // capture at the SwapOrchestrator layer where it's scoped to a
+    // swap_id.
+    token_count: t.tokens?.length ?? 0,
+  }));
+  return { transferCount, transfers: senderSummaries };
+}
+
 export async function startEscrow(): Promise<void> {
   const config = parseTenantConfig();
 
@@ -424,7 +459,38 @@ export async function startEscrow(): Promise<void> {
     },
     addressResolver: {
       resolve: async (address) => {
-        if (address.startsWith('DIRECT://')) return address;
+        if (address.startsWith('DIRECT://')) {
+          // Optional verbose resolution diagnostic. Logs (transportPubkey,
+          // chainPubkey, directAddress, nametag) — a tuple that makes it
+          // trivial to correlate Nostr transport identity ↔ on-chain
+          // identity ↔ human-readable nametag for every counterparty that
+          // sends an invoice payment. Useful for development; off by
+          // default to avoid putting a deanonymization primitive in
+          // production logs.
+          // Enable with `ESCROW_DIAG_PEER_RESOLUTION=1`.
+          if (process.env['ESCROW_DIAG_PEER_RESOLUTION'] === '1') {
+            try {
+              const transport = (sphere as { getTransport?: () => { resolve?: (a: string) => Promise<{ transportPubkey?: string; chainPubkey?: string; directAddress?: string; nametag?: string } | null> } }).getTransport?.();
+              const directPeer = (await transport?.resolve?.(address)) ?? null;
+              log.debug(
+                {
+                  address,
+                  resolved_transportPubkey: directPeer?.transportPubkey ?? null,
+                  resolved_chainPubkey: directPeer?.chainPubkey ?? null,
+                  resolved_directAddress: directPeer?.directAddress ?? null,
+                  resolved_nametag: directPeer?.nametag ?? null,
+                },
+                'diag_direct_address_peer_resolution',
+              );
+            } catch (err) {
+              log.warn(
+                { address, err: err instanceof Error ? err.message : String(err) },
+                'diag_direct_address_peer_resolution_failed',
+              );
+            }
+          }
+          return address;
+        }
         if (address.startsWith('PROXY://')) {
           log.warn({ address }, 'proxy_address_not_supported');
           return null;
@@ -465,11 +531,36 @@ export async function startEscrow(): Promise<void> {
   });
 
   // Periodic sync: receive tokens AND fetch pending DM events.
+  // DIAGNOSTIC: log non-empty receive results to track whether deposit tokens
+  // are arriving at the wallet. The InvoiceManager subscribes separately to
+  // invoice:payment / invoice:covered for attribution; if those fire we'll see
+  // them via SwapOrchestrator's existing logging.
+  //
+  // The per-transfer summary (sender pubkey + free-form memo) is gated
+  // behind `ESCROW_DIAG_RECEIVE_LOOP=1` because:
+  //   - the sender pubkey can be cross-referenced with on-chain identity
+  //     (deanonymization vector for the swap counterparty);
+  //   - the memo is operator-supplied free-form text that may contain
+  //     anything the sender pasted in.
+  // When the diag is OFF we still log the aggregate count so operators can
+  // tell traffic is flowing without exposing per-transfer detail.
   const receiveLoop = setInterval(async () => {
     try {
-      await sphere.payments.receive({ finalize: true });
-    } catch {
-      // Transient errors are tolerable
+      const result = await sphere.payments.receive({ finalize: true });
+      const transferCount = result?.transfers?.length ?? 0;
+      if (transferCount > 0) {
+        const payload = buildReceiveLoopLogPayload(
+          result.transfers,
+          process.env['ESCROW_DIAG_RECEIVE_LOOP'] === '1',
+        );
+        log.info(payload, 'receive_loop_finalized_transfers');
+      }
+    } catch (err) {
+      // Transient errors are tolerable, but log in debug for visibility
+      log.debug(
+        { err: err instanceof Error ? err.message : String(err) },
+        'receive_loop_error',
+      );
     }
     try {
       await (sphere as unknown as { fetchPendingEvents(): Promise<void> }).fetchPendingEvents();

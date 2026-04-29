@@ -53,6 +53,60 @@ describe('InvoiceManager', () => {
       expect(assets[1]).toEqual({ coin: ['USDU', '500'] });
     });
 
+    /**
+     * Smoke test for `createDepositInvoice` with reverse-sorting party
+     * currencies (party A=ZUSD, party B=AUSD).
+     *
+     * SCOPE: this test only verifies that escrow's `createDepositInvoice`
+     * accepts a manifest whose party A currency sorts AFTER party B's
+     * (alphabetically) without crashing, and that both currencies are
+     * present in the invoice's asset list with the correct amounts. The
+     * mock `accounting.createInvoice` does NOT apply the SDK's
+     * canonical-sort step, so input order is preserved here.
+     *
+     * NOT COVERED: the production bug surfaced when the real SDK's
+     * `canonicalSerialize()` sorts assets by coinId before hashing,
+     * causing slot positions to skew from (partyA, partyB) → (sortedA,
+     * sortedB). The slot-lookup-by-currency contract that mitigates this
+     * lives in `SwapModule.deposit()` inside sphere-sdk and is covered by
+     * the SDK's own UT-SWAP-DEP-009. To regression-cover that
+     * end-to-end here we would need to either:
+     *   (a) import `canonicalSerialize` from sphere-sdk's accounting
+     *       submodule (not currently re-exported at the package
+     *       boundary), or
+     *   (b) wire the test against the real SDK accounting module.
+     * Both are out of scope for this unit-level mock; the e2e regression
+     * coverage lives in the SDK test suite.
+     */
+    it('createDepositInvoice accepts reverse-input-order currencies without crashing', async () => {
+      const reversedManifest: SwapManifest = {
+        ...manifest,
+        party_a_currency_to_change: 'ZUSD', // sorts AFTER 'AUSD'
+        party_a_value_to_change: '7000',
+        party_b_currency_to_change: 'AUSD',
+        party_b_value_to_change: '8000',
+      };
+
+      const result = await invoiceManager.createDepositInvoice(reversedManifest);
+
+      expect(result.success).toBe(true);
+      const invoiceState = mockAccounting._getInvoiceState(result.invoiceId!);
+
+      const assets = invoiceState!.terms.targets![0].assets || [];
+      expect(assets).toHaveLength(2);
+
+      // Both currencies present (order is whatever the mock preserves —
+      // see SCOPE note above; this assertion is order-independent).
+      const allCoins = assets.map((a) => a.coin?.[0]).filter(Boolean);
+      expect(allCoins).toContain('ZUSD');
+      expect(allCoins).toContain('AUSD');
+
+      const zusdAsset = assets.find((a) => a.coin?.[0] === 'ZUSD');
+      const ausdAsset = assets.find((a) => a.coin?.[0] === 'AUSD');
+      expect(zusdAsset?.coin?.[1]).toBe('7000');
+      expect(ausdAsset?.coin?.[1]).toBe('8000');
+    });
+
     it('should set memo to "Escrow deposit for swap <swap_id>"', async () => {
       const result = await invoiceManager.createDepositInvoice(manifest);
 

@@ -110,9 +110,50 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   // ---------------------------------------------------------------------------
 
   async function reply(senderPubkey: string, payload: Record<string, unknown>): Promise<void> {
+    const messageType = String(payload['type'] ?? 'unknown');
+    const swapId = payload['swap_id'] !== undefined ? String(payload['swap_id']) : undefined;
+    const invoiceType = payload['invoice_type'] !== undefined ? String(payload['invoice_type']) : undefined;
+    const invoiceId = payload['invoice_id'] !== undefined ? String(payload['invoice_id']) : undefined;
     try {
-      await sphere.communications.sendDM(senderPubkey, JSON.stringify(payload));
+      const serialized = JSON.stringify(payload);
+      // Round-5 diag (basic-roundtrip flake investigation 2026-04-29):
+      // log every outbound DM with type + recipient prefix + payload size.
+      // Critical for diagnosing "buyer never receives deposit invoice"
+      // observations: we can confirm the escrow DID send and to which
+      // transport pubkey, separating "escrow didn't send" from "DM lost
+      // in transport".
+      logger.info(
+        {
+          message_type: messageType,
+          recipient_prefix: senderPubkey.slice(0, 16),
+          ...(swapId !== undefined ? { swap_id: swapId.slice(0, 16) } : {}),
+          ...(invoiceType !== undefined ? { invoice_type: invoiceType } : {}),
+          ...(invoiceId !== undefined ? { invoice_id: invoiceId.slice(0, 16) } : {}),
+          payload_bytes: serialized.length,
+        },
+        'diag_outbound_dm_sending',
+      );
+      await sphere.communications.sendDM(senderPubkey, serialized);
+      logger.info(
+        {
+          message_type: messageType,
+          recipient_prefix: senderPubkey.slice(0, 16),
+          ...(swapId !== undefined ? { swap_id: swapId.slice(0, 16) } : {}),
+          ...(invoiceType !== undefined ? { invoice_type: invoiceType } : {}),
+        },
+        'diag_outbound_dm_sent',
+      );
     } catch (err) {
+      logger.error(
+        {
+          err,
+          recipient: senderPubkey,
+          message_type: messageType,
+          swap_id: swapId,
+          invoice_type: invoiceType,
+        },
+        'diag_outbound_dm_failed',
+      );
       logger.error({ err, recipient: senderPubkey }, 'Failed to send DM reply');
     }
   }
@@ -473,6 +514,26 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
         is_new: result.is_new,
       };
 
+      // Round-5 diag: log resolution outcome + per-party invoice delivery
+      // to confirm the escrow reached the deliverDepositInvoice path for
+      // BOTH parties. Asymmetry in basic-roundtrip 2026-04-29 — only one
+      // party's wallet had the invoice — narrows to either:
+      //   (a) escrow never reached the party-B delivery branch (would
+      //       show as missing diag_invoice_delivery_attempt for B), or
+      //   (b) escrow delivered but the DM was dropped/lost in transport
+      //       (would show diag_invoice_delivery_attempt + diag_outbound_dm_sent
+      //       for both, but the wallet only sees one).
+      logger.info(
+        {
+          swap_id: result.swap_id.slice(0, 16),
+          party_a_resolved: partyAPubkey ? partyAPubkey.slice(0, 16) : null,
+          party_b_resolved: partyBPubkey ? partyBPubkey.slice(0, 16) : null,
+          party_a_address: swap.resolved_party_a_address,
+          party_b_address: swap.resolved_party_b_address,
+        },
+        'diag_announce_party_resolution',
+      );
+
       // Send to BOTH parties
       for (const [party, pubkey] of [['A', partyAPubkey], ['B', partyBPubkey]] as const) {
         if (!pubkey) {
@@ -482,8 +543,16 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
           );
           continue;
         }
+        logger.info(
+          { swap_id: result.swap_id.slice(0, 16), party, recipient_prefix: pubkey.slice(0, 16) },
+          'diag_invoice_delivery_attempt',
+        );
         await reply(pubkey, announcePayload);
         await deliverDepositInvoice(pubkey, swap, party);
+        logger.info(
+          { swap_id: result.swap_id.slice(0, 16), party, recipient_prefix: pubkey.slice(0, 16) },
+          'diag_invoice_delivery_complete',
+        );
       }
     })();
 
