@@ -151,12 +151,12 @@ export class InvoiceManager {
    * and subsequent payout `payInvoice()` calls), preventing token
    * selection races.
    *
-   * **Note:** The SDK's `_executeTerminationReturns()` currently lacks
-   * per-send timeouts (BUG-001 Fix 3). A hung transport send will block
-   * the `closeInvoice()` call until the transport layer times out.
-   * This is acceptable because the escrow calls `closeDepositInvoice()`
-   * BEFORE payouts — if it hangs, the timeout timer remains active as
-   * a safety net, and crash recovery will resume from DEPOSIT_COVERED.
+   * Per-send timeouts on `_executeTerminationReturns()` (BUG-001 Fix 3)
+   * have landed in @unicitylabs/sphere-sdk via Promise.race with a 60s
+   * ceiling per send, so a hung transport send no longer holds the gate
+   * indefinitely. `closeInvoice()` will fail/return within the SDK's
+   * timeout budget rather than wedging the conclude flow. The
+   * crash-recovery path remains the safety net for the swap as a whole.
    *
    * @param invoiceId - The deposit invoice ID to close.
    */
