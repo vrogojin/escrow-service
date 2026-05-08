@@ -98,6 +98,22 @@ export async function startEscrow(): Promise<void> {
   //    drives the swap protocol directly via SwapOrchestrator + invoices).
   // ---------------------------------------------------------------------------
   const apiKey = resolveApiKey();
+
+  // Optional Nostr-relay override. Set `UNICITY_NOSTR_RELAYS` (or
+  // `SPHERE_NOSTR_RELAYS` as a fallback) to a comma-separated list of
+  // WebSocket URLs to replace the network preset's relays — used by the
+  // local-infra e2e harness to point at a Docker-hosted relay when the
+  // public testnet relay's write path is degraded.
+  const relayOverride = (() => {
+    const raw = process.env['UNICITY_NOSTR_RELAYS'] ?? process.env['SPHERE_NOSTR_RELAYS'];
+    if (!raw) return undefined;
+    const relays = raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    return relays.length > 0 ? relays : undefined;
+  })();
+  if (relayOverride) {
+    log.info({ relays: relayOverride }, 'nostr_relays_override_active');
+  }
+
   log.info({ network: config.network, data_dir: config.data_dir }, 'initializing_sphere');
   const providers = createNodeProviders({
     network: config.network as 'testnet' | 'mainnet' | 'dev',
@@ -107,6 +123,7 @@ export async function startEscrow(): Promise<void> {
       trustBasePath: trustbasePath,
       apiKey,
     },
+    ...(relayOverride ? { transport: { relays: relayOverride } } : {}),
   });
 
   const nametag = process.env['SPHERE_NAMETAG']
