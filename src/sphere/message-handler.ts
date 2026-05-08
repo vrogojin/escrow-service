@@ -204,52 +204,108 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
     swap: SwapRecord,
     party: 'A' | 'B',
   ): Promise<void> {
-    if (!swap.deposit_invoice_id) {
+    const recipientPrefix = recipientNpub.slice(0, 16);
+    logger.info({ swap_id: swap.swap_id, party, recipient_prefix: recipientPrefix }, 'deliver_deposit_invoice_enter');
+    try {
+      if (!swap.deposit_invoice_id) {
+        logger.warn({ swap_id: swap.swap_id, party }, 'deliver_deposit_invoice_no_id');
+        await reply(recipientNpub, {
+          type: 'error',
+          error: 'Deposit invoice not yet created',
+        });
+        return;
+      }
+
+      // Retry token retrieval — the invoice was just minted and the token may
+      // not be persisted to storage yet (race between createInvoice returning
+      // the invoiceId and the token being flushed to disk/memory).
+      let token: unknown | null = null;
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try {
+          token = await invoiceManager.getDepositInvoiceToken(swap.deposit_invoice_id);
+        } catch (err) {
+          lastError = err;
+          logger.warn(
+            {
+              swap_id: swap.swap_id,
+              party,
+              attempt,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            'deliver_deposit_invoice_get_token_threw',
+          );
+        }
+        if (token) break;
+        if (attempt < 4) await new Promise((r) => setTimeout(r, 500));
+      }
+      if (!token) {
+        logger.warn(
+          {
+            swap_id: swap.swap_id,
+            party,
+            recipient_prefix: recipientPrefix,
+            invoice_id: swap.deposit_invoice_id,
+            last_error: lastError instanceof Error ? lastError.message : (lastError === null ? null : String(lastError)),
+          },
+          'deliver_deposit_invoice_no_token',
+        );
+        await reply(recipientNpub, {
+          type: 'error',
+          error: 'Deposit invoice token not available',
+        });
+        return;
+      }
+
+      const yourCurrency =
+        party === 'A'
+          ? swap.manifest.party_a_currency_to_change
+          : swap.manifest.party_b_currency_to_change;
+      const yourAmount =
+        party === 'A'
+          ? swap.manifest.party_a_value_to_change
+          : swap.manifest.party_b_value_to_change;
+
+      logger.info(
+        {
+          swap_id: swap.swap_id,
+          party,
+          recipient_prefix: recipientPrefix,
+          invoice_id: swap.deposit_invoice_id,
+          your_currency: yourCurrency,
+          your_amount: String(yourAmount),
+        },
+        'deliver_deposit_invoice_sending',
+      );
       await reply(recipientNpub, {
-        type: 'error',
-        error: 'Deposit invoice not yet created',
+        type: 'invoice_delivery',
+        swap_id: swap.swap_id,
+        invoice_type: 'deposit',
+        invoice_id: swap.deposit_invoice_id,
+        invoice_token: token,
+        payment_instructions: {
+          your_currency: yourCurrency,
+          your_amount: yourAmount,
+          memo: `INV:${swap.deposit_invoice_id}:F`,
+        },
       });
-      return;
+      logger.info(
+        { swap_id: swap.swap_id, party, recipient_prefix: recipientPrefix },
+        'deliver_deposit_invoice_sent',
+      );
+    } catch (err) {
+      logger.error(
+        {
+          swap_id: swap.swap_id,
+          party,
+          recipient_prefix: recipientPrefix,
+          err: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        },
+        'deliver_deposit_invoice_threw',
+      );
+      throw err;
     }
-
-    // Retry token retrieval — the invoice was just minted and the token may
-    // not be persisted to storage yet (race between createInvoice returning
-    // the invoiceId and the token being flushed to disk/memory).
-    let token: unknown | null = null;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      token = await invoiceManager.getDepositInvoiceToken(swap.deposit_invoice_id);
-      if (token) break;
-      if (attempt < 4) await new Promise((r) => setTimeout(r, 500));
-    }
-    if (!token) {
-      await reply(recipientNpub, {
-        type: 'error',
-        error: 'Deposit invoice token not available',
-      });
-      return;
-    }
-
-    const yourCurrency =
-      party === 'A'
-        ? swap.manifest.party_a_currency_to_change
-        : swap.manifest.party_b_currency_to_change;
-    const yourAmount =
-      party === 'A'
-        ? swap.manifest.party_a_value_to_change
-        : swap.manifest.party_b_value_to_change;
-
-    await reply(recipientNpub, {
-      type: 'invoice_delivery',
-      swap_id: swap.swap_id,
-      invoice_type: 'deposit',
-      invoice_id: swap.deposit_invoice_id,
-      invoice_token: token,
-      payment_instructions: {
-        your_currency: yourCurrency,
-        your_amount: yourAmount,
-        memo: `INV:${swap.deposit_invoice_id}:F`,
-      },
-    });
   }
 
   /**
@@ -473,7 +529,10 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
         is_new: result.is_new,
       };
 
-      // Send to BOTH parties
+      // Send to BOTH parties — isolate per-party errors so a throw on
+      // party A's delivery doesn't skip party B (which would silently
+      // half-complete the swap and force the trader to spin in
+      // "registered, polling for invoice").
       for (const [party, pubkey] of [['A', partyAPubkey], ['B', partyBPubkey]] as const) {
         if (!pubkey) {
           logger.warn(
@@ -482,8 +541,32 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
           );
           continue;
         }
-        await reply(pubkey, announcePayload);
-        await deliverDepositInvoice(pubkey, swap, party);
+        try {
+          await reply(pubkey, announcePayload);
+        } catch (err) {
+          logger.error(
+            {
+              swap_id: result.swap_id,
+              party,
+              recipient_prefix: pubkey.slice(0, 16),
+              err: err instanceof Error ? err.message : String(err),
+            },
+            'announce_result_send_failed',
+          );
+        }
+        try {
+          await deliverDepositInvoice(pubkey, swap, party);
+        } catch (err) {
+          logger.error(
+            {
+              swap_id: result.swap_id,
+              party,
+              recipient_prefix: pubkey.slice(0, 16),
+              err: err instanceof Error ? err.message : String(err),
+            },
+            'deliver_deposit_invoice_failed',
+          );
+        }
       }
     })();
 
