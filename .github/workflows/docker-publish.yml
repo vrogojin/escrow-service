@@ -25,7 +25,21 @@ jobs:
 
       - name: Clone sphere-sdk sibling
         env:
-          SPHERE_SDK_SHA: 44b4705352c1582575eeeafbc46dddc8d95e8995
+          # Pinned at uxf integration/all-fixes HEAD as of 2026-05-16.
+          # Matches the SDK content bundled into the manually-published
+          # v0.2 image. Bump alongside any release that needs newer SDK
+          # behavior (PR description should call out the new PRs the
+          # release picks up).
+          #
+          # Bump checklist:
+          #   1. Set SPHERE_SDK_SHA to the new sphere-sdk commit hash.
+          #   2. Verify the SHA is reachable on the public remote
+          #      (https://github.com/unicity-sphere/sphere-sdk.git) —
+          #      branch heads can move, so prefer pinning to merge
+          #      commits on integration/all-fixes or main.
+          #   3. Open a PR, run a manual workflow_dispatch test build,
+          #      then cut the release tag.
+          SPHERE_SDK_SHA: 3a575cd02ff7ab2fc5b2b8696fd8fdfd614779ff
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git sphere-sdk
           git -C sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
