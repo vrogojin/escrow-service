@@ -25,11 +25,19 @@ jobs:
 
       - name: Clone sphere-sdk sibling
         env:
-          # Pinned at uxf integration/all-fixes HEAD as of 2026-05-16.
-          # Matches the SDK content bundled into the manually-published
-          # v0.2 image. Bump alongside any release that needs newer SDK
-          # behavior (PR description should call out the new PRs the
-          # release picks up).
+          # Pinned at uxf integration/all-fixes merge commit for
+          # sphere-sdk PR #196 (issue #195 fix). Picks up:
+          #   - PR #196 — drop placeholder manifest entry in recipient
+          #     poll + emit `transfer:confirmed` from recipient
+          #     dispositionWriter. Unblocks inbound deposit
+          #     finalization so escrow swap deposits flip from
+          #     'pending' to 'confirmed' and the swap state machine
+          #     advances past PARTIAL_DEPOSIT to COMPLETED.
+          #
+          # Verified end-to-end via sphere-cli PR #16
+          # `E2E_RUN_SWAP_FULL=1` against a locally-built image of
+          # this branch: full settlement reached in 147s (no
+          # cas-mismatch, no PerTokenMutex bounded-hold timeout).
           #
           # Bump checklist:
           #   1. Set SPHERE_SDK_SHA to the new sphere-sdk commit hash.
@@ -39,7 +47,7 @@ jobs:
           #      commits on integration/all-fixes or main.
           #   3. Open a PR, run a manual workflow_dispatch test build,
           #      then cut the release tag.
-          SPHERE_SDK_SHA: 3a575cd02ff7ab2fc5b2b8696fd8fdfd614779ff
+          SPHERE_SDK_SHA: af3c0a101f2a6f7f3bccff42b974e7b26148ee73
         run: |
           git clone https://github.com/unicity-sphere/sphere-sdk.git sphere-sdk
           git -C sphere-sdk checkout --detach "$SPHERE_SDK_SHA"
