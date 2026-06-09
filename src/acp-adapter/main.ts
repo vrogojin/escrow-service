@@ -243,7 +243,13 @@ export async function startEscrow(): Promise<void> {
       // swap manifests, deposit invoices) carry the primary identity.
       await sphere.switchToAddress(0);
       log.info({ index: nextIdx, nametag: publicNametag }, 'public_nametag_minted');
-      await verifyNametagResolves(publicNametag);
+      // Fire-and-forget relay verification. The mint itself is on-chain
+      // synchronous; the relay binding event publishes in the background and
+      // can take 30+ seconds to reflect — awaiting it would push past the
+      // host manager's hello timeout (30s).
+      void verifyNametagResolves(publicNametag).then((ok) => {
+        if (!ok) log.warn({ nametag: publicNametag }, 'public_nametag_post_mint_resolve_failed');
+      });
     } else {
       // Already minted on a tracked address. Capture its transport pubkey so
       // message-handler can route incoming DMs targeting it.
