@@ -232,9 +232,18 @@ export async function startEscrow(): Promise<void> {
     const tracked = sphere.getActiveAddresses();
     const owning = tracked.find((a) => a.nametag === publicNametag);
     if (!owning) {
+      // ---------------------------------------------------------------------
+      // FIRST BOOT: mint + publish. Use `registerNametag` (not
+      // `switchToAddress`'s built-in nametag option) because the latter only
+      // mints the on-chain token via `postSwitchSync.mintNametag` and DOES
+      // NOT publish the Nostr binding — observed sphere-sdk#456 testnet
+      // deploy where the on-chain token landed but `queryBindingByNametag`
+      // returned null. `registerNametag` does both.
+      // ---------------------------------------------------------------------
       const nextIdx = Math.max(0, ...tracked.map((a) => a.index)) + 1;
       log.info({ index: nextIdx, nametag: publicNametag }, 'minting_public_nametag_on_secondary');
-      await sphere.switchToAddress(nextIdx, { nametag: publicNametag });
+      await sphere.switchToAddress(nextIdx);
+      await sphere.registerNametag(publicNametag);
       const secondaryIdentity = sphere.identity;
       if (secondaryIdentity?.chainPubkey) {
         publicNametagTransportPubkey = secondaryIdentity.chainPubkey.slice(2);
@@ -244,17 +253,30 @@ export async function startEscrow(): Promise<void> {
       await sphere.switchToAddress(0);
       log.info({ index: nextIdx, nametag: publicNametag }, 'public_nametag_minted');
       // Fire-and-forget relay verification. The mint itself is on-chain
-      // synchronous; the relay binding event publishes in the background and
-      // can take 30+ seconds to reflect — awaiting it would push past the
-      // host manager's hello timeout (30s).
+      // synchronous; the relay binding publishes in the background (default
+      // `publishMode='background'` of `registerNametag`) and can take 30+
+      // seconds to reflect — awaiting it would push past the host manager's
+      // hello timeout (30s).
       void verifyNametagResolves(publicNametag).then((ok) => {
         if (!ok) log.warn({ nametag: publicNametag }, 'public_nametag_post_mint_resolve_failed');
       });
     } else {
-      // Already minted on a tracked address. Capture its transport pubkey so
-      // message-handler can route incoming DMs targeting it.
+      // ---------------------------------------------------------------------
+      // SUBSEQUENT BOOT: nametag already minted locally + on-chain. The Nostr
+      // relay binding may have been lost (prior boot killed mid-publish, or
+      // relay rotated). Cycle through the secondary address: switchToAddress
+      // without nametag triggers `postSwitchSync.syncIdentityWithTransport`,
+      // which republishes the identity binding (with whatever nametag is on
+      // the local cache for that address) to the configured relays.
+      // ---------------------------------------------------------------------
       publicNametagTransportPubkey = owning.chainPubkey.slice(2);
-      log.info({ index: owning.index, nametag: publicNametag }, 'public_nametag_already_present');
+      log.info({ index: owning.index, nametag: publicNametag }, 'public_nametag_already_present_republishing_binding');
+      await sphere.switchToAddress(owning.index);
+      await sphere.switchToAddress(0);
+      // Async verify — same reasoning as fresh-mint branch.
+      void verifyNametagResolves(publicNametag).then((ok) => {
+        if (!ok) log.warn({ nametag: publicNametag }, 'public_nametag_resolve_failed_after_republish');
+      });
     }
   }
 
