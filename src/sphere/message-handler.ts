@@ -28,6 +28,15 @@ export interface MessageHandlerDeps {
   npubRoleMap: NpubRoleMap;
   /** The escrow's own DIRECT:// address — used to validate manifest.escrow_address in v2. */
   escrowAddress: string;
+  /**
+   * Optional — x-only transport pubkey (chainPubkey.slice(2)) of a secondary
+   * HD address that owns the public nametag (sphere-sdk#456 B). When set, a
+   * parallel `sphere.on('message:dm')` subscription routes DMs targeting this
+   * pubkey through the same swap dispatcher. The primary's DMs continue to
+   * flow through `sphere.communications.onDirectMessage` so unread-on-restart
+   * replay is preserved on the primary identity.
+   */
+  secondaryTransportPubkey?: string;
 }
 
 export interface MessageHandler {
@@ -91,7 +100,7 @@ const PAYOUT_ELIGIBLE_STATES: ReadonlySet<SwapState> = new Set([
 // ---------------------------------------------------------------------------
 
 export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
-  const { sphere, orchestrator, stateStore, invoiceManager, npubRoleMap, escrowAddress } = deps;
+  const { sphere, orchestrator, stateStore, invoiceManager, npubRoleMap, escrowAddress, secondaryTransportPubkey } = deps;
 
   // Lifecycle state.
   // `active` is set synchronously before any await, so the flag-check at
@@ -99,6 +108,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
   // are tracked so stop() can drain them.
   let active = false;
   let unsubscribe: (() => void) | null = null;
+  let unsubscribeSecondary: (() => void) | null = null;
   const inFlight = new Set<Promise<void>>();
   let startedAt = Date.now();
   // Per-swap gate: serializes the entire announce+resolve+register+deliver
@@ -923,7 +933,7 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
         draining = false;
       }
 
-      unsubscribe = sphere.communications.onDirectMessage((dm) => {
+      function dispatchDm(dm: DirectMessage): void {
         // Fast skip: already processed in a previous session (persisted by SDK)
         if (dm.isRead) return;
 
@@ -936,7 +946,26 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
         } else {
           pendingQueue.push(dm);
         }
-      });
+      }
+
+      // Primary identity: onDirectMessage gives synchronous replay of unread
+      // DMs persisted from prior sessions. Keeps crash-recovery semantics intact.
+      unsubscribe = sphere.communications.onDirectMessage(dispatchDm);
+
+      // Secondary identity (sphere-sdk#456 B): when the public nametag lives
+      // on a separate HD address, end-user DMs target that address's transport
+      // pubkey. Route those through the central event bus and filter by the
+      // secondary's transport pubkey to avoid double-firing on the primary's
+      // own DMs (onDirectMessage already covers those).
+      if (secondaryTransportPubkey) {
+        const normalizedSecondary = secondaryTransportPubkey.toLowerCase();
+        unsubscribeSecondary = sphere.on('message:dm', (dm: DirectMessage) => {
+          if (dm.recipientPubkey?.toLowerCase() !== normalizedSecondary) return;
+          dispatchDm(dm);
+        });
+        logger.info({ secondaryTransportPubkey: normalizedSecondary.slice(0, 16) + '...' }, 'Message handler also listening on secondary address');
+      }
+
       logger.info('Message handler started');
     },
     async stop() {
@@ -945,6 +974,10 @@ export function createMessageHandler(deps: MessageHandlerDeps): MessageHandler {
       if (unsubscribe) {
         unsubscribe();
         unsubscribe = null;
+      }
+      if (unsubscribeSecondary) {
+        unsubscribeSecondary();
+        unsubscribeSecondary = null;
       }
       // Drain in-flight handlers before returning (loop handles late additions).
       while (inFlight.size > 0) {

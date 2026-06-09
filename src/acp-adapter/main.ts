@@ -21,7 +21,7 @@
  * `@unicitylabs/escrow-service/dist/...`.
  */
 
-import { Sphere } from '@unicitylabs/sphere-sdk';
+import { Sphere, DEFAULT_ESCROW_ADDRESS } from '@unicitylabs/sphere-sdk';
 import { createNodeProviders } from '@unicitylabs/sphere-sdk/impl/nodejs';
 import type { DirectMessage } from '@unicitylabs/sphere-sdk';
 import { writeFileSync, mkdirSync, realpathSync } from 'node:fs';
@@ -126,14 +126,39 @@ export async function startEscrow(): Promise<void> {
     ...(relayOverride ? { transport: { relays: relayOverride } } : {}),
   });
 
-  const nametag = process.env['SPHERE_NAMETAG']
+  // ---------------------------------------------------------------------------
+  // Nametag bootstrap (sphere-sdk#456)
+  //
+  // Two-tier model:
+  //
+  //   PRIMARY (HD address 0): tenant-unique identity. Handles ACP heartbeats,
+  //   swap state, deposit/payout DMs. Stable across the tenant's lifetime —
+  //   rotating it would break in-flight swaps and the HM's container tracking.
+  //
+  //   PUBLIC (HD address 1+): discovery nametag end-user wallets resolve via
+  //   the SDK's hardcoded `DEFAULT_ESCROW_ADDRESS`. Minted on a fresh HD
+  //   address so a wallet that already owns a PRIMARY nametag can still own
+  //   the public one (the SDK enforces 1 nametag / address on-chain).
+  //
+  // Operator override surface:
+  //   - SPHERE_NAMETAG: PRIMARY nametag for fresh deploys. Ignored on existing
+  //     wallets (re-init with a different name throws ALREADY_INITIALIZED).
+  //   - ESCROW_PUBLIC_NAMETAG: PUBLIC nametag override. Defaults to the
+  //     SDK's `DEFAULT_ESCROW_ADDRESS` (currently `@escrow-testnet-v1`).
+  //
+  // Fresh-deploy behaviour: PRIMARY is the auto-generated `e-<id>` so the
+  // ACP-channel nametag stays tenant-unique; PUBLIC mint runs against the
+  // SDK default, giving the new tenant `@escrow-testnet-v1` discoverability
+  // without any operator action.
+  // ---------------------------------------------------------------------------
+  const primaryNametag = process.env['SPHERE_NAMETAG']
     ?? `e-${config.instance_id.replace(/[^a-z0-9]/g, '').slice(0, 12)}`;
-  log.info({ nametag }, 'registering_nametag');
+  log.info({ nametag: primaryNametag }, 'registering_primary_nametag');
 
   const { sphere } = await Sphere.init({
     ...providers,
     autoGenerate: true,
-    nametag,
+    nametag: primaryNametag,
     accounting: true,
     swap: false,
     market: false,
@@ -166,23 +191,71 @@ export async function startEscrow(): Promise<void> {
   );
 
   // Verify nametag is resolvable on the relay before declaring ready.
-  if (identity.nametag) {
-    const escrowNametag = `@${identity.nametag}`;
-    const resolveFunc = (sphere as unknown as { resolve(id: string): Promise<{ directAddress?: string } | null> }).resolve.bind(sphere);
+  const resolveFunc = (sphere as unknown as { resolve(id: string): Promise<{ directAddress?: string } | null> }).resolve.bind(sphere);
+  async function verifyNametagResolves(name: string): Promise<boolean> {
+    const at = name.startsWith('@') ? name : `@${name}`;
     for (let attempt = 1; attempt <= 10; attempt++) {
       try {
-        const resolved = await resolveFunc(escrowNametag);
+        const resolved = await resolveFunc(at);
         if (resolved?.directAddress) {
-          log.info({ nametag: identity.nametag, attempt }, 'nametag_verified');
-          break;
+          log.info({ nametag: name, attempt }, 'nametag_verified');
+          return true;
         }
       } catch { /* retry */ }
-      if (attempt < 10) {
-        await new Promise((r) => setTimeout(r, 2_000 * attempt));
-      } else {
-        log.error({ nametag: identity.nametag }, 'nametag_verification_failed');
-      }
+      if (attempt < 10) await new Promise((r) => setTimeout(r, 2_000 * attempt));
     }
+    log.error({ nametag: name }, 'nametag_verification_failed');
+    return false;
+  }
+  if (identity.nametag) {
+    await verifyNametagResolves(identity.nametag);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public nametag bootstrap (sphere-sdk#456 B+C)
+  //
+  // Ensures the canonical public nametag (default `@escrow-testnet-v1`) is
+  // owned by ONE of our tracked HD addresses. Idempotent on restart: if any
+  // tracked address already owns it (primary mint matched, or a previous boot
+  // already minted on a secondary), this block is a no-op.
+  //
+  // Cross-address message routing — incoming DMs to the secondary address
+  // flow through the central event bus (`sphere.on('message:dm')`) wired in
+  // message-handler.ts; outbound replies go from the primary identity, which
+  // is the canonical escrow address embedded in deposit invoices.
+  // ---------------------------------------------------------------------------
+  const publicNametag = (process.env['ESCROW_PUBLIC_NAMETAG'] ?? DEFAULT_ESCROW_ADDRESS)
+    .replace(/^@/, '')
+    .toLowerCase();
+  let publicNametagTransportPubkey: string | null = null;
+  {
+    const tracked = sphere.getActiveAddresses();
+    const owning = tracked.find((a) => a.nametag === publicNametag);
+    if (!owning) {
+      const nextIdx = Math.max(0, ...tracked.map((a) => a.index)) + 1;
+      log.info({ index: nextIdx, nametag: publicNametag }, 'minting_public_nametag_on_secondary');
+      await sphere.switchToAddress(nextIdx, { nametag: publicNametag });
+      const secondaryIdentity = sphere.identity;
+      if (secondaryIdentity?.chainPubkey) {
+        publicNametagTransportPubkey = secondaryIdentity.chainPubkey.slice(2);
+      }
+      // Switch back to the primary so all subsequent operations (heartbeats,
+      // swap manifests, deposit invoices) carry the primary identity.
+      await sphere.switchToAddress(0);
+      log.info({ index: nextIdx, nametag: publicNametag }, 'public_nametag_minted');
+      await verifyNametagResolves(publicNametag);
+    } else {
+      // Already minted on a tracked address. Capture its transport pubkey so
+      // message-handler can route incoming DMs targeting it.
+      publicNametagTransportPubkey = owning.chainPubkey.slice(2);
+      log.info({ index: owning.index, nametag: publicNametag }, 'public_nametag_already_present');
+    }
+  }
+
+  // Re-read identity in case switchToAddress(0) above renormalized fields.
+  const primaryIdentity = sphere.identity;
+  if (!primaryIdentity) {
+    throw new Error('Primary identity unexpectedly missing after public nametag bootstrap');
   }
 
   // ---------------------------------------------------------------------------
@@ -473,6 +546,11 @@ export async function startEscrow(): Promise<void> {
     invoiceManager,
     npubRoleMap: npubRoleStore,
     escrowAddress: escrowDirectAddress,
+    // sphere-sdk#456 B: when the public nametag (default `@escrow-testnet-v1`)
+    // lives on a secondary HD address, end-user DMs target that address's
+    // transport pubkey. The message handler wires a parallel subscription to
+    // the central event bus so those DMs reach the same swap orchestrator.
+    secondaryTransportPubkey: publicNametagTransportPubkey ?? undefined,
   });
   escrowMessageHandler.start();
 
