@@ -264,14 +264,51 @@ export async function startEscrow(): Promise<void> {
       // ---------------------------------------------------------------------
       // SUBSEQUENT BOOT: nametag already minted locally + on-chain. The Nostr
       // relay binding may have been lost (prior boot killed mid-publish, or
-      // relay rotated). Cycle through the secondary address: switchToAddress
-      // without nametag triggers `postSwitchSync.syncIdentityWithTransport`,
-      // which republishes the identity binding (with whatever nametag is on
-      // the local cache for that address) to the configured relays.
+      // relay rotated). Switch to the secondary address and explicitly
+      // publish the binding before switching back.
+      //
+      // We can't rely on `postSwitchSync.syncIdentityWithTransport` here —
+      // that path is fire-and-forget, and by the time its async resolve
+      // returns, the `_identity` it captures has been re-pointed at the
+      // primary by our `switchToAddress(0)` below. So it would publish the
+      // primary's binding (a no-op), not the secondary's.
+      //
+      // Accessing `(sphere as unknown).._transport.publishIdentityBinding`
+      // reaches the SDK's private transport surface. Tracks sphere-sdk#456 —
+      // a public `sphere.republishBinding()` would be the right long-term API.
       // ---------------------------------------------------------------------
       publicNametagTransportPubkey = owning.chainPubkey.slice(2);
       log.info({ index: owning.index, nametag: publicNametag }, 'public_nametag_already_present_republishing_binding');
       await sphere.switchToAddress(owning.index);
+      const secondaryIdentity = sphere.identity;
+      const transport = (sphere as unknown as {
+        _transport?: {
+          publishIdentityBinding?: (
+            chainPubkey: string,
+            l1Address: string,
+            directAddress: string,
+            nametag?: string,
+          ) => Promise<boolean>;
+        };
+      })._transport;
+      if (secondaryIdentity && transport?.publishIdentityBinding) {
+        try {
+          const published = await transport.publishIdentityBinding(
+            secondaryIdentity.chainPubkey,
+            secondaryIdentity.l1Address,
+            secondaryIdentity.directAddress ?? `DIRECT://${secondaryIdentity.chainPubkey}`,
+            publicNametag,
+          );
+          log.info({ nametag: publicNametag, published }, 'public_nametag_binding_republished');
+        } catch (err) {
+          log.warn(
+            { nametag: publicNametag, err: err instanceof Error ? err.message : String(err) },
+            'public_nametag_binding_republish_failed',
+          );
+        }
+      } else {
+        log.warn({ nametag: publicNametag }, 'public_nametag_binding_republish_skipped_no_transport_api');
+      }
       await sphere.switchToAddress(0);
       // Async verify — same reasoning as fresh-mint branch.
       void verifyNametagResolves(publicNametag).then((ok) => {
