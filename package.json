@@ -17,7 +17,7 @@
     "init-wallet": "tsx src/scripts/init-wallet.ts"
   },
   "dependencies": {
-    "@unicitylabs/sphere-sdk": "file:../sphere-sdk",
+    "@unicitylabs/sphere-sdk": "file:../uxf",
     "canonicalize": "^2.0.0",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0"
