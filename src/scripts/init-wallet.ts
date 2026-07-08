@@ -26,7 +26,7 @@ async function main(): Promise<void> {
   const { createNodeProviders } = await import('@unicitylabs/sphere-sdk/impl/nodejs');
 
   const providers = createNodeProviders({
-    network: config.sphereNetwork as 'mainnet' | 'testnet' | 'dev',
+    network: config.sphereNetwork as 'mainnet' | 'testnet' | 'testnet2' | 'dev',
     dataDir: walletPath,
     tokensDir: join(walletPath, 'tokens'),
   });
@@ -36,6 +36,8 @@ async function main(): Promise<void> {
   // can never cause mnemonic loss.
   const { sphere, created, generatedMnemonic } = await Sphere.init({
     ...providers,
+    // Phase-6 UXF v2 fork: pass network for v2 SphereTokenEngine.
+    network: config.sphereNetwork as 'mainnet' | 'testnet' | 'testnet2' | 'dev',
     autoGenerate: true,
   });
 

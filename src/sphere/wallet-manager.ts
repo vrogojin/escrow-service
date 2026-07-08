@@ -84,7 +84,6 @@ export async function initializeWallet(config: Config): Promise<WalletManager> {
       oracle: providers.oracle,
       tokenStorage: providers.tokenStorage,
       accounting: true,
-      l1: undefined,
     });
   } else {
     // No wallet in storage. Check for artifacts indicating a prior wallet existed
@@ -117,7 +116,6 @@ export async function initializeWallet(config: Config): Promise<WalletManager> {
         ...providers,
         mnemonic: savedMnemonic,
         accounting: true,
-        l1: undefined,
       });
       sphere = result.sphere;
       created = result.created;
@@ -150,7 +148,6 @@ export async function initializeWallet(config: Config): Promise<WalletManager> {
         ...providers,
         autoGenerate: true,
         accounting: true,
-        l1: undefined,
         ...(nametag ? { nametag } : {}),
       });
       sphere = result.sphere;

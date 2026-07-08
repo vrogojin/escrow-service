@@ -51,8 +51,19 @@ import { createMessageHandler } from '../sphere/message-handler.js';
 import type { SwapOrchestrator as ISwapOrchestrator } from '../sphere/orchestrator-interfaces.js';
 import { logger } from '../utils/logger.js';
 
-const TRUSTBASE_URL =
-  'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
+// Phase-6 UXF v2 fork — network-aware trustbase URL.
+function trustbaseUrlFor(network: string): string {
+  switch (network) {
+    case 'testnet2':
+      return 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet2.json';
+    case 'mainnet':
+      return 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.mainnet.json';
+    case 'testnet':
+    case 'dev':
+    default:
+      return 'https://raw.githubusercontent.com/unicitynetwork/unicity-ids/refs/heads/main/bft-trustbase.testnet.json';
+  }
+}
 
 export async function startEscrow(): Promise<void> {
   const config = parseTenantConfig();
@@ -85,8 +96,9 @@ export async function startEscrow(): Promise<void> {
   // ---------------------------------------------------------------------------
   // 3. Download trustbase
   // ---------------------------------------------------------------------------
-  log.info({ url: TRUSTBASE_URL }, 'downloading_trustbase');
-  const tbResponse = await fetch(TRUSTBASE_URL, { signal: AbortSignal.timeout(30_000) });
+  const trustbaseUrl = trustbaseUrlFor(config.network);
+  log.info({ url: trustbaseUrl, network: config.network }, 'downloading_trustbase');
+  const tbResponse = await fetch(trustbaseUrl, { signal: AbortSignal.timeout(30_000) });
   if (!tbResponse.ok) {
     throw new Error(`Failed to download trustbase: HTTP ${tbResponse.status}`);
   }
@@ -116,7 +128,7 @@ export async function startEscrow(): Promise<void> {
 
   log.info({ network: config.network, data_dir: config.data_dir }, 'initializing_sphere');
   const providers = createNodeProviders({
-    network: config.network as 'testnet' | 'mainnet' | 'dev',
+    network: config.network as 'testnet' | 'testnet2' | 'mainnet' | 'dev',
     dataDir: config.data_dir,
     tokensDir: config.tokens_dir,
     oracle: {
@@ -132,6 +144,10 @@ export async function startEscrow(): Promise<void> {
 
   const { sphere } = await Sphere.init({
     ...providers,
+    // Phase-6 UXF v2 fork: pass network so ensureTokenEngine picks up
+    // NETWORKS[network].trustBaseUrl + aggregatorApiKey and constructs
+    // the v2 SphereTokenEngine.
+    network: config.network as 'testnet' | 'testnet2' | 'mainnet' | 'dev',
     autoGenerate: true,
     nametag,
     accounting: true,
